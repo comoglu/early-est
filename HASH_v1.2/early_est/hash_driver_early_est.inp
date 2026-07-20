@@ -1,0 +1,17 @@
+early_est.reverse           ! station polarity reversal file
+msprocess_out/Indonesia_2006_90deg10minP.mseed.out//hypos.csv                   ! name of hypos input file (Early-est hypos.csv format)
+msprocess_out/Indonesia_2006_90deg10minP.mseed.out//picks.csv                   ! name of picks input file (Early-est picks.csv format)
+msprocess_plots//preferred.out               ! output file name for focal mechanisms
+msprocess_plots//acceptable.out              ! output file name for acceptable planes
+.                           ! output file path for Early-est/GMT plot files
+10                          ! minimum number of polarities (e.g., 8)
+180                         ! maximum azimuthal gap (e.g., 90)
+90                          ! maximum takeoff angle gap (e.g., 60)
+2                           ! grid angle for focal mech search, in degrees         (min    5.0000000     )
+1                           ! number of trials (e.g., 30)
+500                         ! maxout for focal mech. output (e.g., 500)
+0.1                         ! fraction of picks presumed bad (e.g., 0.10)
+90                          ! maximum allowed source-station distance,                    in km (e.g., 120)
+45                          ! angle for computing mechanisms probability,                 in degrees (e.g., 45)
+0.25                        ! probability threshold for multiples (e.g., 0.1)
+

@@ -1,0 +1,660 @@
+# application properties file for EarlyEst
+
+# uses #/ for documentation comments
+
+#/ Syntax
+#/
+#/ Structure of a settings entity: A settings entity is a tree of depth 2. At the top level are the section nodes that represent isolated sections of application settings (e.g. general application properties, font attributes, color attributes, and so on). At the bottom level are the key-value pairs that represent set values for keys inside a particular section.
+#/
+#/ A settings entity is read from and written to disk using a textual format. The textual format is parsed by sequentially scanning each line. Blank lines are ignored. For all other lines, leading and trailing blanks are ignored. Sections are enclosed by square brackets ("[" and "]") on separate lines. Key-value pairs are written as the key followed by a single equal sign ("="), followed by the value, all of which must be together on one separate line. A key-value pair is associated to the last seen section. A key-value pair is not valid until at least one section has been seen. All lines that start with a hash ("#") are considered comments and are ignored. Empty sections, that is, sections that do not contain any key-value pairs, are not written to disk. Empty sections can be present in the textual format. However, they are ignored when creating a settings entity in memory.
+#/
+#/ A value can be a single or multi-valued. A multi-valued value is a tuple. Tuples are separated by comma and are singly-typed. This means that a tuple can only contain objects of one kind (e.g. integer tuples, double tuples, etc.).
+
+
+#/
+#/ =========================================
+#/ [DataInput]
+#/   properties file section with settings for data input
+[DataInput]
+
+#/ -------------------------------
+#/ filter.component.accept
+#/   comma separated list of channel component orientations to accept (channel component orientation is 3rd char of channel, e.g. component for BHZ is Z)
+#/   accept only specified channel components, if none specified, accept all channel components
+#/   default: Z
+#/   See also: [TimedomainProcessing] process.orientation.list
+# For 3-comp, P polarization, uncomment following line
+filter.component.accept = Z,N,E,1,2
+
+#/ -------------------------------
+#/ filter.ignore_duplicate_net_sta
+#/   ignore streams with same network and station codes as previously accepted stream
+#/   default: 1
+#filter.ignore_duplicate_net_sta = 1
+#
+#/ -------------------------------
+#/ filter.ignore_duplicate_sta
+#/   ignore streams with same station code as previously accepted stream
+#/   default: 1
+#filter.ignore_duplicate_sta = 1
+
+
+#/
+#/ =========================================
+#/ [TimedomainProcessing]
+#/   properties file section with settings for time-domain processing
+[TimedomainProcessing]
+
+#/ -------------------------------
+#/ measures.enable
+#/   enable/disable magnitude and tsunami discriminant measures
+#/   default: 1
+#measures.enable = 1
+
+
+#/ -------------------------------
+#/ process.orientation.list
+#/   comma separated list of channel component orientations to be picked and fully processed
+#/   default: all channel component orientations picked and processed
+#/   Note: superseeds channel component orientations in pick.channel.list
+#/      Other components may be processed in certain analyses, e.g. for polarization analysis, horizontal components (N,E,1,2) are used and should be listed in [DataInput] filter.component.accept.
+#/   See also: [DataInput] filter.component.accept
+#/   default: all inpout channel orientations picked and processed
+process.orientation.list = Z
+
+
+#/ -------------------------------
+#/ polarization.enable
+#/   enable/disable use of P polarization azimuth for location
+#/   default: 0
+# For 3-comp, P polarization, uncomment following line
+polarization.enable = 1
+
+#/ -------------------------------
+#/ polarization.window.start_delay_after_P
+#/   start delay after P (sec) of P polarization analysis window
+#/   default: 0.0
+polarization.window.start_delay_after_P = 0.0
+
+#/ -------------------------------
+#/ polarization.window.length.min
+#/   minimum window length (sec) for P polarization analysis
+#/   P polarization analysis is applied in a suite of windows of multiples of 2*polarization.window.length.min and <= polarization.window.length.max
+#/   default: 0.25
+polarization.window.length.min = 0.25
+
+#/ -------------------------------
+#/ polarization.window.length.max
+#/   maximum window length (sec) for P polarization analysis
+#/   default: 32.0
+polarization.window.length.max = 32.0
+
+
+
+#/ -------------------------------
+#/ pick.channel.list
+#/   ordered (0-N), comma separated list of channel names for mapping pick parameters.
+#/   To apply specific values of a pick parameter to the channels, the number and order of values for the pick parameter must match exactly this list of channel names.  If a channel is not present in this list, or the number of values for a parameter is less than the channel index in this list, then the zero (0) index value for the parameter is applied to the channel.
+#/   Comma separated list with optional $ separated sub-list of channel names for corresponding pick parameter
+#/   default: zero (0) index value for the parameter is applied to all channels
+#/   Note: specified channel orientations must be allowed  by process.orientation.list
+#pick.channel.list = SHZ,SHN$SHE
+
+
+#/ -------------------------------
+#/ pick.raw.enable
+#/   enable/disable picking on raw data stream (unfiltered input data)
+#/   default: 1
+#pick.raw.enable = 1
+#
+#/ -------------------------------
+#/ pick.raw.filterWindow pick.hf.filterWindow
+#/   the filter window (filterWindow) in seconds determines how far back in time the previous samples are examined.  The filter window will be adjusted upwards to be an integer N power of 2 times the sample interval (deltaTime).  Then numRecursive = N + 1 "filter bands" are created.  For each filter band n = 0,N  the data samples are processed through a simple recursive filter backwards from the current sample, and picking statistics and characteristic function are generated.  Picks are generated based on the maximum of the characteristic funciton values over all filter bands relative to the threshold values threshold1 and threshold2.
+#pick.raw.filterWindow = 100.0
+#
+#/ -------------------------------
+#/ pick.raw.longTermWindow pick.hf.longTermWindow
+#/   long term window, determines: a) a stabilisation delay time after the beginning of data; before this delay time picks will not be generated. b) the decay constant of a simple recursive filter to accumulate/smooth all picking statistics and characteristic functions for all filter bands.
+#pick.raw.longTermWindow = 50.0
+#
+#/ -------------------------------
+#/ pick.raw.threshold1 pick.hf.threshold1
+#/   sets the threshold to trigger a pick event (potential pick).  This threshold is reached when the (clipped) characteristic function for any filter band exceeds threshold1.
+#pick.raw.threshold1 = 10.0
+#
+#/ -------------------------------
+#/ pick.raw.threshold2 pick.hf.threshold1
+#/   sets the threshold to declare a pick (pick will be accepted when tUpEvent reached).  This threshold is reached when the integral of the (clipped) characteristic function for any filter band over the window tUpEvent exceeds threshold2 * tUpEvent (i.e. the average (clipped) characteristic function over tUpEvent is greater than threshold2)..
+#pick.raw.threshold2 = 10.0
+#
+#/ -------------------------------
+#/ pick.raw.tUpEvent
+#/   determines the maximum time the integral of the (clipped) characteristic function is accumlated after threshold1 is reached (pick event triggered) to check for this integral exceeding threshold2 * tUpEvent (pick declared).
+#/ tUpEvent must be less than TIME_DELAY_TAUC_MIN (set in timedomain_processing_data.h)
+#pick.raw.tUpEvent = 2.0
+
+
+#pick.hf.enable = 1
+#pick.hf.filterWindow = 10.0
+#pick.hf.longTermWindow = 25.0
+#pick.hf.threshold1 = 10.0
+#pick.hf.threshold2 = 8.0
+# tUpEvent must be less than TIME_DELAY_TAUC_MIN
+#pick.hf.tUpEvent = 2.0
+
+# 20150506 AJL - tests to reduce number of picks when Makefile->USE_USE_ALL_PICKS_FOR_LOCATION defined
+#pick.hf.threshold1 = 12.0
+#pick.hf.threshold2 = 10.0
+
+
+
+
+#/
+#/ =========================================
+#/ [WaveformExport]
+#/   properties file section with settings for waveform export (miniseed data files)
+[WaveformExport]
+
+#/ Exported waveforms are written in a waveforms/<event_id> subdirectory of the -o output directory, e.g., seedlink_out/iris/waveforms/1389094395723/   The waveform files are deleted after the time specified by the parameter file_archive.age_max
+
+#/ -------------------------------
+#/ enable
+#/   enable waveform export
+#/   default: 0
+enable = 1
+
+#/ -------------------------------
+#/ memory.sliding_window.length
+#/   length in seconds of sliding window waveform data memory
+#/   sliding window ends at last data packet start time for each channel
+#/   default: 3600
+#memory.sliding_window.length = 1800
+
+#/ -------------------------------
+#/ window.start.before.P
+#/   earliest start time in seconds before P for waveform window
+#/   start time may be later if all waveform data not available
+#/   default: 300
+window.start.before.P = 600
+
+#/ -------------------------------
+#/ window.end.after.S
+#/   latest end time in seconds after S for waveform window
+#/   end time may be earlier if all waveform data not available
+#/   default: 600
+#window.end.after.S = 120
+
+#/ -------------------------------
+#/ file_archive.age_max
+#/   maximum time period in seconds to keep waveform export files on disk
+#/   default: 10 days
+# 10 day:
+#file_archive.age_max = 864000
+# 3 day:
+#file_archive.age_max = 259200
+
+
+
+#/
+#/ =========================================
+#/ [Report]
+#/   properties file section with settings for report generation
+#/   The Early-est reporting module calls the oct-tree associate/locate module with the current pick list, and then the reporting module which determines event characterization results and generates graphical and alpha-numeric reporting output.
+[Report]
+
+#/ -------------------------------
+#/ warning.colors.show
+#/   enable or disable HTML and alert message display of warning level colors (grey, green, yellow, red) (1, 0)
+#/   default: 0
+warning.colors.show = 0
+
+#/ -------------------------------
+#/ tsunami.evaluation.write
+#/   enable or disable output of "Tsunami evaluation" information in the e-mail and in the html event pages (1, 0)
+#/   default: 0
+tsunami.evaluation.write = 0
+
+#/ -------------------------------
+#/ report.sliding_window.length
+#/   length in seconds of the report window, use negative value to deactivate sliding window reports.
+#/   default: 3600
+#report.sliding_window.length = 3600
+
+#/ -------------------------------
+#/ report.interval
+#/   interval in seconds between standard reports.
+#/   default: 60
+#report.interval = 60
+
+#/ -----------------------------------------
+#/ report.trigger properties group
+#/   properties that control the early triggering of association/location/reporting
+
+#/ -------------------------------
+#/ report.trigger.min_num_picks
+#/   minimum number of new picks (that can contribute to association/location) to trigger report.
+#/   default: 5
+report.trigger.min_num_picks = 9999
+
+#/ -------------------------------
+#/ report.trigger.pick_window
+#/   window in seconds before current data time to count new picks for possible triggered report.
+#/   default: 600
+#report.trigger.pick_window = 600
+
+#/ -------------------------------
+#/ report.trigger.min_delay_time
+#/   minimum data delay time in seconds between possible early triggered reports.
+#/   default: 10
+#report.trigger.min_delay_time = 10
+
+
+#/ -------------------------------
+#/ min_num_valid.mb
+#/   minimum number of mb magnitude readings to validate and report
+#/   default: 4
+#min_num_valid.mb = 4
+
+#/ -------------------------------
+#/ min_num_valid.mwp
+#/   minimum number of Mwp magnitude readings to validate and report
+#/   default: 4
+#min_num_valid.mwp = 4
+
+#/ -------------------------------
+#/ min_num_valid.mwpd
+#/   minimum number of Mwpd magnitude readings to validate and report
+#/   should be >= min_num_valid.mwp
+#/   default: 4
+#min_num_valid.mwpd = 4
+
+#/ -------------------------------
+#/ min_num_valid.tdT50Ex
+#/   minimum number of TdT50Ex readings to validate and report
+#/   default: 4
+#min_num_valid.tdT50Ex = 4
+
+
+
+#/ -------------------------------
+#/ preferred.min_value.mb
+#/   minimum value of mb magnitude to set as preferred magnitude
+#/   default: -9
+#preferred.min_value.mb = -9
+
+#/ -------------------------------
+#/ preferred.min_value.mwp
+#/   minimum value of Mwp magnitude to set as preferred magnitude
+#/   default: 5.5
+#preferred.min_value.mwp = 5.5
+
+#/ -------------------------------
+#/ preferred.min_value.mwpd
+#/   minimum value of Mwpd magnitude to set as preferred magnitude
+#/   default: 8.0
+#preferred.min_value.mwpd = 8.0
+
+
+
+#/ -------------------------------
+#/ alert.mb_min
+#/   minimum mb magnitude to trigger an alert (e-mail, Twitter, etc).
+#/   default: 5.5
+#alert.mb_min = 5.5
+
+#/ -------------------------------
+#/ alert.mwp_min
+#/   minimum Mwp magnitude to trigger an alert (e-mail, Twitter, etc).
+#/   default: 5.8
+#alert.mwp_min = 5.8
+
+#/ -------------------------------
+#/ alert.mwpd_min
+#/   minimum Mwpd magnitude to trigger an alert (e-mail, Twitter, etc).
+#/   default: 6.95 (rounds to 7.0)
+#alert.mwpd_min = 6.95
+
+#/ -------------------------------
+#/ alert.tdt50ex_min
+#/   minimum TdT50Ex value to trigger an alert (e-mail, Twitter, etc).
+#/   default: 7.2 (= 0.9 * 8.0, 8.0 is "yellow" cutoff for TdT50Ex)
+#alert.tdt50ex_min = 7.2
+
+#/ -------------------------------
+#/ alert.resend_time_delay
+#/   delay in sec after event otime to resend (update) an alert (e-mail, Twitter, etc) if already sent.
+#/   default: -1    (disabled)
+alert.resend_time_delay = -1
+#alert.resend_time_delay = 600
+
+
+#/ -------------------------------
+#/ hypocenter_sequence_xml.enable
+#/   enable hypocenter sequence xml archive
+#/   default: 0
+hypocenter_sequence_xml.enable = 1
+
+#/ -------------------------------
+#/ hypocenter_sequence_xml.write_arrivals
+#/   enable writing of associated arrivals in hypocenter sequence xml archive
+#/   default: 0
+hypocenter_sequence_xml.write_arrivals = 1
+
+#/ -------------------------------
+#/ hypocenter_sequence_xml.file_archive.age_max
+#/   maximum time period in seconds to keep hypocenter sequence xml archive files on disk
+#/   default: 10 days
+# 10 day:
+#hypocenter_sequence_xml.file_archive.age_max = 864000
+# 3 day:
+#hypocenter_sequence_xml.file_archive.age_max = 259200
+
+#/ -------------------------------
+#/ save.plotfiles.geojson
+#/   enable or disable output of plotting information in GeoJSON format (1, 0)
+#/   default: 0
+save.plotfiles.geojson = 1
+
+
+
+#/
+#/ =========================================
+#/ [AssociateLocate]
+#/   properties file section with settings for association and location
+[AssociateLocate]
+
+#/ -------------------------------
+#/ assoc_loc.min_weight_sum_associate
+#/   assoc_loc.min_weight_sum_associate sets the minimum sum of total phase weights for a set of picks to be associated into an event
+#/   default: 4.5 (for teleseismic monitor mode)
+#assoc_loc.min_weight_sum_associate = 4.5
+# DANGER! TEST!!!!
+#assoc_loc.min_weight_sum_associate = 4.0
+
+#/ -------------------------------
+#/ assoc_loc.min_time_delay_between_picks_for_location
+#/   sets the minimum time delay in seconds between picks on a channel for the succeeding pick to be used for location
+#/   default: 25.0 (same as aref, for teleseismic monitor mode)
+#assoc_loc.min_time_delay_between_picks_for_location = 25.0
+
+# gap
+#/ -------------------------------
+#/ assoc_loc.gap_primary_critical
+#/   sets the critical primary gap in deg
+#/   default: 270 (for teleseismic monitor mode)
+#
+#/ -------------------------------
+#/ assoc_loc.gap_secondary_critical
+#/   sets the critical secondary gap in deg
+#/   default: 315 (for teleseismic monitor mode)
+
+#/ -------------------------------
+#/ phase.names.use
+#/   sets a list of phase names to use in location/association
+#/   This includes all phases that will count in association/location with non-zero weight and other phases that will
+#/   be passively associated.
+#/   Comma separated list with optional $ separated list of required channels for phase
+#/   default: all phases set in ttimes.c through included header file ttimes/ttimes_*.h
+#
+#phase.names.use = P,Pg,S,Sg
+#phase.names.use = P:SHZ,S:SHN$SHE
+#phase.names.use = P:SHZ,S:SHZ
+
+#/ -------------------------------
+#/ assoc_loc.*.*
+#/   sets the bounds and step size for the regular grid search that initiates the oct-tree association/location algorithm
+#/   default: e.g. for teleseismic monitor mode:
+#/      depth (km): (DIST_TIME_DEPTH_MAX, 0.0, DIST_TIME_DEPTH_MAX) where DIST_TIME_DEPTH_MAX is set in ttimes.c through included header file ttimes/ttimes_*.h
+#/   	lat (deg): (7.2, -90, 90)
+#/   	lon (deg): (7.2, -180, 180)
+#
+# Local (small)
+#assoc_loc.depth.step = 15.0
+#assoc_loc.depth.min = 0.0
+#assoc_loc.depth.max = 60.0
+#assoc_loc.lat.step = 0.125
+#assoc_loc.lat.min = 40.0
+#assoc_loc.lat.max = 41.5
+#assoc_loc.lon.step = 0.25
+#assoc_loc.lon.min = 27.0
+#assoc_loc.lon.max = 30.0
+
+
+#/ -------------------------------
+#/ assoc_loc.nomimal_critical_oct_tree_node_size
+#/   nominal (approximate) size in km of oct tree node that must be reached before accepting a location
+#/   may be reduced automatically in location.c -> octtreeGlobalAssociationLocation()
+#/   default: 50.0 (for teleseismic monitor mode)
+#
+#assoc_loc.nomimal_critical_oct_tree_node_size = 50.0
+#
+#/ -------------------------------
+#/ assoc_loc.min_critical_oct_tree_node_size
+#/   minimum size in km of nomimal_critical_oct_tree_node_size
+#/   default: 1.0 (for teleseismic monitor mode)
+#
+#assoc_loc.min_critical_oct_tree_node_size = 1.0
+#
+#/ -------------------------------
+#/ assoc_loc.nominal_oct_tree_min_node_size
+#/   nominal (approximate) minimum size in km of oct tree node to be used for association/location
+#/   may be reduced automatically in location.c -> octtreeGlobalAssociationLocation()
+#/   default: 5.0 (for teleseismic monitor mode)
+#assoc_loc.nominal_oct_tree_min_node_size = 5.0
+
+#/ -------------------------------
+#/ sta_corr.nmin
+#/   minimum number of number of data used to generate time correction to enable correction to be applied
+#/   default: 10
+#
+# sta_corr.nmin 10
+
+#/ -------------------------------
+#/ sta_corr.filename
+#/   station time correction file
+#/   default: none
+#
+# from 201506 20160531:
+sta_corr.filename = sta_corr/residuals_P_TEST.csv
+# from 20160531-:
+#sta_corr.filename = sta_corr/residuals_P_2015.08.04-2016.04.30.csv
+#sta_corr.filename = sta_corr/residuals_P_PKPdf_2015.08.04-2016.04.30.csv
+#sta_corr.filename = sta_corr/residuals_P_PKPdf_2014.01.01-2016.05.31_skip2015.05.01-2015.08.03.csv
+
+#/ -------------------------------
+#/ assoc_loc.upweight_picks_sn_cutoff
+#/   S/N cutoff to upweight picks on raw data stream (unfiltered input data) for association/location
+#/   if S/N for a pick is greater than this cutoff, then a linear upweight:
+#/      upweight = 1.0 + (snr - upweight_picks_sn_cutoff) / upweight_picks_sn_cutoff,
+#/      upweight scaled by linear ramp weight (1->0),
+#       upweight value max = 2.0
+#/   is applied so that the pick can have weight > 1, allowing earlier association/location for larger, high S/N events.
+#/   Use a negative value to disable upweighting
+#/   default: -1
+#
+assoc_loc.upweight_picks_sn_cutoff = 50.0
+
+#/ -------------------------------
+#/ assoc_loc.upweight_picks_dist_full
+#/   minimum station-epicenter distance to enable full upweighting of picks on raw data stream (unfiltered input data) for association/location
+#/   upweighting of picks is scaled by linear ramp weight (1->0) between upweight_picks_dist_full and upweight_picks_dist_max
+#/   default: 5.0
+#
+#assoc_loc.upweight_picks_dist_full = 5.0
+
+#/ -------------------------------
+#/ assoc_loc.upweight_picks_dist_max
+#/   maximum station-epicenter distance to enable upweighting of picks on raw data stream (unfiltered input data) for association/location
+#/   upweighting of picks is scaled by linear ramp weight (1->0) between upweight_picks_dist_full and upweight_picks_dist_max
+#/   default: 10.0
+#
+#assoc_loc.upweight_picks_dist_max = 10.0
+
+#/ -------------------------------
+#/ assoc_loc.use_amplitude_attenuation
+#/   enable or disable amplitude attenuation weighting for event association (1, 0)
+#/   calculation and weighting during association of the fit of the P amplitudes attenuation to a power law decay follows a theoretical decay power
+#/   default: 0
+assoc_loc.use_amplitude_attenuation = 1
+
+#/ -------------------------------
+#/ assoc_loc.use_magnitude_amp_atten_check
+#/   enable or disable validation of P pick magnitude based on amplitude attenuation error ratio (1, 0)
+#/   Mwp, mB and mb magnitudes for a P pick are not used if the ratio between observed and predicted amplitudes
+#/      for best fit, event amplitude attenuation is too high or too low
+#/    Note: requires assoc_loc.use_amplitude_attenuation = 1
+#/   default: 1
+#assoc_loc.use_magnitude_amp_atten_check = 1
+
+
+#/ -------------------------------
+#/ assoc_loc.persistence.min_num_def_phases
+#/   minimun number of defining phases (tot_wt > 0) for an event to be tested for persistence
+#/   Use a negative value to disable event persistence
+#/   default: 20
+#assoc_loc.persistence.min_num_def_phases = 20
+# 20180319 AJL - TEST, try to reduce chance smaller event will be always be non-persistant
+assoc_loc.persistence.min_num_def_phases = 10
+
+#/ -------------------------------
+#/ assoc_loc.persistence.frac_poss_assoc_cutoff
+#/   maximum ratio (n_poss_assoc/wt_assoc_full) of picks that could be associated to defining phases to previous association weight
+#/      for an event to declared persistent
+#/   ratio is [n_poss_assoc = number possible defining phases not already used for full assoc/loc] to [wt_assoc_full = total weight of fully associated defining phases]
+#/   NOTE: this ratio is conservative (will overestimate true ratio of weights, since number and not eventual weights used for possible associated phases)
+#/   default: 0.05 (=1/20)
+assoc_loc.persistence.frac_poss_assoc_cutoff = 0.05
+# 20180319 AJL - TEST, try to reduce chance smaller event will be always be non-persistant
+#assoc_loc.persistence.frac_poss_assoc_cutoff = 0.2
+
+#/ -------------------------------
+#/ assoc_loc.persistence.time_after_otime_cutoff
+#/   maximum time in seconds for which min_num_def_phases and frac_poss_assoc_cutoff will be used at full value
+#/   from time_after_otime_cutoff+(mean data latency) to 2*(time_after_otime_cutoff+(mean data latency)) these two values are scaled from 1.0 to 0.2
+#/   default: (15.0 * 60.0) = 15min
+assoc_loc.persistence.time_after_otime_cutoff = 900
+
+#/ -------------------------------
+#/ assoc_loc.persistence.event_persistence_tt_err_fact
+#/   scale factor that is multiplied by the phase travel time error to determine if unassociated data might be associated
+#/   the scaled error defines a time tolerance to match predicted and observed arrival time of unassociated data
+#/   default: 2.0
+#assoc_loc.persistence.event_persistence_tt_err_fact = 2.0
+
+
+#/ -------------------------------
+#/ assoc_loc.existing_event_assoc.min_num_def_phases
+#/   minimun number of defining phases (tot_wt > 0) for an event to be have existing event association (association/location in a limited region around previous hypocenter), if minimun delay time since event origin time not reached
+#/   Use a negative value to disable existing event association
+#/   default: 20
+#assoc_loc.existing_event_assoc.min_num_def_phases = 20
+
+#/ -------------------------------
+#/assoc_loc.existing_event_assoc.delay_otime.min
+#/   minimun delay time in seconds since event origin time for an event to be have existing event association (association/location in a limited region around previous hypocenter), if minimun number of defining phases not associated
+#/   default: 720 (=12min)
+#assoc_loc.existing_event_assoc.delay_otime.min = 720
+
+
+#/ -------------------------------
+#/ assoc_loc.use_mwp_distance_correction
+#/   enable or disable correcting the computed Mwp and Mwpd based on epicentral distance (1, 0)
+#/   Uses Mwp correction from Bernardi et al. (2015)
+#/      Appraising the Early-est earthquake monitoring system for tsunami alerting at the Italian candidate Tsunami Service Provider,
+#/      Nat. Hazards Earth Syst. Sci. Discuss., 15, 1–40, 2015 www.nat-hazards-ear th-syst-sci-discuss.net/15/1/2015/ doi:10.5194/nhessd-15-1-2015
+#/   default: 1
+#assoc_loc.use_mwp_distance_correction = 1
+
+#/ -------------------------------
+#/ assoc_loc.use_mb_correction
+#/   enable or disable correcting the computed mB based on a linear fit to NEIC mb (1, 0)
+#/   Uses mb correction from Bernardi et al. (2015)
+#/      Appraising the Early-est earthquake monitoring system for tsunami alerting at the Italian candidate Tsunami Service Provider,
+#/      Nat. Hazards Earth Syst. Sci. Discuss., 15, 1–40, 2015 www.nat-hazards-ear th-syst-sci-discuss.net/15/1/2015/ doi:10.5194/nhessd-15-1-2015
+#/   default: 1
+#assoc_loc.use_mb_correction = 1
+
+
+#/
+#/ =========================================
+#/ [Messaging]
+#/   properties file section with settings for messaging with http://www.rabbitmq.com/
+[Messaging]
+
+#/ -------------------------------
+#/ rabbtimq messaging
+#/
+#/ To use rabbtimq with default properties settings:
+#/ 1) Install rabbitmq from http://www.rabbitmq.com
+#/ 2) Check and edit environment variables in the Makefile and source directory for your platform
+#/ 3) Run:
+#/         make clean
+#/         make
+#/ 4) Start rabbitmq-server (from http://www.rabbitmq.com), e.g.
+#/         /usr/local/sbin/rabbitmq-server &
+#/            or
+#/         /usr/local/opt/rabbitmq/sbin/rabbitmq-server &
+#/ 5) In a console, start listener, e.g.
+#/         amqp_listen_test localhost 5672 / guest guest test test
+#/ 6) To Test: In another console, send a string, which should be echoed in the listener, e.g.
+#/ 7) In the end:
+#/         /usr/local/sbin/rabbitmqctl stop
+#/             or
+#/         /usr/local/opt/rabbitmq/sbin/rabbitmqctl stop
+
+#/ -------------------------------
+#/ rmq.use_rmq
+#/   enable or disable rabbitmq messaging (1, 0)
+#/   default: 0
+rmq.use_rmq = 1
+
+#/ -------------------------------
+#/ rmq.hostname
+#/   hostname
+#/   default: localhost
+rmq.hostname = localhost
+
+#/ -------------------------------
+#/ rmq.port
+#/   port
+#/   default: 5672
+rmq.port = 5672
+
+#/ -------------------------------
+#/ rmq.vhost
+#/   vhost
+#/   default: /
+rmq.vhost = /
+
+#/ -------------------------------
+#/ rmq.username
+#/   username
+#/   default: guest
+rmq.username = guest
+
+#/ -------------------------------
+#/ rmq.password
+#/   password
+#/   default: guest
+rmq.password = guest
+
+#/ -------------------------------
+#/ rmq.exchange
+#/   exchange
+#/   default: test
+rmq.exchange = test
+
+#/ -------------------------------
+#/ rmq.exchangetype
+#/   exchangetype
+#/   default: topic
+rmq.exchangetype = topic
+
+#/ -------------------------------
+#/ rmq.routingkey
+#/   routingkey root, full routingkey will be of form <rmq.routingkey>.earlyest.<topics> (e.g. test.earlyest.realtime.picks)
+#/   default: test
+rmq.routingkey = test
+
+
+

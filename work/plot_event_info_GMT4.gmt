@@ -1,0 +1,318 @@
+#!/bin/bash
+
+SECONDS=0
+#echo "DEBUG: plot_event_info_GMT4.gmt: dt=${SECONDS}: TP 0"
+
+# gmt_shell_functions
+# These functions can be used from any sh/bash script by specifying
+# . gmt_shell_functions.sh
+# in your script.  See our script template gmt_script.sh for usage.
+export GMT_TMPDIR=`mktemp -d ${TMPDIR:-/tmp}/gmt.event_info.XXXXXX`
+
+#echo "$0 running in dir: $(pwd)"
+
+SAVE_DIR=$1
+#echo "SAVE_DIR ${SAVE_DIR}"
+
+ROOT_OUT_PATH=$2
+#echo "ROOT_OUT_PATH ${ROOT_OUT_PATH}"
+
+INSTANCE_PATH_NAME=$3
+#echo "INSTANCE_PATH_NAME ${INSTANCE_PATH_NAME}"
+
+INSTANCE_NAME=$4
+#echo "INSTANCE_NAME ${INSTANCE_NAME}"
+
+HYPO_EVENT_ID=$5
+#echo "HYPO_EVENT_ID ${HYPO_EVENT_ID}"
+
+HYPO_REGION=$6
+#echo "HYPO_REGION ${HYPO_REGION}"
+
+HYPO_ORIGIN_TIME=$7
+#echo "HYPO_ORIGIN_TIME ${HYPO_ORIGIN_TIME}"
+
+PLOT_MECHANISMS=$8
+#echo "PLOT_MECHANISMS ${PLOT_MECHANISMS}"
+
+PLOT_MAP_MECHANISM_TYPE=$9
+#echo "PLOT_MAP_MECHANISM_TYPE ${PLOT_MAP_MECHANISM_TYPE}"
+
+
+# choose here if you want to use gs (ghostscript) or convert (ImageMagic command) for ps to jpg conversion
+# Note: also change in plot_event_info_GMT4.gmt
+#USE_CONVERT_FOR_PS2JPG=NO
+USE_CONVERT_FOR_PS2JPG=YES
+
+
+RUN_NAME="t50"
+
+
+
+# GMT version specific settings
+GMT --version 2> ${GMT_TMPDIR}/_temp_.txt
+{
+read -a tokens 
+} < ${GMT_TMPDIR}/_temp_.txt
+export GMT_VERSION=${tokens[2]}
+#echo ">>>>>>>>>>>>>GMT --version:" ${GMT_VERSION}
+export M_SYNTAX=-m
+if [ ${GMT_VERSION%.*} =  4.4 ]; then
+export M_SYNTAX=-M
+fi
+
+# the following is needed to insure that gs produces correctly oriented A4 landscape output in png
+#gmtset CHAR_ENCODING ISOLatin1+
+gmtset PAGE_COLOR 223
+gmtset BASEMAP_TYPE plain
+gmtset ANNOT_FONT_PRIMARY 1  LABEL_FONT 1
+gmtset ANNOT_FONT_SIZE_PRIMARY 7  LABEL_FONT_SIZE 8
+gmtset ANNOT_OFFSET_PRIMARY 0.1 LABEL_OFFSET -0.09c
+gmtset PSIMAGE_FORMAT hex
+gmtset X_ORIGIN 0.25c  Y_ORIGIN 0.5c
+gmtset FRAME_PEN 2.0
+
+# plot mechanisms =========================================================================================
+if [ ${PLOT_MECHANISMS} = YES ]; then
+
+	#gmtset PAGE_ORIENTATION portrait  PAPER_MEDIA Custom_285x295
+	gmtset PAGE_ORIENTATION portrait  PAPER_MEDIA Custom_142x150
+	
+	ROOT_IN_NAME=${INSTANCE_PATH_NAME}/events/hypo.${HYPO_EVENT_ID}
+	
+	A_B_MECHANISM_LOG=./mechanism.log
+
+	# check for HASH and fmamp mechanism results
+	PROGRAM_TYPE_LIST=""
+	if [ -f ${ROOT_IN_NAME}.mech.fmamp_polarity.preferred.meca ] ; then
+		PROGRAM_TYPE_LIST="fmamp_polarity"
+	fi
+	if [ -f ${ROOT_IN_NAME}.mech.fmamp_polarity_waveform.preferred.meca ] ; then
+		PROGRAM_TYPE_LIST="${PROGRAM_TYPE_LIST} fmamp_polarity_waveform"
+	fi
+	if [ -f ${ROOT_IN_NAME}.mech.fmamp_amp_aref.preferred.meca ] ; then
+		PROGRAM_TYPE_LIST="${PROGRAM_TYPE_LIST} fmamp_amp_aref"
+	fi
+	if [ -f ${ROOT_IN_NAME}.mech.fmamp_amp_mwp.preferred.meca ] ; then
+		PROGRAM_TYPE_LIST="${PROGRAM_TYPE_LIST} fmamp_amp_mwp"
+	fi
+	if [ -f ${ROOT_IN_NAME}.mech.hash.preferred.meca ] ; then
+		PROGRAM_TYPE_LIST="${PROGRAM_TYPE_LIST} hash"
+	fi
+
+	# PROGRAM_TYPE ignored, last type processed is used for mechanism thumbnail jpg image
+	ROOT_NAME_THUMB=${INSTANCE_PATH_NAME}/events/hypo.${HYPO_EVENT_ID}.mechanism.thumb
+	
+	for PROGRAM_TYPE in ${PROGRAM_TYPE_LIST} ; do
+	
+#echo "DEBUG: plot_event_info_GMT4.gmt: dt=${SECONDS}: TP 1"
+
+		ROOT_IN_NAME_MECH=${INSTANCE_PATH_NAME}/events/hypo.${HYPO_EVENT_ID}.mech.${PROGRAM_TYPE}
+		ROOT_OUT_NAME=${ROOT_IN_NAME_MECH}.mechanism
+		PS_NAME=${ROOT_OUT_NAME}.ps
+		ROOT_NAME_THUMB_TYPE=${INSTANCE_PATH_NAME}/events/hypo.${HYPO_EVENT_ID}.mech.${PROGRAM_TYPE}.thumb
+
+		Y_POS=0
+		pstext -R0/1/0/1 -JX1 -Y${Y_POS} -N -K << END > ${PS_NAME}
+		-999 -999  4 0 3 BL  X
+END
+		PS_NAME_THUMB_TYPE=${ROOT_NAME_THUMB_TYPE}.ps
+		pstext -R0/1/0/1 -JX1 -Y${Y_POS} -N -K << END > ${PS_NAME_THUMB_TYPE}
+		-999 -999  4 0 3 BL  X
+END
+
+		R_VAL=-R0/360/-90/90
+		J_VAL=-JX1
+
+		#
+		#MECH_SIZE=2.0
+		#POL_SYM_SIZE=0.1
+		X_SHIFT=2.25
+		Y_SHIFT=2.0
+		Y_SHIFT_THUMB=2.125
+		MECH_SIZE=4.85
+		BIG_PT_AXIS_SYM_SIZE=0.45
+		SMALL_PT_AXIS_SYM_SIZE=0.08
+		POL_SYM_SIZE=0.25
+		FONT_SIZE=8
+		FONT_OFFSET=0.04
+		#MECH_COLOR=0/0/127
+		#MECH_FILL_COLOR=127/127/255
+		#MECH_FILL_COLOR=191/191/255
+		MECH_FILL_COLOR=159
+		#MECH_FILL_COLOR=191
+		MECH_OUTLINE_COLOR=0
+
+		MECH_QUALITY=XXX  # flags no preferred mechanism available
+
+echo "ROOT_IN_NAME_MECH.preferred.meca ${ROOT_IN_NAME_MECH}.preferred.meca"
+		if [ -f ${ROOT_IN_NAME_MECH}.preferred.meca ] ; then
+
+			{
+			read dummy	# header line
+			read -a tokens
+	
+			#echo "g:  ${tokens[0]} ${tokens[1]} ${tokens[2]} ${tokens[3]} ${tokens[4]} ${tokens[5]} ${tokens[6]} ${tokens[7]} ${tokens[8]} ${tokens[9]} ${tokens[10]} ${tokens[11]}"
+			MECH_LAT=0
+			MECH_LON=0
+			MECH_QUALITY=${tokens[13]}
+
+			# write temp preferred meca file with lat/lon = 0/0 (-C option of psmeca does not seem to work)
+			PREF_PARAMS="0 0 ${tokens[2]} ${tokens[3]} ${tokens[4]} ${tokens[5]} ${tokens[6]} ${tokens[7]} ${tokens[8]}"
+			cat << END > ${GMT_TMPDIR}/mech.${PROGRAM_TYPE}.preferred.meca.tmp
+			${PREF_PARAMS}
+END
+			PREF_TEXT_STRING_TITLE="${tokens[9]} ${tokens[10]} ${tokens[11]} ${tokens[12]} ${tokens[13]}"
+
+			rm -f ${GMT_TMPDIR}/mech.${PROGRAM_TYPE}.acceptable.meca.tmp
+			{
+				read dummy	# header line
+				while read -a tokens ; do
+					cat << END >> ${GMT_TMPDIR}/mech.${PROGRAM_TYPE}.acceptable.meca.tmp
+					0 0 ${tokens[2]} ${tokens[3]} ${tokens[4]} ${tokens[5]} ${tokens[6]} ${tokens[7]} ${tokens[8]}
+END
+				done
+			} < ${ROOT_IN_NAME_MECH}.acceptable.meca
+			#DEBUG
+			#cat ${ROOT_IN_NAME_MECH}.preferred.polar
+
+			if [ ${MECH_QUALITY} = A ] || [ ${MECH_QUALITY} = B ] || [ ${MECH_QUALITY} = C ] || [ ${MECH_QUALITY} = D ]; then
+				# thumbnail image
+				# plot quadrants for preferred mechanism
+				MECH_FILL_COLOR_THUMB=127
+				if [ ${MECH_QUALITY} = A ] || [ ${MECH_QUALITY} = B ]; then
+					MECH_FILL_COLOR=191/191/255
+					MECH_FILL_COLOR_THUMB=0/0/255
+				fi
+				psmeca ${GMT_TMPDIR}/mech.${PROGRAM_TYPE}.preferred.meca.tmp -N -Xa${X_SHIFT} -Ya${Y_SHIFT_THUMB} ${R_VAL} ${J_VAL} \
+					-Sa${MECH_SIZE} -M -G${MECH_FILL_COLOR_THUMB} -E255 -N -: -O >> ${PS_NAME_THUMB_TYPE}
+				# main image
+				# append text for main image
+				cat << END >> ${GMT_TMPDIR}/mech.${PROGRAM_TYPE}.preferred.meca.tmp
+				${PREF_PARAMS} ${PREF_TEXT_STRING_TITLE}
+END
+				# plot quadrants for preferred mechanism
+				psmeca ${GMT_TMPDIR}/mech.${PROGRAM_TYPE}.preferred.meca.tmp -N -Xa${X_SHIFT} -Ya${Y_SHIFT} ${R_VAL} ${J_VAL} \
+					-Sa${MECH_SIZE}/${FONT_SIZE}/${FONT_OFFSET} -M -G${MECH_FILL_COLOR} -E255 \
+					-N -: -O -K >> ${PS_NAME}
+				# plot fault planes and P/T axes for acceptable mechanisms
+				psmeca ${GMT_TMPDIR}/mech.${PROGRAM_TYPE}.acceptable.meca.tmp -N -Xa${X_SHIFT} -Ya${Y_SHIFT} ${R_VAL} ${J_VAL} -Sa${MECH_SIZE} -M -W0.5,0,. \
+					-T0 -a${SMALL_PT_AXIS_SYM_SIZE}/cc -g63 -t2,78 -e247 -: -O -K >> ${PS_NAME}
+				# plot polarities for preferred mechanism
+				pspolar ${ROOT_IN_NAME_MECH}.preferred.polar -N -Xa${X_SHIFT} -Ya${Y_SHIFT} ${R_VAL} ${J_VAL} \
+					-M${MECH_SIZE} -Sc${POL_SYM_SIZE} -W4 -G0 -e2/0 -f0 -D${MECH_LON}/${MECH_LAT} -H1 -O -K >> ${PS_NAME}
+				if [ ${MECH_QUALITY} = A ] || [ ${MECH_QUALITY} = B ] || [ ${MECH_QUALITY} = C ]; then
+					# plot P/T axes and beach-ball outline for preferred mechanism
+					psmeca ${GMT_TMPDIR}/mech.${PROGRAM_TYPE}.preferred.meca.tmp -N -Xa${X_SHIFT} -Ya${Y_SHIFT} ${R_VAL} ${J_VAL} \
+						-Sa${MECH_SIZE}/${FONT_SIZE}/${FONT_OFFSET} -M -W2/${MECH_OUTLINE_COLOR} \
+						-T0 -a${BIG_PT_AXIS_SYM_SIZE}/cc -g0 -p2,255 -e255 -t2,0 -: -O -K >> ${PS_NAME}
+				fi
+			else
+		pstext -R0/1/0/1 -JX1 -Xa${X_SHIFT} -Ya${Y_SHIFT}  -N -O -K << END >> ${PS_NAME}
+		0 0.5 7 0 2 MC  	(No focal mechanism solution available)
+END
+			fi
+				
+			} < ${ROOT_IN_NAME_MECH}.preferred.meca
+
+		fi
+
+		# close plot, write mechanism program type
+		Y_POS=0
+		pstext -R0/1/0/1 -JX1 -Y${Y_POS} -N -O << END >> ${PS_NAME}
+		-0.2 0.05  5 0 1 BL  ${PROGRAM_TYPE}
+END
+
+
+		if [ ${USE_CONVERT_FOR_PS2JPG} == NO ] ; then
+			COMMAND="gs -dNOPAUSE -sDEVICE=jpeg -r200 -sOutputFile=${ROOT_OUT_NAME}.jpg ${PS_NAME} -c quit"
+			COMMAND2="gs -dNOPAUSE -sDEVICE=jpeg -r30 -sOutputFile=${ROOT_NAME_THUMB_TYPE}.jpg ${PS_NAME_THUMB_TYPE} -c quit"
+		else
+			COMMAND="convert -density 150 -quality 85  ${PS_NAME} ${ROOT_OUT_NAME}.jpg"
+			COMMAND2="convert -density 20 -quality 85  ${PS_NAME_THUMB_TYPE} ${ROOT_NAME_THUMB_TYPE}.jpg"
+		fi
+		echo ${COMMAND}
+		${COMMAND}
+		echo ${COMMAND2}
+		${COMMAND2}
+		rm ${PS_NAME}
+		rm ${PS_NAME_THUMB_TYPE}
+		cp -p ${ROOT_OUT_NAME}.jpg ${SAVE_DIR}
+		cp -p ${ROOT_NAME_THUMB_TYPE}.jpg ${SAVE_DIR}
+		if [ ${PROGRAM_TYPE} = ${PLOT_MAP_MECHANISM_TYPE} ]; then
+			cp -p ${ROOT_NAME_THUMB_TYPE}.jpg ${ROOT_NAME_THUMB}.jpg
+			cp -p ${ROOT_NAME_THUMB}.jpg ${SAVE_DIR}
+		fi
+					
+		#=============================================================================
+		# 20140820 201600303 AJL - test of processing of high-quality amplitude mechanism
+		if [ YES == YES ] ; then
+			# process A or B quality mechanism
+			if [ ${PROGRAM_TYPE} = fmamp_polarity ]; then
+				echo "TRY: high_quality_mechanism: ${PROGRAM_TYPE} ${MECH_QUALITY}"
+				if [ ${MECH_QUALITY} = A ] || [ ${MECH_QUALITY} = B ]; then
+				# TEST!! if [ ${MECH_QUALITY} = D ] || ${MECH_QUALITY} = C ] ||  [ ${MECH_QUALITY} = A ] || [ ${MECH_QUALITY} = B ]; then
+					#echo "------------------" >> high_quality_mechanism.log
+					#echo "RUN: ./run_action__high_quality_mechanism.bash ${HYPO_EVENT_ID} ${HYPO_ORIGIN_TIME} ${HYPO_REGION} ${INSTANCE_PATH_NAME} events/hypo.${HYPO_EVENT_ID}.html ${PROGRAM_TYPE} ${ROOT_OUT_NAME}.jpg"  >> high_quality_mechanism.log
+					./run_action__high_quality_mechanism.bash ${HYPO_EVENT_ID} ${INSTANCE_PATH_NAME} events/hypo.${HYPO_EVENT_ID}.html ${PROGRAM_TYPE} ${ROOT_OUT_NAME}.jpg
+				fi
+			fi
+		fi
+		#=============================================================================
+				
+	done
+		
+
+fi	# if [ ${PLOT_MECHANISMS} = YES ]
+
+
+#echo "DEBUG: plot_event_info_GMT4.gmt: dt=${SECONDS}: TP 2"
+
+
+
+# plot detail map =========================================================================================
+
+gmtset PAGE_ORIENTATION portrait  PAPER_MEDIA Custom_425x425
+
+ROOT_NAME=${INSTANCE_PATH_NAME}/events/hypo.${HYPO_EVENT_ID}.map
+PS_NAME=${ROOT_NAME}.ps
+#echo "PS_NAME ${PS_NAME}"
+Y_POS=0
+pstext -R0/1/0/1 -JX1 -Y${Y_POS} -N -K << END > ${PS_NAME}
+-999 -999  4 0 3 BL  X
+END
+
+R_VAL=-Rg
+LAT_CENT=45
+J_VAL=-JG12.5/${LAT_CENT}/75000/0/0/0/5/4.7/13.7c
+X_POS=0.39
+Y_POS=0.80
+B_VAL=-B10g10/10g10nWENS
+N_VAL=NO
+AUTO_CENTER_MAP=YES
+SINGLE_EVENT_HYPO_EVENT_ID=${HYPO_EVENT_ID}	# must use NO to plot all events
+./plot_warning_map_GMT4.gmt ${SAVE_DIR} ${ROOT_OUT_PATH} ${INSTANCE_PATH_NAME} ${INSTANCE_NAME} ${RUN_NAME} ${X_POS} ${Y_POS} \
+${R_VAL} ${J_VAL} ${B_VAL} ${N_VAL} ${AUTO_CENTER_MAP} ${LAT_CENT} ${SINGLE_EVENT_HYPO_EVENT_ID} ${PLOT_MAP_MECHANISM_TYPE} ${PS_NAME}
+
+Y_POS=0
+pstext -R0/1/0/1 -JX1 -Y${Y_POS} -N -O << END >> ${PS_NAME}
+-999 -999  4 0 3 BL  X
+END
+
+if [ ${USE_CONVERT_FOR_PS2JPG} == NO ] ; then
+	COMMAND="gs -dNOPAUSE -sDEVICE=jpeg -r300 -sOutputFile=${ROOT_NAME}.jpg ${PS_NAME} -c quit"
+else
+	COMMAND="convert -density 200 -quality 85  ${PS_NAME} ${ROOT_NAME}.jpg"
+fi
+#echo ${COMMAND}
+${COMMAND} >> ./plot_warning_report.log
+rm ${PS_NAME}
+cp -p ${ROOT_NAME}.jpg ${SAVE_DIR}
+
+
+#echo "DEBUG: plot_event_info_GMT4.gmt: dt=${SECONDS}: TP 3"
+
+
+# gmt_shell_functions
+rm -rf $GMT_TMPDIR
+unset GMT_TMPDIR

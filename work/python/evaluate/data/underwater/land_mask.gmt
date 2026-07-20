@@ -1,0 +1,70 @@
+#!/bin/bash
+
+PS_NAME=land_mask.ps
+
+gmtset PAGE_ORIENTATION portrait
+
+# GMT version specific settings
+GMT --version 2> _temp_.txt
+{
+read -a tokens 
+} < _temp_.txt
+export GMT_VERSION=${tokens[2]}
+#echo "GMT --version:" ${GMT_VERSION}
+export M_SYNTAX=-m
+if [ ${GMT_VERSION%.*} =  4.4 ]; then
+export M_SYNTAX=-M
+fi
+# NOTE: -gD20c important to avoid stray lines in regional views.
+G_VAL=-gD10c
+# 20110107 AJL - may be causing postscript errors ???
+#G_VAL=
+if [ ${GMT_VERSION%.*} =  4.4 ]; then
+G_VAL=
+fi
+
+
+# generate percent probability underwater grid
+
+if [ YES = NO ]; then
+
+	R_VAL=-R0/360/-90/90 ; J_VAL=-JN150/18c
+	
+	DEGREE_STEP=0.05	# ~5km
+	#FILTER_WIDTH=40
+	FILTER_WIDTH=20		# diameter of filter
+	
+	# create land mask grd (0/200)
+	grdlandmask ${R_VAL} -Dh -I${DEGREE_STEP} -N100/0/0/0/0 -Gland_mask.grd -V
+	# smooth land/ocean boundary
+	grdfilter land_mask.grd -Gfiltered_land_mask.grd -Fb${FILTER_WIDTH} -D4 -V
+	# create ocean mask grd
+	grdmath land_mask.grd -100 DIV 1 ADD = ocean_mask.grd
+	# truncate smooth land/ocean boundary at coast, multiply by 2 to get 0-100 range on land
+	#grdmath ocean_mask.grd filtered_land_mask.grd MUL 2 MUL = temp1.grd
+	# truncate smooth land/ocean boundary at coast, multiply by 1 to get 0-50 range on land
+	grdmath ocean_mask.grd filtered_land_mask.grd MUL 1 MUL = temp1.grd
+	rm ocean_mask.grd filtered_land_mask.grd
+	# combine land mask with truncate smooth land/ocean boundary at coast
+	grdmath land_mask.grd temp1.grd ADD = temp2.grd
+	rm  land_mask.grd temp1.grd
+	# clip to 0-100 range
+	grdclip temp2.grd -Gpercent_prob_underwater.grd -Sa100/100 -Sb0/0
+	rm temp2.grd
+	# convert to table
+	grd2xyz percent_prob_underwater.grd -ZBLc > percent_prob_underwater.table
+	cat << END > percent_prob_underwater.hdr
+${DEGREE_STEP} ${R_VAL}
+END
+
+fi
+
+
+# plot sample of grid
+
+R_VAL=-R110/140/-15/15 ; J_VAL=-JN125/18c
+
+grdimage percent_prob_underwater.grd ${J_VAL} ${R_VAL} -Cland_mask.cpt -Sn -Xc -Yc -K > ${PS_NAME}
+pscoast ${J_VAL} ${R_VAL} -Dh -W -O -K >> ${PS_NAME}
+psxy ${M_SYNTAX} ../plate_boundaries/PB2002_steps.dat.txt.SUB.xy ${R_VAL} ${J_VAL} ${G_VAL} -W4,191/0/0 -O -K >> ${PS_NAME}
+psbasemap ${J_VAL} ${R_VAL} -B5g5/5g5:.LandMask: -L118/-13/0/100 -O >> ${PS_NAME}

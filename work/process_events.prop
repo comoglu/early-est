@@ -1,0 +1,137 @@
+# application properties file for processEvents.py
+
+# uses #/ for documentation comments
+
+#/ Syntax
+#/ 
+#/ Structure of a settings entity: A settings entity is a tree of depth 2. At the top level are the section nodes that represent isolated sections of application settings (e.g. general application properties, font attributes, color attributes, and so on). At the bottom level are the key-value pairs that represent set values for keys inside a particular section.
+#/ 
+#/ A settings entity is read from and written to disk using a textual format. The textual format is parsed by sequentially scanning each line. Blank lines are ignored. For all other lines, leading and trailing blanks are ignored. Sections are enclosed by square brackets ("[" and "]") on separate lines. Key-value pairs are written as the key followed by a single equal sign ("="), followed by the value, all of which must be together on one separate line. A key-value pair is associated to the last seen section. A key-value pair is not valid until at least one section has been seen. All lines that start with a hash ("#") are considered comments and are ignored. Empty sections, that is, sections that do not contain any key-value pairs, are not written to disk. Empty sections can be present in the textual format. However, they are ignored when creating a settings entity in memory.
+#/ 
+#/ A value can be a single or multi-valued. A multi-valued value is a tuple. Tuples are separated by comma and are singly-typed. This means that a tuple can only contain objects of one kind (e.g. integer tuples, double tuples, etc.). 
+
+#/
+#/  Boolean options: accepted values are "1", "yes", "true", and "on", for True, and "0", "no", "false", and "off", for False. These string values are checked in a case-insensitive manner.
+
+
+#/
+#/ =========================================
+#/ [EventInfo]
+#/   properties file section with settings for event info generation
+[EventInfo]
+#
+#/ -------------------------------
+#/ warning.colors.show
+#/   enable or disable display of warning level colors (grey, green, yellow, red) (1, 0)
+#/   default: 0
+warning.colors.show = 0
+#
+#/ -------------------------------
+#/ location_map.write
+#/   enable or disable HTML output of event location map (1, 0)
+#/   default: 1
+location_map.write = 1
+#
+#/ -------------------------------
+#/ tsunami.write
+#/   enable or disable HTML output of Tsunamigeneic Assesment (1, 0)
+#/   default: 1
+tsunami.write = 1
+#
+#/ -------------------------------
+#/ tsunami.evaluation.write
+#/   enable or disable HTML output of Tsunamigeneic Assesment -> Tsunami evaluation (1, 0)
+#/   default: 0
+tsunami.evaluation.write = 0
+#
+#/ -------------------------------
+#/ tsunami.decision_table.write
+#/   enable or disable HTML output of Tsunamigeneic Assesment -> Decision table (1, 0)
+#/   default: 0
+tsunami.decision_table.write = 1
+#
+#/ -------------------------------
+#/ tsunami.decision_table.colors.show
+#/   enable or disable warning level colors in HTML output of Tsunamigeneic Assesment -> Decision table (1, 0)
+#/   default: 1
+tsunami.decision_table.colors.show = 1
+#
+#/ -------------------------------
+#/ first_motion_mech.run.hash
+#/   enable or disable running of HASH First-motion Focal Mechanism (1, 0)
+#/   default: 0
+first_motion_mech.run.hash = 1
+#
+#/ -------------------------------
+#/ first_motion_mech.run.fmamp.polarity
+#/   enable or disable running of fmamp First-motion Focal Mechanism using first-motion and waveform polarities (1, 0)
+#/   default: 1
+first_motion_mech.run.fmamp.polarity = 1
+#
+#/ -------------------------------
+#/ first_motion_mech.run.fmamp.polarity.waveform
+#/   enable or disable running of fmamp First-motion Focal Mechanism using waveform polarities only (1, 0)
+#/   default: 0
+first_motion_mech.run.fmamp.polarity.waveform = 1
+#
+#/ -------------------------------
+#/ first_motion_mech.run.fmamp.amplitude
+#/   enable or disable running of fmamp First-motion Focal Mechanism using amplitudes (1, 0)
+#/   default: 0
+first_motion_mech.run.fmamp.amplitude = 0
+#
+#/ -------------------------------
+#/ first_motion_mech.write
+#/   enable or disable HTML output of First-motion Focal Mechanism (1, 0)
+#/   default: first_motion_mech.run
+first_motion_mech.write = 1
+#
+#/ -------------------------------
+#/ tsunami.tsunami_rupture_predicitions.write
+#/   enable or disable HTML output of predicted tsunami and rupture parameters (1, 0)
+#/   default: 0
+tsunami.tsunami_rupture_predicitions.write = 1
+#
+#/ -------------------------------
+#/ tsunami.tsunami_rupture_predicitions.ff_duration.pkl_file_root
+#/   root path and name for saved prediction file set
+#/   default: None
+tsunami.tsunami_rupture_predicitions.ff_duration.pkl_file_root = tsunamiLearn_regressors/ff_duration_ElasticNet_a_0.1_l1r_0.1
+#
+#/ -------------------------------
+#/ tsunami.tsunami_rupture_predicitions.ff_rupture_area.pkl_file_root
+#/   root path and name for saved prediction file set
+#/   default: None
+tsunami.tsunami_rupture_predicitions.ff_rupture_area.pkl_file_root = tsunamiLearn_regressors/ff_rupture_area_ElasticNet_a_0.1_l1r_0.1
+#
+#/ -------------------------------
+#/ tsunami.tsunami_rupture_predicitions.at.pkl_file_root
+#/   root path and name for saved prediction file set
+#/   default: None
+tsunami.tsunami_rupture_predicitions.at.pkl_file_root = tsunamiLearn_regressors/At_ElasticNet_a_0.001_l1r_0.95
+#
+#/ -------------------------------
+#/ tsunami.tsunami_rupture_predicitions.it.pkl_file_root
+#/   root path and name for saved prediction file set
+#/   default: None
+tsunami.tsunami_rupture_predicitions.it.pkl_file_root = tsunamiLearn_regressors/It_ElasticNet_a_0.01_l1r_0.1
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,8 @@
+# GMT common arguments shelf
+-B5g5/5g5:.LandMask:
+-JN125/18c
+-R110/140/-15/15
+-Xc
+-Yc
+-jN125/18c
+EOF

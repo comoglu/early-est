@@ -1,0 +1,8 @@
+GMT Version 4.5.7
+Copyright 1991-2011 Paul Wessel and Walter H. F. Smith
+
+This program comes with NO WARRANTY, to the extent permitted by law.
+You may redistribute copies of this program under the terms of the
+GNU General Public License.
+For more information about these matters, see the file named LICENSE.TXT.
+For a brief description of GMT programs, type GMT --help

@@ -1,0 +1,508 @@
+#!/bin/bash
+
+SECONDS=0
+#echo "DEBUG: plot_warning_map_GMT4.gmt: dt=${SECONDS}: TP 0"
+
+# gmt_shell_functions
+# These functions can be used from any sh/bash script by specifying
+# . gmt_shell_functions.sh
+# in your script.  See our script template gmt_script.sh for usage.
+#export GMT_TMPDIR=`mktemp -d ${TMPDIR:-/tmp}/gmt.warning_map.XXXXXX`
+
+
+#./plot_warning_map.gmt
+
+SAVE_DIR=$1
+#echo "SAVE_DIR ${SAVE_DIR}"
+
+ROOT_OUT_PATH=$2
+#echo "ROOT_OUT_PATH ${ROOT_OUT_PATH}"
+
+INSTANCE_PATH_NAME=$3
+#echo "INSTANCE_PATH_NAME ${INSTANCE_PATH_NAME}"
+
+INSTANCE_NAME=$4
+#echo "INSTANCE_NAME ${INSTANCE_NAME}"
+
+RUN_NAME=$5
+#echo "RUN_NAME ${RUN_NAME}"
+
+X_POS=$6
+#echo "X_POS ${X_POS}"
+
+Y_POS=$7
+#echo "Y_POS ${Y_POS}"
+
+R_VAL=$8
+#echo "R_VAL ${R_VAL}"
+
+J_VAL=$9
+#echo "J_VAL ${J_VAL}"
+
+B_VAL=${10}
+#echo "B_VAL ${B_VAL}"
+
+N_VAL=${11}
+#echo "N_VAL ${N_VAL}"
+if [ ${N_VAL} =  YES ]; then
+N_VAL=-N
+else
+N_VAL=
+fi
+
+AUTO_CENTER_MAP=${12}
+#echo "AUTO_CENTER_MAP ${AUTO_CENTER_MAP}"
+
+LAT_CENT=${13}
+#echo "LAT_CENT ${LAT_CENT}"
+
+# NOTE: zero based index !!!
+#        must use NO to plot all events
+SINGLE_EVENT_HYPO_EVENT_ID=${14}
+#echo "SINGLE_EVENT_HYPO_EVENT_ID ${SINGLE_EVENT_HYPO_EVENT_ID}"
+
+PLOT_MAP_MECHANISM_TYPE=${15}
+#echo "PLOT_MAP_MECHANISM_TYPE ${PLOT_MAP_MECHANISM_TYPE}"
+
+PS_NAME=${16}
+#echo "PS_NAME ${PS_NAME}"
+
+#PLOT_PREVOUS_EVENTS=BELOW
+PLOT_PREVOUS_EVENTS=ABOVE
+
+
+###########################################################################
+# functions
+
+plot_previous_events() {
+
+	# plot previous events
+	# event_id assoc_ndx loc_seq_num ph_assoc ph_used dmin(deg) gap1(deg) gap2(deg) atten sigma_otime(sec) otime(UTC) lat(deg) lon(deg) errH(km) depth(km) errZ(km) Q T50Ex n Td(sec) n TdT50Ex WL_col mb n Mwp n T0(sec) n Mwpd n region n_sta_tot n_sta_active assoc_latency
+
+#rm -f ${GMT_TMPDIR}/_temp_hypolist.xy
+	{
+		read dummy	# header line
+		while read -a tokens ; do
+			cat << END  >> ${GMT_TMPDIR}/_temp_hypolist.xy
+			${tokens[11]} ${tokens[12]} ${tokens[23]} ${tokens[16]}
+END
+		done
+	} < ${ROOT_OUT_PATH}/hypolist.csv
+	if [ -f ${GMT_TMPDIR}/_temp_hypolist.xy ] ; then
+		#psxy ${GMT_TMPDIR}/_temp_hypolist.xy ${R_VAL} ${J_VAL} -: ${N_VAL} -Scp -Gwhite -O -K >> ${PS_NAME}
+		psxy ${GMT_TMPDIR}/_temp_hypolist.xy ${R_VAL} ${J_VAL} -: ${N_VAL} -Scp -G0/255/255 -O -K >> ${PS_NAME}
+		psxy ${GMT_TMPDIR}/_temp_hypolist.xy ${R_VAL} ${J_VAL} -: ${N_VAL} -Scp -W1,black -O -K >> ${PS_NAME}
+	fi
+
+}
+
+# functions
+###########################################################################
+
+
+PLOT_DATA_PATH=${INSTANCE_PATH_NAME}/plot
+
+declare -a HYPO_COLOR
+HYPO_COLOR[0]=31/31/191
+if [ ${SINGLE_EVENT_HYPO_EVENT_ID} = NO ]; then
+	HYPO_COLOR[1]=159/31/159
+	HYPO_COLOR[1]=159/31/159
+	HYPO_COLOR[2]=31/127/0
+	HYPO_COLOR[3]=159/95/0
+	HYPO_COLOR[4]=31/31/191
+	HYPO_COLOR[5]=159/31/159
+	HYPO_COLOR[6]=31/127/0
+	HYPO_COLOR[7]=159/95/0
+	HYPO_COLOR[8]=31/31/191
+	HYPO_COLOR[9]=159/31/159
+	HYPO_COLOR[10]=31/127/0
+	HYPO_COLOR[11]=159/95/0
+	HYPO_COLOR[12]=31/31/191
+	HYPO_COLOR[13]=159/31/159
+	HYPO_COLOR[14]=31/127/0
+	HYPO_COLOR[15]=159/95/0
+	HYPO_COLOR[16]=31/31/191
+	HYPO_COLOR[17]=159/31/159
+	HYPO_COLOR[18]=31/127/0
+	HYPO_COLOR[19]=159/95/0
+else
+	HYPO_COLOR[1]=${HYPO_COLOR[0]}
+	HYPO_COLOR[2]=${HYPO_COLOR[0]}
+	HYPO_COLOR[3]=${HYPO_COLOR[0]}
+	HYPO_COLOR[4]=${HYPO_COLOR[0]}
+	HYPO_COLOR[5]=${HYPO_COLOR[0]}
+	HYPO_COLOR[6]=${HYPO_COLOR[0]}
+	HYPO_COLOR[7]=${HYPO_COLOR[0]}
+	HYPO_COLOR[8]=${HYPO_COLOR[0]}
+	HYPO_COLOR[9]=${HYPO_COLOR[0]}
+	HYPO_COLOR[11]=${HYPO_COLOR[0]}
+	HYPO_COLOR[12]=${HYPO_COLOR[0]}
+	HYPO_COLOR[13]=${HYPO_COLOR[0]}
+	HYPO_COLOR[14]=${HYPO_COLOR[0]}
+	HYPO_COLOR[15]=${HYPO_COLOR[0]}
+	HYPO_COLOR[16]=${HYPO_COLOR[0]}
+	HYPO_COLOR[17]=${HYPO_COLOR[0]}
+	HYPO_COLOR[18]=${HYPO_COLOR[0]}
+	HYPO_COLOR[19]=${HYPO_COLOR[0]}
+fi
+# assumes maximum of 20 hypocenters (see timedomain_processing_report.h: #define MAX_NUM_HYPO)
+
+
+#PLATE_BOUNDARY_COLOR=31
+
+#COAST_LAND_COLOR=223
+#COAST_LAND_COLOR=207
+#COAST_LAND_COLOR=223/207/191
+COAST_LAND_COLOR=239/199/159
+#COAST_OCEAN_COLOR=255
+# 20160126 AJL  COAST_OCEAN_COLOR=223/239/255
+COAST_OCEAN_COLOR=231/239/255
+COAST_BOUNDARIES_COLOR=255
+#
+#COAST_LAND_COLOR=255
+#COAST_OCEAN_COLOR=223
+#COAST_BOUNDARIES_COLOR=127
+#
+STA_REQUESTED_COLOR=255
+#STA_ACTIVE_COLOR=191
+STA_ACTIVE_COLOR=175
+
+# invert map colors
+if [ NO = YES ]; then
+	COAST_LAND_COLOR=63
+	COAST_OCEAN_COLOR=0
+	COAST_BOUNDARIES_COLOR=0
+	#
+	STA_REQUESTED_COLOR=127
+	STA_ACTIVE_COLOR=255
+fi
+
+
+#gmtset ANNOT_FONT_SIZE_PRIMARY 6   ANNOT_OFFSET_PRIMARY 0.15   ANNOT_MIN_SPACING 0.5
+#gmtset FRAME_PEN 0.5   GRID_PEN_PRIMARY 1/127  PLOT_DEGREE_FORMAT D
+
+gmtset ANNOT_FONT_PRIMARY 1  LABEL_FONT 1
+gmtset ANNOT_FONT_SIZE_PRIMARY 6  LABEL_FONT_SIZE 8
+gmtset ANNOT_OFFSET_PRIMARY 0.1 LABEL_OFFSET -0.09c
+gmtset ANNOT_MIN_SPACING 0.5
+gmtset BASEMAP_FRAME_RGB 0/0/0
+gmtset FRAME_PEN 2.0   GRID_PEN_PRIMARY 1/127  PLOT_DEGREE_FORMAT D
+gmtset TICK_LENGTH 0.1c
+gmtset PSIMAGE_FORMAT hex
+
+#echo "DEBUG: plot_warning_map_GMT4.gmt: dt=${SECONDS}: TP 1"
+
+# parameters
+#t50 1.000000 61.016667 2010.01.27-19:42:38 2010.01.27-20:43:39 167 176 1
+read DUMMY CRITICAL_VALUE TIME_AXIS_LEN PLOT_START_TIME PLOT_END_TIME TIME_STEP N_ACTIVE N_HAS_BEEN_ACTIVE N_HYPOCENTERS < ${INSTANCE_PATH_NAME}/${RUN_NAME}.csv
+declare -i ITERATION_MAX_HYPOCENTERS=${N_HYPOCENTERS}
+
+
+# set alarm color and map size
+declare -a ALARM_COLOR
+ALARM_COLOR[0]=255
+declare -i HYPO_INDEX=0
+declare -a HYPO_EVENT_ID
+FIRST=YES
+{
+	while read -a tokens ; do
+		HYPO_INDEX=${tokens[1]}-1
+		HYPO_EVENT_ID[HYPO_INDEX]=${tokens[0]}
+		ALARM_COLOR[${HYPO_INDEX}]=255
+			if [ ${tokens[21]} = RED ]; then
+				ALARM_COLOR[${HYPO_INDEX}]=255/0/0
+			elif  [ ${tokens[21]} = YELLOW ]; then
+				ALARM_COLOR[${HYPO_INDEX}]=255/255/0
+			elif  [ ${tokens[21]} = GREEN ]; then
+				ALARM_COLOR[${HYPO_INDEX}]=0/255/0
+			elif  [ ${tokens[21]} = GREY ]; then
+				#ALARM_COLOR[${HYPO_INDEX}]=191
+				ALARM_COLOR[${HYPO_INDEX}]=255
+			fi
+		if [ ${AUTO_CENTER_MAP} = YES ]; then
+			if [ ${FIRST} = YES ] || [ ${HYPO_EVENT_ID[${HYPO_INDEX}]} = ${SINGLE_EVENT_HYPO_EVENT_ID} ]; then
+				if [ ${SINGLE_EVENT_HYPO_EVENT_ID} != NO ]; then
+					VIEW_HEIGHT=4.95
+				else
+					VIEW_HEIGHT=4.8
+					if [ $((${ITERATION_MAX_HYPOCENTERS} <= 1)) = 1 ]; then
+						VIEW_HEIGHT=4.8
+					elif [ $((${ITERATION_MAX_HYPOCENTERS} <= 2)) = 1 ]; then
+						VIEW_HEIGHT=4.73
+					elif [ $((${ITERATION_MAX_HYPOCENTERS} <= 3)) = 1 ]; then
+						VIEW_HEIGHT=4.66
+					elif [ $((${ITERATION_MAX_HYPOCENTERS} <= 4)) = 1 ]; then
+						VIEW_HEIGHT=4.59
+					elif [ $((${ITERATION_MAX_HYPOCENTERS} <= 5)) = 1 ]; then
+						VIEW_HEIGHT=4.52
+					elif [ $((${ITERATION_MAX_HYPOCENTERS} <= 6)) = 1 ]; then
+						VIEW_HEIGHT=4.45
+					elif [ $((${ITERATION_MAX_HYPOCENTERS} <= 7)) = 1 ]; then
+						VIEW_HEIGHT=4.38
+					elif [ $((${ITERATION_MAX_HYPOCENTERS} <= 8)) = 1 ]; then
+						VIEW_HEIGHT=4.31
+					elif [ $((${ITERATION_MAX_HYPOCENTERS} <= 9)) = 1 ]; then
+						VIEW_HEIGHT=4.24
+					elif [ $((${ITERATION_MAX_HYPOCENTERS} <= 10)) = 1 ]; then
+						VIEW_HEIGHT=4.17
+					fi
+				fi
+				R_VAL=-Rg
+				J_VAL=-JG${tokens[12]}/${tokens[11]}/75000/0/0/0/5/${VIEW_HEIGHT}/13.7c
+				LAT_CENT=${tokens[11]}
+    		fi
+    	fi
+    	FIRST=NO
+	done
+} < ${INSTANCE_PATH_NAME}/hypos_pretty.csv > ${GMT_TMPDIR}/_temp_.txt
+
+#echo "DEBUG: plot_warning_map_GMT4.gmt: dt=${SECONDS}: TP 2"
+
+# if there is a hypocenter, center regional map on 1st hypocenter
+# Euro-Med map
+#R_VAL=-R-20/15/100/75r
+#J_VAL=-JQ40/45/13.7c
+
+# scale for auto-center zoom map
+L_VAL=
+if [ ${AUTO_CENTER_MAP} = YES ]; then
+	L_VAL=-Lfx3/0.9/${LAT_CENT}/2000+u
+fi
+
+pscoast ${R_VAL} ${J_VAL} ${B_VAL} ${L_VAL} -Dl -A1000  -G${COAST_LAND_COLOR}  -S${COAST_OCEAN_COLOR}  -N1/2/${COAST_BOUNDARIES_COLOR} -X${X_POS} -Y${Y_POS}  -P  -O -K >> ${PS_NAME}
+
+#echo "DEBUG: plot_warning_map_GMT4.gmt: dt=${SECONDS}: TP 3"
+
+
+# NOTE: -gD20c important to avoid stray lines in regional views.
+G_VAL=-gD10c
+# 20110107 AJL - may be causing postscript errors ???
+#G_VAL=
+if [ ${GMT_VERSION%.*} =  4.4 ]; then
+G_VAL=
+fi
+#psxy ${M_SYNTAX} plates.lonlat ${R_VAL} ${J_VAL} ${G_VAL} -W2,${PLATE_BOUNDARY_COLOR} -O -K >> ${PS_NAME}
+#psxy ${M_SYNTAX} PB2002_steps.dat.txt ${R_VAL} ${J_VAL} ${G_VAL} -W2,${PLATE_BOUNDARY_COLOR} -O -K >> ${PS_NAME}
+
+#white, black, and [light$\vert$dark]{red, orange, yellow, green, cyan, blue, magenta, gray$\vert$grey, brown}
+#        Subduction zones (SUB)
+psxy ${M_SYNTAX} PB2002_steps.dat.txt.SUB.xy ${R_VAL} ${J_VAL} ${G_VAL} -W4,191/0/0 -O -K >> ${PS_NAME}
+#        oceanic spreading ridge (OSR)
+psxy ${M_SYNTAX} PB2002_steps.dat.txt.OSR.xy ${R_VAL} ${J_VAL} ${G_VAL} -W2,0/127/0 -O -K >> ${PS_NAME}
+#        oceanic transform fault (OTF)
+psxy ${M_SYNTAX} PB2002_steps.dat.txt.OTF.xy ${R_VAL} ${J_VAL} ${G_VAL} -W2,191/0/0 -O -K >> ${PS_NAME}
+#        continental rift boundary (CRB)
+psxy ${M_SYNTAX} PB2002_steps.dat.txt.CRB.xy ${R_VAL} ${J_VAL} ${G_VAL} -W2,0/127/0 -O -K >> ${PS_NAME}
+#        continental transform fault (CTF)
+psxy ${M_SYNTAX} PB2002_steps.dat.txt.CTF.xy ${R_VAL} ${J_VAL} ${G_VAL} -W2,191/0/0 -O -K >> ${PS_NAME}
+#
+# 20120111 AJL - remove (?) convergent boundaries since some are not well defined faults ???
+#        oceanic convergent boundary (OCB)
+psxy ${M_SYNTAX} PB2002_steps.dat.txt.OCB.xy ${R_VAL} ${J_VAL} ${G_VAL} -W2,darkbrown -O -K >> ${PS_NAME}
+#        continental convergent boundary (CCB)
+psxy ${M_SYNTAX} PB2002_steps.dat.txt.CCB.xy ${R_VAL} ${J_VAL} ${G_VAL} -W2,darkbrown -O -K >> ${PS_NAME}
+
+#echo "DEBUG: plot_warning_map_GMT4.gmt: dt=${SECONDS}: TP 4"
+
+# plot previous events
+if [ ${PLOT_PREVOUS_EVENTS} = BELOW ]; then
+	plot_previous_events
+fi
+
+
+declare -i I_N_HYPO=0
+while [ $((${I_N_HYPO} < ${ITERATION_MAX_HYPOCENTERS})) = 1 ]; do
+	if [ ${SINGLE_EVENT_HYPO_EVENT_ID} = NO ] || [ ${HYPO_EVENT_ID[${I_N_HYPO}]} = ${SINGLE_EVENT_HYPO_EVENT_ID} ]; then
+		# hypocenter grid
+		psxy ${PLOT_DATA_PATH}/hypo.${I_N_HYPO}.grid.xy ${R_VAL} ${J_VAL} -: ${N_VAL} -Sc -G${HYPO_COLOR[${I_N_HYPO}]}  -O -K >> ${PS_NAME}
+	fi
+	I_N_HYPO=I_N_HYPO+1
+done
+
+# using -g here sometimes causes postscript error
+#G_VAL=
+# WARNING: in psxy below, do not us +v in -S option, sometimes causes postscript error
+declare -i I_N_HYPO=${ITERATION_MAX_HYPOCENTERS}-1
+while [ $((${I_N_HYPO} >= 0)) = 1 ]; do
+	if [ ${SINGLE_EVENT_HYPO_EVENT_ID} = NO ] || [ ${HYPO_EVENT_ID[${I_N_HYPO}]} = ${SINGLE_EVENT_HYPO_EVENT_ID} ]; then
+		# hypocenter P wavefront
+		#psxy ${PLOT_DATA_PATH}/hypo.${I_N_HYPO}.pwavefront.xy ${R_VAL} ${J_VAL} ${G_VAL} -m -Sqd3c:+Lh+s6+k${HYPO_COLOR[${I_N_HYPO}]} -: -W3,${HYPO_COLOR[${I_N_HYPO}]}  -O -K >> ${PS_NAME}
+		psxy ${PLOT_DATA_PATH}/hypo.${I_N_HYPO}.pwavefront.xy ${R_VAL} ${J_VAL} ${G_VAL} \
+			-m -Sqd4c:+Lh+s6+k${HYPO_COLOR[${I_N_HYPO}]} -: -W4,${HYPO_COLOR[${I_N_HYPO}]}  -O -K >> ${PS_NAME}
+		# hypocenter S wavefront
+		#psxy ${PLOT_DATA_PATH}/hypo.${I_N_HYPO}.swavefront.xy ${R_VAL} ${J_VAL} ${G_VAL} -m -Sqd3c:+Lh+s6+k${HYPO_COLOR[${I_N_HYPO}]} -: -W2,${HYPO_COLOR[${I_N_HYPO}]},-  -O -K >> ${PS_NAME}
+		psxy ${PLOT_DATA_PATH}/hypo.${I_N_HYPO}.swavefront.xy ${R_VAL} ${J_VAL} ${G_VAL} \
+			-m -Sqd4c:+Lh+s6+k${HYPO_COLOR[${I_N_HYPO}]} -: -W2,${HYPO_COLOR[${I_N_HYPO}]},  -O -K >> ${PS_NAME}
+		# hypocenter distance limits
+		#psxy ${PLOT_DATA_PATH}/hypo.${I_N_HYPO}.dist_limits.xy ${R_VAL} ${J_VAL} ${G_VAL} -m -Sqd4c:+Lh+s6+k127+f0 -: -W2,95,.  -O -K >> ${PS_NAME}
+		#20110321TEST psxy ${PLOT_DATA_PATH}/hypo.${I_N_HYPO}.dist_limits.xy ${R_VAL} ${J_VAL} ${G_VAL} -m -Sqd5c:+Lh+s6+k63+f0 -: -W1,127  -O -K >> ${PS_NAME}
+		#20110325TEST 
+		psxy ${PLOT_DATA_PATH}/hypo.${I_N_HYPO}.dist_limits.xy ${R_VAL} ${J_VAL} ${G_VAL} \
+			-m -: -W1,127  -O -K >> ${PS_NAME}
+	fi
+	I_N_HYPO=I_N_HYPO-1
+done
+#echo "DEBUG: plot_warning_map_GMT4.gmt: dt=${SECONDS}: TP 5"
+
+
+cat << END > _temp_rectangle.def
+ 0.5  0.25 M
+ 0.5 -0.25 D
+-0.5 -0.25 D
+-0.5  0.25 D
+ 0.5  0.25 D
+END
+declare -a SYMBOL
+SYMBOL[0]=-Sk_temp_rectangle/0.50
+SYMBOL[1]=-Sk_temp_rectangle/0.55
+SYMBOL[2]=-Sk_temp_rectangle/0.60
+SYMBOL[3]=-Sk_temp_rectangle/0.50
+SYMBOL[4]=-Sk_temp_rectangle/0.55
+SYMBOL[5]=-Sk_temp_rectangle/0.60
+SYMBOL[6]=-Sk_temp_rectangle/0.50
+SYMBOL[7]=-Sk_temp_rectangle/0.55
+SYMBOL[8]=-Sk_temp_rectangle/0.60
+SYMBOL[9]=-Sk_temp_rectangle/0.50	   
+# assumes maximum of 10 hypocenters (see duration_exceedence_report.h: #define MAX_NUM_HYPO)
+cat << END > _temp_rectangle_upper_left.def
+ 0.48  0.23 M
+-0.48 -0.23 D
+-0.48  0.23 D
+ 0.48  0.23 D
+END
+SYMBOL_UPPER_LEFT=-Sk_temp_rectangle_upper_left/0.50
+cat << END > _temp_rectangle_lower_right.def
+ 0.48  0.23 M
+ 0.48 -0.23 D
+-0.48 -0.23 D
+ 0.48  0.23 D
+END
+SYMBOL_LOWER_RIGHT=-Sk_temp_rectangle_lower_right/0.50
+# plot requested and active background colors
+psxy ${PLOT_DATA_PATH}/sta.requested.xy ${R_VAL} ${J_VAL} -: ${N_VAL} ${SYMBOL[0]} -W1,0/0/0 -G${STA_REQUESTED_COLOR}  -O -K >> ${PS_NAME}
+psxy ${PLOT_DATA_PATH}/sta.healthy.xy ${R_VAL} ${J_VAL} -: ${N_VAL} ${SYMBOL[0]} -W1,0/0/0 -G${STA_ACTIVE_COLOR}  -O -K >> ${PS_NAME}
+# plot available warning levels - t50
+psxy ${PLOT_DATA_PATH}/t50.sta.ltgreen.xy ${R_VAL} ${J_VAL} -: ${N_VAL} ${SYMBOL_LOWER_RIGHT} -G127/191/127  -O -K >> ${PS_NAME}
+psxy ${PLOT_DATA_PATH}/t50.sta.ltyellow.xy ${R_VAL} ${J_VAL} -: ${N_VAL} ${SYMBOL_LOWER_RIGHT} -G191/191/127  -O -K >> ${PS_NAME}
+psxy ${PLOT_DATA_PATH}/t50.sta.ltred.xy ${R_VAL} ${J_VAL} -: ${N_VAL} ${SYMBOL_LOWER_RIGHT} -G191/127/127  -O -K >> ${PS_NAME}
+psxy ${PLOT_DATA_PATH}/t50.sta.green.xy ${R_VAL} ${J_VAL} -: ${N_VAL} ${SYMBOL_LOWER_RIGHT} -G0/255/0  -O -K >> ${PS_NAME}
+psxy ${PLOT_DATA_PATH}/t50.sta.yellow.xy ${R_VAL} ${J_VAL} -: ${N_VAL} ${SYMBOL_LOWER_RIGHT} -G255/255/0  -O -K >> ${PS_NAME}
+psxy ${PLOT_DATA_PATH}/t50.sta.red.xy ${R_VAL} ${J_VAL} -: ${N_VAL} ${SYMBOL_LOWER_RIGHT} -G255/0/0  -O -K >> ${PS_NAME}
+# plot available warning levels - t50
+psxy ${PLOT_DATA_PATH}/tauc.sta.ltgreen.xy ${R_VAL} ${J_VAL} -: ${N_VAL} ${SYMBOL_UPPER_LEFT} -G127/191/127  -O -K >> ${PS_NAME}
+psxy ${PLOT_DATA_PATH}/tauc.sta.ltyellow.xy ${R_VAL} ${J_VAL} -: ${N_VAL} ${SYMBOL_UPPER_LEFT} -G191/191/127  -O -K >> ${PS_NAME}
+psxy ${PLOT_DATA_PATH}/tauc.sta.ltred.xy ${R_VAL} ${J_VAL} -: ${N_VAL} ${SYMBOL_UPPER_LEFT} -G191/127/127  -O -K >> ${PS_NAME}
+psxy ${PLOT_DATA_PATH}/tauc.sta.green.xy ${R_VAL} ${J_VAL} -: ${N_VAL} ${SYMBOL_UPPER_LEFT} -G0/255/0  -O -K >> ${PS_NAME}
+psxy ${PLOT_DATA_PATH}/tauc.sta.yellow.xy ${R_VAL} ${J_VAL} -: ${N_VAL} ${SYMBOL_UPPER_LEFT} -G255/255/0  -O -K >> ${PS_NAME}
+psxy ${PLOT_DATA_PATH}/tauc.sta.red.xy ${R_VAL} ${J_VAL} -: ${N_VAL} ${SYMBOL_UPPER_LEFT} -G255/0/0  -O -K >> ${PS_NAME}
+I_N_HYPO=${ITERATION_MAX_HYPOCENTERS}-1
+while [ $((${I_N_HYPO} >= 0)) = 1 ]; do
+	if [ ${SINGLE_EVENT_HYPO_EVENT_ID} = NO ] || [ ${HYPO_EVENT_ID[${I_N_HYPO}]} = ${SINGLE_EVENT_HYPO_EVENT_ID} ]; then
+		psxy ${PLOT_DATA_PATH}/sta.associated.${I_N_HYPO}.xy ${R_VAL} ${J_VAL} -: ${N_VAL} ${SYMBOL[${I_N_HYPO}]} -W4,${HYPO_COLOR[${I_N_HYPO}]}  -O -K >> ${PS_NAME}
+	fi
+	I_N_HYPO=I_N_HYPO-1
+done
+
+# station codes
+# x,  y,  size,  angle, fontno,  justify,  text
+cat << END > ${GMT_TMPDIR}/_temp_.txt
+END
+{
+while read -a tokens ; do
+	cat << END >> ${GMT_TMPDIR}/_temp_.txt
+	${tokens[0]} ${tokens[1]} 5 0 21 CM ${tokens[2]}
+END
+done
+} < ${PLOT_DATA_PATH}/sta.code.txt
+pstext ${GMT_TMPDIR}/_temp_.txt ${R_VAL} ${J_VAL} -: ${N_VAL} -O -K >> ${PS_NAME}
+
+
+# plot previous events
+if [ ${PLOT_PREVOUS_EVENTS} = ABOVE ]; then
+	plot_previous_events
+fi
+
+#echo "DEBUG: plot_warning_map_GMT4.gmt: dt=${SECONDS}: TP 6"
+
+# hypocenter symbols (stars)
+I_N_HYPO=${ITERATION_MAX_HYPOCENTERS}-1
+while [ $((${I_N_HYPO} >= 0)) = 1 ]; do
+	if [ ${SINGLE_EVENT_HYPO_EVENT_ID} = NO ] || [ ${HYPO_EVENT_ID[${I_N_HYPO}]} = ${SINGLE_EVENT_HYPO_EVENT_ID} ]; then
+		psxy ${PLOT_DATA_PATH}/hypo.${I_N_HYPO}.xy ${R_VAL} ${J_VAL} -: ${N_VAL} -Sa0.7 -W5,${HYPO_COLOR[${I_N_HYPO}]} -G${ALARM_COLOR[${I_N_HYPO}]}  -O -K >> ${PS_NAME}
+		# DEBUGGING - small star
+		#psxy ${PLOT_DATA_PATH}/hypo.${I_N_HYPO}.xy ${R_VAL} ${J_VAL} -: ${N_VAL} -Sa0.6 -W3,${HYPO_COLOR[${I_N_HYPO}]} -G${ALARM_COLOR[${I_N_HYPO}]}  -O -K >> ${PS_NAME}
+	fi
+	I_N_HYPO=I_N_HYPO-1
+done
+
+#echo "DEBUG: plot_warning_map_GMT4.gmt: dt=${SECONDS}: TP 7"
+
+# plot mechanisms
+if [ ${PLOT_MAP_MECHANISM_TYPE} = hash ] || [ ${PLOT_MAP_MECHANISM_TYPE} = fmamp_polarity  ]; then
+
+MECH_SIZE=0.75
+MECH_COLOR=191
+POL_SYM_SIZE=0.15
+FONT_SIZE=-1
+FONT_OFFSET=0
+
+I_N_HYPO=${ITERATION_MAX_HYPOCENTERS}-1
+while [ $((${I_N_HYPO} >= 0)) = 1 ]; do
+
+	if [ ${SINGLE_EVENT_HYPO_EVENT_ID} = NO ] || [ ${HYPO_EVENT_ID[${I_N_HYPO}]} = ${SINGLE_EVENT_HYPO_EVENT_ID} ]; then
+		if [ -f ${INSTANCE_PATH_NAME}/events/hypo.${HYPO_EVENT_ID[${I_N_HYPO}]}.mech.${PLOT_MAP_MECHANISM_TYPE}.preferred.meca ] ; then
+			{
+			read dummy	# header line
+			read -a tokens
+			MECH_LAT=${tokens[0]}
+			MECH_LON=${tokens[1]}
+			MECH_QUALITY=${tokens[13]}
+			
+			MECH_COLOR=${ALARM_COLOR[${I_N_HYPO}]}
+			if  [ ${MECH_COLOR} = 255 ]; then
+				MECH_COLOR=${HYPO_COLOR[${I_N_HYPO}]}
+			fi
+			
+			#echo "${INSTANCE_PATH_NAME}/events/hypo.${HYPO_EVENT_ID[${I_N_HYPO}]}.mech.${PLOT_MAP_MECHANISM_TYPE}.preferred.meca ->  MECH_QUALITY ${MECH_QUALITY}"
+			#if [ ${MECH_QUALITY} = A ] || [ ${MECH_QUALITY} = B ] || [ ${MECH_QUALITY} = C ] || [ ${MECH_QUALITY} = D ]; then
+			if [ ${MECH_QUALITY} = A ] || [ ${MECH_QUALITY} = B ]; then
+				psmeca ${INSTANCE_PATH_NAME}/events/hypo.${HYPO_EVENT_ID[${I_N_HYPO}]}.mech.${PLOT_MAP_MECHANISM_TYPE}.preferred.meca ${R_VAL} ${J_VAL} \
+					-Sa${MECH_SIZE}/${FONT_SIZE}/${FONT_OFFSET} -M -G${MECH_COLOR} -H1 -: -O -K >> ${PS_NAME}
+				psmeca ${INSTANCE_PATH_NAME}/events/hypo.${HYPO_EVENT_ID[${I_N_HYPO}]}.mech.${PLOT_MAP_MECHANISM_TYPE}.preferred.meca ${R_VAL} ${J_VAL} \
+					-Sa${MECH_SIZE}/${FONT_SIZE}/${FONT_OFFSET} -M -W5/${HYPO_COLOR[${I_N_HYPO}]} -T0 -H1 -: -O -K >> ${PS_NAME}
+			fi
+			} < ${INSTANCE_PATH_NAME}/events/hypo.${HYPO_EVENT_ID[${I_N_HYPO}]}.mech.${PLOT_MAP_MECHANISM_TYPE}.preferred.meca
+		fi
+
+	fi
+
+	I_N_HYPO=I_N_HYPO-1
+
+done
+
+fi # plot mechanisms
+
+#echo "DEBUG: plot_warning_map_GMT4.gmt: dt=${SECONDS}: TP 8"
+
+# hypocenter numbers
+if [ $((${ITERATION_MAX_HYPOCENTERS} > 0)) = 1 ] && [ ${SINGLE_EVENT_HYPO_EVENT_ID} = NO ] ; then
+	# x,  y,  size,  angle, fontno,  justify,  text
+	cat << END > ${GMT_TMPDIR}/_temp_.txt
+END
+	{
+	while read -a tokens ; do
+		cat << END >> ${GMT_TMPDIR}/_temp_.txt
+		${tokens[0]} ${tokens[1]} 8 0 1 CM ${tokens[2]}
+END
+	done
+	} < ${PLOT_DATA_PATH}/hypo.txt
+	pstext ${GMT_TMPDIR}/_temp_.txt ${R_VAL} ${J_VAL} -: -D-0.01/0 -G0 -O -K >> ${PS_NAME}
+fi
+
+#echo "DEBUG: plot_warning_map_GMT4.gmt: dt=${SECONDS}: TP 99"
+
+
+# gmt_shell_functions
+#rm -rf $GMT_TMPDIR
+#unset GMT_TMPDIR
+

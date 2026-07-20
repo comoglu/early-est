@@ -1,0 +1,41 @@
+#!/bin/bash
+# Rebuild Early-est streams.list from currently-streaming stations (capped & balanced),
+# and publish stations.json (monitored stations + coords) for the web dashboard.
+WORK=/home/comonvgc/early-est-1.2.9/work
+DOC=/home/comonvgc/early-est.comoglu.com
+SL=/home/comonvgc/seiscomp/bin/slinktool
+ADDR=localhost; MINSTA=3; MAXAGE=900; MAXTOTAL=100
+LOG=/home/comonvgc/early-est/earlyest_monitor.log
+now=$(date -u +%s); tmp=$(mktemp); cand=$(mktemp)
+"$SL" -Q "$ADDR" 2>/dev/null | awk -v now="$now" -v maxage="$MAXAGE" '
+function score(loc,chan,  s){ s=0;
+  if(chan=="BHZ")s+=100; else if(chan=="HHZ")s+=50; else s+=10;
+  if(loc=="00")s+=3; else if(loc==""||loc=="--")s+=2; else s+=1; return s }
+{
+  di=0; for(i=3;i<=NF;i++){ if($i=="D"||$i=="R"||$i=="Q"||$i=="M"){di=i;break} }
+  if(di<4) next
+  chan=$(di-1); if(chan !~ /^[A-Z][A-Z]Z$/) next
+  loc=""; if(di-2>=3){ f=$(di-2); if(f ~ /^[0-9][0-9]$/||f=="--") loc=f }
+  et=$(NF-1)" "$NF; gsub("/"," ",et); split(et,a,"[ :]");
+  t=mktime(a[1]" "a[2]" "a[3]" "a[4]" "a[5]" "int(a[6])); if(now-t>maxage) next
+  key=$1"_"$2; sc=score(loc,chan)
+  if(sc>best[key]){ best[key]=sc; net[key]=$1; sta[key]=$2;
+    sel[key]=((loc!=""&&loc!="--")?loc:"") chan ".D" }
+}
+END{ for(k in sel) print net[k], sta[k], sel[k] }' | sort > "$cand"
+awk '{ r[$1]++; print r[$1]"\t"$1"\t"$2"\t"$3 }' "$cand" | sort -k1,1n -k2,2 \
+  | awk -v max="$MAXTOTAL" 'NR<=max{print $2, $3, $4}' | sort > "$tmp"
+n=$(wc -l < "$tmp")
+if [ "$n" -ge "$MINSTA" ]; then
+  mv "$tmp" "$WORK/streams.list"
+  echo "$(date '+%F %T') refresh_streams: $n stations (cap $MAXTOTAL, $(wc -l <"$cand") avail)" >> "$LOG"
+else
+  rm -f "$tmp"; echo "$(date '+%F %T') refresh_streams: only $n, keeping existing" >> "$LOG"
+fi
+rm -f "$cand"
+# publish stations.json = monitored stations joined with coordinates
+awk 'NR==FNR{lat[$1"_"$2]=$3; lon[$1"_"$2]=$4; next}
+{k=$1"_"$2; if((k in lat) && !seen[k]++){ printf "%s{\"net\":\"%s\",\"sta\":\"%s\",\"lat\":%s,\"lon\":%s}",(p++?",":""),$1,$2,lat[k],lon[k] }}' \
+  "$WORK/local_station_coordinates.csv" "$WORK/streams.list" > /tmp/_sj.txt 2>/dev/null
+{ printf "["; cat /tmp/_sj.txt; printf "]\n"; } > "$DOC/stations.json" 2>/dev/null
+exit 0

@@ -1,0 +1,8610 @@
+/***************************************************************************
+ * timedomain_processing.c:
+ *
+ * TODO: add doc
+ *
+ * Written by Anthony Lomax
+ *   ALomax Scientific www.alomax.net
+ *
+ * modified: 2009.02.03
+ ***************************************************************************/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <float.h>
+#include <time.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include <sys/resource.h>
+#include <dirent.h>
+#include <ftw.h>
+#include <fcntl.h>
+
+#define EXTERN_MODE
+
+//#include "../geometry/geometry.h"
+//#include "../alomax_matrix/alomax_matrix.h"
+//#include "../matrix_statistics/matrix_statistics.h"
+#include "../statistics/statistics.h"
+#include "../picker/PickData.h"
+#include "time_utils.h"
+#include "timedomain_processing_data.h"
+#include "ttimes.h"
+#include "location.h"
+#include "timedomain_processing.h"
+#include "timedomain_processing_report.h"
+#include "timedomain_memory.h"
+#include "timedomain_processes.h"
+#include "timedomain_filter.h"
+#include "../picker/FilterPicker5_Memory.h"
+#include "../picker/FilterPicker5.h"
+#include "../feregion/feregion.h"
+#include "../miniseed_utils/miniseed_utils.h"
+#include "loc2xml.h"
+
+#ifdef USE_JSON_OUTPUT
+#include <json-c/json.h>
+#include "../json/json_lib.h"
+#endif
+
+#include "../response/response_lib.h"
+
+#ifndef _XOPEN_SOURCE   // 20171120 AJL
+// 20160513 - following line added per suggestion by mehmety@boun.edu.tr
+#define _XOPEN_SOURCE 500
+#endif
+
+#define IMIN(a,b) (a<b?a:b)
+
+#define DEBUG 1
+
+#undef USE_MWP_LEVEL_ARRAY
+
+
+
+// locals set from from properties file
+//
+static int num_phase_names_use = -1;
+static char phase_names_use[MAX_NUM_TTIME_PHASES][32];
+static char channel_names_use[MAX_NUM_TTIME_PHASES][128];
+static char time_delay_use[MAX_NUM_TTIME_PHASES][64]; // 20150410 AJL - added
+//
+static double depth_step_full;
+static double depth_min_full; // range defines grid cell limits
+static double depth_max_full; // range defines grid cell limits
+static double lat_step_full;
+static double lat_min_full; // range defines grid cell limits
+static double lat_max_full; // range defines grid cell limits
+static double lon_step_smallest_full; // lon step is nominal for lat = 0 (on equator), will  be adjusted by 1/cos(lat) in assoc/location routine
+static double lon_min_full; // range defines grid cell limits
+static double lon_max_full; // range defines grid cell limits
+//
+static double nomimal_critical_oct_tree_node_size; // nominal (approximate) size of oct tree node that must be reached before accepting a location
+//    may be reduced automatically in location.c -> octtreeGlobalAssociationLocation()
+static double min_critical_oct_tree_node_size; // minimum size of nomimal_critical_oct_tree_node_size
+static double nominal_oct_tree_min_node_size; // nominal (approximate) minimum size of oct tree node to be used for association/location
+//    may be reduced automatically in location.c -> octtreeGlobalAssociationLocation()
+//
+static double min_weight_sum_assoc;
+static double min_time_delay_between_picks_for_location;
+//
+static double gap_primary_critical;
+static double gap_secondary_critical;
+
+
+//
+// END - locals set from from properties file
+
+
+static time_t report_time_max = LONG_MAX;
+static time_t earliest_time = LONG_MAX;
+static char tmp_str[STANDARD_STRLEN];
+static char tmp_str_2[STANDARD_STRLEN];
+static HypocenterDesc existing_hypo_desc;
+
+static char outname[STANDARD_STRLEN];
+static char xmlWriterFileroot[STANDARD_STRLEN];
+
+#define FEREGION_STR_SIZE STANDARD_STRLEN
+static char feregion_str[STANDARD_STRLEN];
+
+#define MAX_NUM_HYPO 100
+static HypocenterDesc **hyp_assoc_loc = NULL;
+static int num_hypocenters_associated = 0;
+static int hyp_persistent[MAX_NUM_HYPO]; // indices of persistent hypocenters
+
+// reference full search oct-tree for alignment of reduced search volume
+static Tree3D *pOctTree = NULL;
+
+
+// 20140627 AJL - following declarations added to support persistent hypocenters
+static float **assoc_scatter_sample = NULL;
+static int n_alloc_scatter_sample[MAX_NUM_HYPO];
+static int n_assoc_scatter_sample[MAX_NUM_HYPO];
+static double global_max_nassociated_P_lat_lon[MAX_NUM_HYPO];
+
+
+static int numPhaseTypesUse = -1;
+static int phaseTypesUse[MAX_NUM_TTIME_PHASES]; // int phase code to use
+static char channelNamesUse[MAX_NUM_TTIME_PHASES][128]; // string containing allowable channel names to use
+static double timeDelayUse[MAX_NUM_TTIME_PHASES][2]; // min [0] and max [1] allowable time delays after previously defined phase to use // 20150410 AJL - added
+// reference phase ttime error for phase weighting
+// 20130307 AJL - added to allow use of non P phases for location
+static double reference_phase_ttime_error = DBL_MAX;
+
+
+// 20141212 AJL - made static global
+static int nstaHasBeenActive = -1; // number of stations for which data has been received in past
+static int nstaIsActive = -1; // number of stations for which data has been received and data_latency < report_interval
+
+// 20180321 AJL - following made static global to support event_persistence_time_after_otime_cutoff
+static double data_latency_mean = 0.0;
+static double data_latency_variance = 0.0;
+
+
+
+static int n_open_files = 0;
+static int max_n_open_files = 0;
+
+FILE* fopen_counter(const char *filename, const char *mode) {
+
+    FILE* fptr = fopen(filename, mode);
+    if (fptr == NULL) {
+        printf("Info: fopen_counter(): cannot open file: %s\n", filename);
+    } else {
+        n_open_files++;
+        if (n_open_files > max_n_open_files)
+            max_n_open_files = n_open_files;
+    }
+    //printf("DEBUG: fopen_counter(): nfiles open: %d\n", n_open_files);
+
+    return (fptr);
+
+}
+
+int fclose_counter(FILE *stream) {
+
+    int retval = fclose(stream);
+    if (retval != 0) {
+        printf("ERROR: fclose_counter(): closing output file.\n");
+    } else {
+        n_open_files--;
+    }
+    //printf("DEBUG: fclose_counter(): nfiles open: %d\n", n_open_files);
+
+    return (retval);
+
+}
+
+int ignoreData(TimedomainProcessingData* deData) {
+    // 20130128 AJL - use flag_snr_brb_int_too_low to allow mwp, mwpd, etc., but do not use for ignore tests (e.g. ignore determined by flag_snr_brb_too_low)
+    //return (
+    //        deData->flag_clipped || deData->flag_non_contiguous || deData->flag_a_ref_not_ok
+    //        || (deData->flag_snr_hf_too_low && deData->flag_snr_brb_too_low && deData->flag_snr_brb_int_too_low)
+    //        );
+    // 20131022 AJL - try using all picks for location, regardless of HF S/N
+    //return (
+    //        deData->flag_clipped || deData->flag_non_contiguous || deData->flag_a_ref_not_ok
+    //        || (deData->flag_snr_hf_too_low && deData->flag_snr_brb_too_low)
+    //        );
+    return (
+            deData->flag_clipped || deData->flag_non_contiguous || (!USE_AREF_NOT_OK_BRB_PICKS_FOR_LOCATION && deData->flag_a_ref_not_ok
+            // 20210929 AJL - Allow brb picks in prev coda (flag_a_ref_not_ok) if sn_brb OK. May avoid loosing correct BRB picks after early HF pick.
+            && (!USE_AREF_NOT_OK_PICKS_FOR_LOCATION_IF_SNR_BRB_OK || !(deData->pick_stream == STREAM_RAW) || deData->flag_snr_brb_too_low))
+            // 20150402 AJL  || (deData->flag_snr_hf_too_low && deData->flag_snr_brb_too_low && !(USE_SNR_HF_TOO_LOW_PICKS_FOR_LOCATION && deData->is_associated))
+            || (!USE_SNR_HF_TOO_LOW_PICKS_FOR_LOCATION && deData->flag_snr_hf_too_low && deData->flag_snr_brb_too_low)
+            );
+    // END 20131022 AJL - try using all picks for location, regardless of HF S/N
+
+}
+
+/** helper function to remove a file or directory */
+
+int remove_fn(const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf) {
+
+    //printf("DEBUG: remove_fn(): remove file: %s\n", fpath);
+    int ireturn = remove(fpath);
+    if (ireturn) {
+        printf("ERROR: remove_fn(): return value = %d, path = %s\n", ireturn, fpath);
+    }
+    return ireturn;
+}
+
+/** function to remove an event directory and all files within the directory if the directory name is an event id older
+ *      the maximum file age (file_archive_age_max) relative to the end of the current report interval
+ */
+
+static char filepath[STANDARD_STRLEN];
+
+int remove_file_archive_directories(const char *dirpath, int file_archive_age_max) {
+
+    //printf("DEBUG: remove_file_archive_directories(): root: %s\n", dirpath);
+
+    int ireturn = 0;
+
+    DIR* pDir = opendir(dirpath);
+    struct dirent *pFile = NULL;
+
+    while ((pFile = readdir(pDir))) {
+
+        sprintf(filepath, "%s/%s", dirpath, pFile->d_name);
+        //printf("DEBUG: remove_file_archive_directories(): processing %s\n", filepath);
+
+        if (!strcmp(pFile->d_name, ".") || !strcmp(pFile->d_name, "..")) {
+            continue;
+        }
+
+        // check if old event directory
+        time_t archive_earliesttime = report_time_max - file_archive_age_max;
+        long hypo_unique_id = atol(pFile->d_name);
+        //printf("DEBUG: remove_file_archive_directories(): hypo_unique_id/1000 %ld, archive_earliesttime %ld, diff %ld\n",
+        //        (hypo_unique_id / 1000), archive_earliesttime, (hypo_unique_id / 1000) - archive_earliesttime);
+        if (hypo_unique_id > 0 && hypo_unique_id != LONG_MIN && hypo_unique_id != LONG_MAX && (hypo_unique_id / 1000) < archive_earliesttime) {
+            ireturn = nftw(filepath, remove_fn, 16, FTW_DEPTH);
+            if (ireturn) {
+                printf("ERROR: remove_file_archive_directories(): removing files: return value = %d, path = %s\n", ireturn, filepath);
+            }
+        }
+
+    }
+
+    closedir(pDir);
+
+    return (ireturn);
+}
+
+
+/** create links if possible for web service to display plot of raw and filtered channel data */
+
+static char hf_str[8 * STANDARD_STRLEN];
+static char brb_str[8 * STANDARD_STRLEN];
+static char str_channel_linked[8 * STANDARD_STRLEN];
+
+char *create_channel_links(char *network, char *station, char *location, char *channel, int pick_stream, char* stream_name, int n_int_tseries,
+        double start_time, int duration, char* str_channel, char* str_stream) {
+
+    //char* stream_name = pick_stream_name(deData);
+    strcpy(str_stream, stream_name);
+    sprintf(str_channel, "%s_%s_%s_%s", network, station, location, channel);
+
+    // check if internet timeseries info available for this data
+    //int n_int_tseries = deData->n_int_tseries;
+    if (n_int_tseries >= 0) {
+
+        if (internetTimeseriesQueryParams[n_int_tseries].type == IRIS_WS_TIMESERIES) {
+
+            // channel link
+            // assume if IRIS_WS_TIMESERIES, then IRIS DMC MetaData Aggregator available
+            sprintf(str_channel_linked, "<a href=\"%s/%s/%s\" "
+                    "title=\"Show station meta-data\" target=%s>%s_%s</a>_%s_%s",
+                    IRIS_METADATA_BASE_URL, network, station, str_channel, network, station, location, channel
+                    );
+
+            // stream link
+            /*
+            // pick towards beginning of plot window
+            int before_pick_lead = 60 * (time_max - deData->t_time_t) / (5 * 60); // 1 min lead time for each 5 min available after pick
+            before_pick_lead = 60 * (before_pick_lead / 60); // round to minute
+            before_pick_lead += 60;
+            time_t start_time = deData->t_time_t - before_pick_lead;
+            int duration = time_max - start_time + 60;
+            if (duration > 3600)
+                duration = 3600;
+             */
+            //struct tm* tm_gmt = gmtime(&start_time);
+            sprintf(brb_str, "<a href=\"%s/%s?net=%s&sta=%s&loc=%s&cha=%s&start=%s&dur=%d&output=plot\" "
+                    "title=\"View %s stream\" target=%s_%s>%s</a>",
+                    internetTimeseriesQueryParams[n_int_tseries].hosturl, internetTimeseriesQueryParams[n_int_tseries].query,
+                    network, station, location, channel,
+                    timeDecSec2string(start_time, tmp_str, IRIS_WS_TIME_FORMAT), duration,
+                    STREAM_RAW_NAME, str_channel, STREAM_RAW_NAME, STREAM_RAW_NAME
+                    );
+            sprintf(hf_str, "<a href=\"%s/%s?net=%s&sta=%s&loc=%s&cha=%s&start=%s&dur=%d&output=plot&bpfilter=%s\" "
+                    "title=\"View %s stream\" target=%s_%s>%s</a>",
+                    internetTimeseriesQueryParams[n_int_tseries].hosturl, internetTimeseriesQueryParams[n_int_tseries].query,
+                    network, station, location, channel,
+                    timeDecSec2string(start_time, tmp_str, IRIS_WS_TIME_FORMAT), duration, STREAM_HF_BPFILTER,
+                    STREAM_HF_NAME, str_channel, STREAM_HF_NAME, STREAM_HF_NAME
+                    );
+            if (pick_stream == STREAM_HF) {
+                sprintf(str_stream, "%s&#8212;<font size=\"-2\">(<i>%s</i>)</font>", hf_str, brb_str);
+            } else if (pick_stream == STREAM_RAW) {
+                sprintf(str_stream, "%s&#8212;<font size=\"-2\">(<i>%s</i>)</font>", brb_str, hf_str);
+            } else {
+                sprintf(str_stream, "%s&#8212;%s", brb_str, hf_str);
+            }
+            strcpy(str_channel, str_channel_linked);
+
+        }
+    }
+
+    return (str_channel);
+}
+
+
+
+static char *qualityCodeBackgroundColor[] = {
+    // A B C D
+    "\"#00FF00\"", "\"#FFFF00\"", "\"#FFA500\"", "\"#FF0000\"",
+};
+static char quality_code_list[] = "ABCD";
+
+// 20160307 AJL - added
+
+char *getQualityCodeBackgroundColorStringHtml(char *quality_code) {
+
+    int ndx = strstr(quality_code_list, quality_code) - quality_code_list;
+    if (ndx >= 0 && ndx < strlen(quality_code_list)) {
+        return (qualityCodeBackgroundColor[ndx]);
+    }
+
+    return ("\"#FFFFFF\"");
+
+}
+
+
+/*
+HYPO_COLOR[0]=31/31/191
+HYPO_COLOR[1]=159/31/159
+HYPO_COLOR[2]=31/127/0
+HYPO_COLOR[3]=159/95/0
+ */
+static char *hypoBackgroundColor[] = {
+    "bgcolor=\"#CCCCFF\"", "bgcolor=\"#FFCCFF\"", "bgcolor=\"#99CC99\"", "bgcolor=\"#CCCC99\"",
+};
+static int hypoBackgroundColorModulo = 4;
+static char levelStringHtml[WARNING_LEVEL_STRING_LEN];
+static char eventBackgroundColorString[WARNING_LEVEL_STRING_LEN];
+static char hypoDataString[STANDARD_STRLEN];
+static char hypoMessageHtmlString[STANDARD_STRLEN];
+
+void setLevelString(int numLevelMax, statistic_level *plevelStatistics, char *levelString, int min_num_levels,
+        double red_cutoff, double yellow_cutoff, double invalid, int colors_show) {
+    //
+    if (numLevelMax < min_num_levels) {
+        strcpy(levelString, "GREY");
+    } else if (!colors_show) {
+        strcpy(levelString, "WHITE");
+    } else if (plevelStatistics->centralValue >= red_cutoff) {
+        strcpy(levelString, "RED");
+    } else if (plevelStatistics->centralValue >= yellow_cutoff) {
+        strcpy(levelString, "YELLOW");
+    } else if (plevelStatistics->centralValue != invalid) {
+        strcpy(levelString, "GREEN");
+    } else {
+        strcpy(levelString, "GREY");
+    }
+
+}
+
+int setLevelStringHtml(int numLevelMax, double centralValue, char *prefix, char *rowBackground, char *colorString, int min_num_levels,
+        double red_cutoff, double yellow_cutoff, double invalid, int colors_show) {
+
+    int highlight = 0;
+    //
+    if (numLevelMax < min_num_levels) {
+        sprintf(colorString, "%s", rowBackground);
+    } else if (!colors_show) {
+        //sprintf(colorString, "%s%s", prefix, "\"#FFFFFF\"");
+        sprintf(colorString, "%s", rowBackground);
+        highlight = 1;
+    } else if (centralValue >= red_cutoff) {
+        sprintf(colorString, "%s%s", prefix, "\"#FFAAAA\"");
+        highlight = 1;
+    } else if (centralValue >= yellow_cutoff) {
+        sprintf(colorString, "%s%s", prefix, "\"#FFFFBB\"");
+        highlight = 1;
+    } else if (centralValue != invalid) {
+        sprintf(colorString, "%s%s", prefix, "\"#CCFFCC\"");
+        highlight = 1;
+    } else {
+        sprintf(colorString, "%s", rowBackground);
+    }
+
+    return (highlight);
+
+}
+
+int setEventBackgroundColorStringHtml(int num_levels, double level, char *prefix, char *colorString, char *qualityCode,
+        int min_num_levels, double level_small, double level_intermediate, double level_high, char *loc_quality_acceptable) {
+
+
+    // greyscale
+    int col_small_low = 207;
+    int col_high = 255;
+    int col_base = 199;
+    // grey
+    int col_grey = 199;
+
+    //if (!warning_colors_show) { // yellow-scale
+    // grey yellow
+    int col_small_lowr = 255;
+    int col_small_lowg = 255;
+    int col_small_lowb = 239;
+    // yellow
+    int col_intermed_lowr = 255;
+    int col_intermed_lowg = 255;
+    int col_intermed_lowb = 127;
+    // red
+    int col_large_r = 255;
+    int col_large_g = 127;
+    int col_large_b = 127;
+    col_base = 239;
+    col_grey = 199;
+    //}
+
+    //
+    if (strstr(loc_quality_acceptable, qualityCode) == NULL) { // 20160307 AJL - added
+        sprintf(colorString, "%s\"#%02X%02X%02X\"", prefix, col_grey, col_grey, col_grey);
+        return (0);
+    } else if (num_levels < min_num_levels) {
+        sprintf(colorString, "%s\"#%02X%02X%02X\"", prefix, col_base, col_base, col_base);
+        return (0);
+    } else if (level <= level_small) {
+        sprintf(colorString, "%s\"#%02X%02X%02X\"", prefix, col_base, col_base, col_base);
+    } else if (level >= level_high) {
+        if (warning_colors_show) { // greyscale
+            sprintf(colorString, "%s\"#%02X%02X%02X\"", prefix, col_high, col_high, col_high);
+        } else { // large
+            //sprintf(colorString, "%s\"#%02X%02X%02X\"", prefix, 255, 255, col_high);
+            sprintf(colorString, "%s\"#%02X%02X%02X\"", prefix, col_large_r, col_large_g, col_large_b);
+        }
+    } else if (level >= level_intermediate) {
+        if (warning_colors_show) { // greyscale
+            sprintf(colorString, "%s\"#%02X%02X%02X\"", prefix, col_high, col_high, col_high);
+        } else { // intermediate-large scale
+            double factor = (level - level_intermediate) / (level_high - level_intermediate);
+            int colr = (int) ((double) col_intermed_lowr + (double) (col_large_r - col_intermed_lowr) * factor * factor);
+            int colg = (int) ((double) col_intermed_lowg + (double) (col_large_g - col_intermed_lowg) * factor * factor);
+            int colb = (int) ((double) col_intermed_lowb + (double) (col_large_b - col_intermed_lowb) * factor * factor);
+            sprintf(colorString, "%s\"#%02X%02X%02X\"", prefix, colr, colg, colb);
+        }
+    } else {
+        double factor = (level - level_small) / (level_intermediate - level_small);
+        if (warning_colors_show) { // greyscale
+            int col = (int) ((double) col_small_low + (double) (col_high - col_small_low) * factor * factor);
+            sprintf(colorString, "%s\"#%02X%02X%02X\"", prefix, col, col, col);
+        } else { // small-intermediate scale
+            int colr = (int) ((double) col_small_lowr + (double) (col_intermed_lowr - col_small_lowr) * factor * factor);
+            int colg = (int) ((double) col_small_lowg + (double) (col_intermed_lowg - col_small_lowg) * factor * factor);
+            int colb = (int) ((double) col_small_lowb + (double) (col_intermed_lowb - col_small_lowb) * factor * factor);
+            sprintf(colorString, "%s\"#%02X%02X%02X\"", prefix, colr, colg, colb);
+        }
+    }
+    return (1);
+
+}
+
+/** create compact hypo information string */
+
+void create_compact_hypo_info_string(HypocenterDesc* phypo, char* hypo_info_string, int html) {
+
+    // set FE-region
+    feregion(phypo->lat, phypo->lon, feregion_str, FEREGION_STR_SIZE);
+    sprintf(hypo_info_string, "%s%s%s%slat:%.2f lon:%.2f  depth:%.0fkm  Q:%s%smb:%.1f[%d]  Mwp:%.1f[%d]  T0:%.0fs[%d]  Mwpd:%.1f[%d]  TdT50Ex:%.1f",
+            feregion_str,
+            html ? "<BR>" : "  ",
+            time2string(phypo->otime, tmp_str),
+            html ? "<BR>" : "  ",
+            phypo->lat, phypo->lon, phypo->depth,
+            phypo->qualityIndicators.quality_code,
+            html ? "<BR>" : "  ",
+            phypo->mbLevelStatistics.numLevel >= reportMinNumberValuesUse.mb ? phypo->mbLevelStatistics.centralValue : MB_INVALID, phypo->mbLevelStatistics.numLevel,
+            useMwpForReport(phypo, 1, 0) ? phypo->mwpLevelStatistics.centralValue : MWP_INVALID, phypo->mwpLevelStatistics.numLevel,
+            phypo->t0LevelStatistics.numLevel >= reportMinNumberValuesUse.t0 && useMwpForReport(phypo, 1, 0) // 20211215 AJL - only use To if Mwp valid
+            ? phypo->t0LevelStatistics.centralValue : T0_INVALID, phypo->t0LevelStatistics.numLevel,
+            useMwpdForReport(phypo, 1, 0) ? phypo->mwpdLevelStatistics.centralValue : MWPD_INVALID, phypo->mwpdLevelStatistics.numLevel,
+            phypo->tdT50ExLevelStatistics.centralValue
+            // 20140306 AJL  , phypo->warningLevelString
+            );
+}
+
+static char map_fileroot[STANDARD_STRLEN] = "\0";
+static char map_link_str[STANDARD_STRLEN] = "\0";
+static char js_file_str[STANDARD_STRLEN] = "\0";
+static char js_link_str[STANDARD_STRLEN] = "\0";
+static char image_tag_str[STANDARD_STRLEN] = "\0";
+static char event_url_str[STANDARD_STRLEN] = "\0";
+static char event_link_str[STANDARD_STRLEN] = "\0";
+static char hypo_description_str[STANDARD_STRLEN] = "\0";
+static char hypo_description_str2[STANDARD_STRLEN] = "\0";
+
+/** create event page link */
+
+void create_event_link(char* link_root, long event_id, char* event_url, char* event_link, char* feregion_str) {
+
+    snprintf(event_url, STANDARD_STRLEN, "%s/events/hypo.%ld.html", link_root, event_id);
+    snprintf(event_link, STANDARD_STRLEN, "<a href=\"%s\" title=\"View event information page - %s\" target=event_%ld>",
+            event_url, feregion_str, event_id);
+
+}
+
+/** create mechanism image tag */
+
+void create_mech_image_tag(char* link_root, long event_id, char* image_tag, char* feregion_str) {
+
+    create_event_link(link_root, event_id, event_url_str, event_link_str, feregion_str);
+    snprintf(image_tag, STANDARD_STRLEN, "%s<img src=\"%s/events/hypo.%ld.mechanism.thumb.jpg\" height=\"17\"></a>",
+            event_link_str, link_root, event_id);
+
+}
+
+#define MAP_LINK_GLOBAL_ZOOM 3
+#define MAP_LINK_MED_ZOOM 6
+#define MAP_LINK_BIG_ZOOM MAP_LINK_MED_ZOOM
+#define MAP_LINK_DEFAULT_ZOOM MAP_LINK_MED_ZOOM
+
+/** create map link */
+
+void create_map_link(char* link_root, long event_id, char* map_link, int zoom_level) {
+
+    if (event_id > 0) {
+        sprintf(map_fileroot, "hypo.%ld", event_id);
+    } else {
+        strcpy(map_fileroot, "station");
+    }
+
+
+    if (zoom_level == MAP_LINK_DEFAULT_ZOOM || zoom_level == MAP_LINK_GLOBAL_ZOOM) {
+        sprintf(map_link, "%s/%s%s.map.html", link_root, event_id > 0 ? "events/" : "", map_fileroot);
+    } else {
+        sprintf(map_link, "%s/%s%s.map.zoom%d.html", link_root, event_id > 0 ? "events/" : "", map_fileroot, zoom_level);
+    }
+
+}
+
+/** create map javascript file name */
+
+void create_map_javascript_file_link(char* link_root, long event_id, char* js_file, char* js_link, int zoom_level) {
+
+    if (event_id > 0) {
+        sprintf(map_fileroot, "hypo.%ld", event_id);
+    } else {
+        strcpy(map_fileroot, "station");
+    }
+
+    if (zoom_level == MAP_LINK_DEFAULT_ZOOM || zoom_level == MAP_LINK_GLOBAL_ZOOM) {
+        sprintf(js_file, "./%s.map.js", map_fileroot);
+        sprintf(js_link, "%s/%s%s.map.js", link_root, event_id > 0 ? "events/" : "", map_fileroot);
+    } else {
+        sprintf(js_file, "./%s.map.zoom%d.js", map_fileroot, zoom_level);
+        sprintf(js_link, "%s/%s%s.map.zoom%d.js", link_root, event_id > 0 ? "events/" : "", map_fileroot, zoom_level);
+    }
+
+}
+
+/** function to convert lat/long to rectangular km coord */
+
+int latlon2rect_simple(double dlat, double dlong, double* pxrect, double* pyrect, double map_orig_lat, double map_orig_long) {
+
+    double xtemp, ytemp;
+
+    xtemp = dlong - map_orig_long;
+    if (xtemp > 180.0)
+        xtemp -= 360.0;
+    if (xtemp < -180.0)
+        xtemp += 360.0;
+    xtemp = xtemp * DEG2KM * cos(DE2RA * dlat);
+    ytemp = (dlat - map_orig_lat) * DEG2KM;
+    *pxrect = xtemp;
+    *pyrect = ytemp;
+
+    return (0);
+
+}
+
+/** function to convert rectangular km coord to lat/long */
+
+int rect2latlon_simple(double xrect, double yrect, double* pdlat, double* pdlong, double map_orig_lat, double map_orig_long) {
+
+    double xtemp, ytemp;
+
+    xtemp = xrect;
+    ytemp = yrect;
+    *pdlat = map_orig_lat + ytemp / DEG2KM;
+    *pdlong = map_orig_long + xtemp / (DEG2KM * cos(DE2RA * *pdlat));
+    // prevent longitude outside of -180 -> 180 deg range
+    if (*pdlong < -180.0)
+        *pdlong += 360.0;
+    else if (*pdlong > 180.0)
+        *pdlong -= 360.0;
+
+    return (0);
+
+}
+
+
+
+/** create map page with Leaflet
+        https://leafletjs.com/
+ */
+// 20150909 AJL - added plotting of un-associated stations, station parameters and station health map
+// 20191007 AJL - converted from Google API using https://www.endpoint.com/blog/2019/03/23/switching-google-maps-leaflet
+
+
+#define MAX_NUM_SCATTTER_POINTS_MAP 1000
+
+void create_map_html_page(char *outnameroot, HypocenterDesc* phypo_map, time_t time_min, time_t time_max, int zoom_level) {
+
+    if (phypo_map != NULL) { // creating map for associated/located event
+        create_map_link(outnameroot, phypo_map->unique_id, map_link_str, zoom_level);
+        create_compact_hypo_info_string(phypo_map, hypo_description_str, 0);
+        create_map_javascript_file_link(outnameroot, phypo_map->unique_id, js_file_str, js_link_str, zoom_level);
+    } else { // creating map for station status/health
+        create_map_link(outnameroot, -1, map_link_str, zoom_level);
+        strcpy(hypo_description_str, "Station Map");
+        create_map_javascript_file_link(outnameroot, -1, js_file_str, js_link_str, zoom_level);
+    }
+    //printf("DEBUG: js_file_str %s\n js_link_str %s\n map_link_str %s\n", js_file_str, js_link_str, map_link_str);
+
+    // write Google javascript map html page
+    if (ee_verbose > 2)
+        printf("Opening output file: %s\n", map_link_str);
+    FILE * mapHtmlStream = fopen_counter(map_link_str, "w");
+    if (mapHtmlStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", map_link_str);
+        perror(tmp_str);
+        return;
+    }
+
+    // start html and scripts
+    fprintf(mapHtmlStream,
+            "<!DOCTYPE html>\n"
+            "<html>\n"
+            "<!-- Automatically generated by %s [v%s %s] www.alomax.net -->\n"
+            "<head>\n"
+            "<meta name='viewport' content='initial - scale = 1.0, user - scalable = no'/>\n"
+            "<meta charset='utf-8'/>\n"
+            "<title>%s - %s</title>\n"
+            "<style type='text/css'>\n"
+            "  html { height: 100%% }\n"
+            "  body { height: 100%%; margin: 0; padding: 0 }\n"
+            "  #map-canvas { height: 97%% }\n"
+            "  h1 { font-family: sans-serif; font-size: medium; text-align: center; border: 0px solid #ffffff; background-color: #ffffff; }\n"
+            "</style>\n"
+
+            "<link rel='stylesheet' href='https://unpkg.com/leaflet@1.5.1/dist/leaflet.css'   integrity='sha512-xwE/Az9zrjBIphAcBb3F6JVqxf46+CDLwfLMHloNu6KEQCAWi6HcDUbeOfBIptF7tcCzusKFjFw2yuvEpDL9wQ=='   crossorigin=''/>\n"
+            // https://github.com/ardhi/Leaflet.MousePosition
+            "<link rel='stylesheet' href='http://alomax.net/projects/early-est/map_data/leaflet/L.Control.MousePosition.css'/>\n"
+            //
+            "<script src='https://unpkg.com/leaflet@1.5.1/dist/leaflet.js'   integrity='sha512-GffPMF3RvMeYyc1LWMHtK8EbPv0iNZ8/oTtHPx9/cc2ILxQ+u905qIwdpULaqDkyBKgOaB57QTMg7ztg8Jm2Og=='   crossorigin=''></script>\n"
+            // https://github.com/Raruto/leaflet-kmz
+            "<script src='https://unpkg.com/leaflet-kmz@1.0.6/dist/leaflet-kmz.js'></script>\n"
+            // https://gitlab.com/IvanSanchez/Leaflet.RepeatedMarkers
+            "<script src='https://unpkg.com/leaflet.repeatedmarkers@latest/Leaflet.RepeatedMarkers.js'></script>\n"
+            // https://github.com/ardhi/Leaflet.MousePosition
+            "<script src='http://alomax.net/projects/early-est/map_data/leaflet/L.Control.MousePosition.js'></script>\n"
+            "<script src='%s'></script>\n"
+            "</head>\n"
+            "<body>\n"
+            "<div id='map-canvas'></div>\n"
+            "<h1>%s &nbsp;&nbsp; [%s v%s %s] &nbsp;&nbsp; (Plate Bdys & Faults: USGS, EU-SHARE)</h1>\n"
+            "<script type='text/javascript'>\n"
+            "initialize()\n"
+            "</script>\n"
+            "</body>\n"
+            "</html>\n",
+            EARLY_EST_MONITOR_SHORT_NAME, EARLY_EST_MONITOR_VERSION, EARLY_EST_MONITOR_VERSION_DATE,
+            EARLY_EST_MONITOR_SHORT_NAME, hypo_description_str,
+            js_file_str,
+            hypo_description_str, EARLY_EST_MONITOR_SHORT_NAME, EARLY_EST_MONITOR_VERSION, EARLY_EST_MONITOR_VERSION_DATE
+            );
+
+    fclose_counter(mapHtmlStream);
+
+    // write Google javascript map html page
+    if (ee_verbose > 2)
+        printf("Opening output file: %s\n", js_link_str);
+    FILE * mapJavascriptStream = fopen_counter(js_link_str, "w");
+    if (mapJavascriptStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", map_link_str);
+        perror(tmp_str);
+        return;
+    }
+
+    double lat = 0.0;
+    double lon = 150.0;
+    if (phypo_map != NULL) { // creating map for associated/located event
+        lat = phypo_map->lat;
+        lon = phypo_map->lon;
+    }
+
+    fprintf(mapJavascriptStream,
+            "// Automatically generated by %s [v%s %s] www.alomax.net\n\n"
+            "function initialize() {\n"
+            "   var myLatlng = new L.LatLng(%f,%f);\n"
+            //
+            "   var Esri_World_Imagery = new L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {\n"
+            "      attribution: 'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community'});\n"
+            //
+            "   var Esri_OceanBasemap = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Ocean_Basemap/MapServer/tile/{z}/{y}/{x}', {\n"
+            "   	attribution: 'Tiles &copy; Esri &mdash; Sources: GEBCO, NOAA, CHS, OSU, UNH, CSUMB, National Geographic, DeLorme, NAVTEQ, and Esri',\n"
+            "   });\n"
+            //
+            "   var Esri_WorldTerrain = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Terrain_Base/MapServer/tile/{z}/{y}/{x}', {\n"
+            "   	attribution: 'Tiles &copy; Esri &mdash; Source: USGS, Esri, TANA, DeLorme, and NPS'});\n"
+            //
+            "   var OpenMapSurfer_Roads = L.tileLayer('https://maps.heigit.org/openmapsurfer/tiles/roads/webmercator/{z}/{x}/{y}.png', {\n"
+            "   	maxZoom: 19,\n"
+            "   	attribution: 'Imagery from <a href=\"http://giscience.uni-hd.de/\">GIScience Research Group @ University of Heidelberg</a> | Map data &copy; <a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap</a> contributors'\n"
+            "   });\n"
+            //
+            "   var CartoDB_DarkMatterNoLabels = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_nolabels/{z}/{x}/{y}{r}.png', {\n"
+            "   attribution: '&copy; <a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap</a> contributors &copy; <a href=\"https://carto.com/attributions\">CARTO</a>',\n"
+            "   subdomains: 'abcd',\n"
+            "   });\n"
+            //
+            "   var CartoDBLabels = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_only_labels/{z}/{x}/{y}{r}.png', {\n"
+            "   	attribution: '&copy; <a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap</a> contributors &copy; <a href=\"https://carto.com/attributions\">CARTO</a>'});\n"
+            //
+            "   var pastEvents = L.layerGroup();\n"
+            //
+            "   var mapOptions = {\n"
+            "      layers: [Esri_World_Imagery, CartoDBLabels, pastEvents],\n"
+            "      zoom: %d,\n"
+            "      center: [%f,%f],\n"
+            "      worldCopyJump: true,\n"
+            "   };\n"
+            "var map = new L.Map('map-canvas', mapOptions);\n"
+            //
+            "var baseLayers = {\n"
+            "    'Satellite': Esri_World_Imagery,\n"
+            "    'Terrain/Ocean': Esri_OceanBasemap,\n"
+            "    'Terrain': Esri_WorldTerrain,\n"
+            "    'Roads': OpenMapSurfer_Roads,\n"
+            "    'Dark': CartoDB_DarkMatterNoLabels,\n"
+            "};\n"
+            "var overlays = {\n"
+            "    'Labels': CartoDBLabels,\n"
+            "    'Recent Earthquakes': pastEvents,\n"
+            "};\n"
+            "var control = L.control.layers(baseLayers, overlays, { collapsed:true }).addTo(map);\n"
+            "L.control.scale({ maxWidth:200, position:'bottomright'}).addTo(map);\n"
+            "L.control.mousePosition().addTo(map);\n"
+
+            // https://gitlab.com/IvanSanchez/Leaflet.RepeatedMarkers
+            "var myRepeatingMarkers = L.gridLayer.repeatedMarkers().addTo(map);\n"
+
+            "//\n"
+            "var loc = window.location.href;\n"
+            "var path = loc.substring(0, loc.lastIndexOf('/'));\n"
+            "//\n"
+
+            // 20210217 AJL - Bug fix, updated to leaflet-kmz@1.0.6 parser initialization (https://github.com/Raruto/leaflet-kmz)
+            "// Instantiate KMZ parser (async)\n"
+            "var kmzParser = L.kmzLayer().addTo(map);\n"
+            "  kmzParser.on('load', function(e) {\n"
+            "    control.addOverlay(e.layer, e.name);\n"
+            "});\n"
+
+            "// kml layer elements from http://earthquake.usgs.gov/learn/plate-boundaries.kmz\n"
+            "kmzParser.load(path + '/../map_data/PlateBoundaries.kmz', {name:'Plate Boundaries'});\n"
+            /*
+            //var kmlUrl = path + '/../map_data/PlateBoundaries.kmz';\n"
+            "var kmlLayer1 = new google.maps.KmlLayer(kmlUrl1, {\n"
+            "  suppressInfoWindows: true,\n"
+            "  preserveViewport: true,\n"
+            "});\n"
+            "kmlLayer1.setMap(map);\n"
+            "//\n"
+            //*/
+            "//\n"
+            "// kml layer elements from http://diss.rm.ingv.it/share-edsf\n"
+            "kmzParser.load(path + '/../map_data/Europe_Crustal_fault_sources_TOP.kmz', {name:'European Database of Seismogenic Faults'});\n"
+            /*
+            "//\n"
+            "// kml layer elements from http://diss.rm.ingv.it/share-edsf\n"
+            "var kmlUrl2 = path + '/../map_data/Europe_Crustal_fault_sources_TOP.kmz';\n"
+            "var kmlLayer2 = new google.maps.KmlLayer(kmlUrl2, {\n"
+            "  suppressInfoWindows: false,\n"
+            "  preserveViewport: true,\n"
+            "});\n"
+            "kmlLayer2.setMap(map);\n"
+            //*/
+            "//\n"
+            "// kml layer elements from http://earthquake.usgs.gov/hazards/qfaults/KML/Historic.kmz\n"
+            "kmzParser.load(path + '/../map_data/USGS_Historic.kmz', {name:'USGS Historic Faults'});\n"
+            /*
+            "var kmlUrl3 = path + '/../map_data/Historic.kmz';\n"
+            "var kmlLayer3 = new google.maps.KmlLayer(kmlUrl3, {\n"
+            "  suppressInfoWindows: false,\n"
+            "  preserveViewport: true,\n"
+            "});\n"
+            "kmlLayer3.setMap(map);\n"
+            //*/
+            "//\n"
+            "// kml layer elements from http://earthquake.usgs.gov/hazards/qfaults/KML/Holocene_LatestPleistocene.kmz\n"
+            "kmzParser.load(path + '/../map_data/USGS_Holocene_LatestPleistocene.kmz', {name:'USGS Holocene LatestPleistocene Faults'});\n"
+            /*
+            "// Too big! > 3MB?  var kmlUrl4 = path + '/../map_data/Holocene_LatestPleistocene.kmz';\n"
+            "// kml layer elements from genarc.shp\n"
+            "var kmlUrl4 = path + '/../map_data/CalifFaults.kmz';\n"
+            "var kmlLayer4 = new google.maps.KmlLayer(kmlUrl4, {\n"
+            "  suppressInfoWindows: false,\n"
+            "  preserveViewport: true,\n"
+            "});\n"
+            "kmlLayer4.setMap(map);\n"*/,
+            EARLY_EST_MONITOR_SHORT_NAME, EARLY_EST_MONITOR_VERSION, EARLY_EST_MONITOR_VERSION_DATE,
+            lat, lon, zoom_level, lat, lon
+            );
+
+    if (phypo_map != NULL) { // creating map for associated/located event
+
+        // main map hypocenter marker
+        create_event_link("..", phypo_map->unique_id, event_url_str, event_link_str, feregion(phypo_map->lat, phypo_map->lon, feregion_str, FEREGION_STR_SIZE));
+        fprintf(mapJavascriptStream,
+                "//\n"
+                /*"var hypoStar = {\n"
+                "   path: 'M 0,-100 30,-30 100,-30 40,10 60,80 0,35 -60,80 -40,10 -100,-30 -30,-30 z',\n"
+                "   fillColor: 'yellow',\n"
+                "   fillOpacity: 1.0,\n"
+                "   scale: 0.17,\n"
+                "   color: 'red',\n"
+                "   weight: 2\n"
+                "};\n"*/
+                "var hypoStarIcon = L.icon({\n"
+                "iconUrl: path + '/../map_data/hypoStar.png',\n"
+                "iconSize:     [32, 32],\n" // size of the icon
+                "iconAnchor:   [15, 15],\n" // point of the icon which will correspond to marker's location
+                //"popupAnchor:  [-3, -76],\n" // point from which the popup should open relative to the iconAnchor
+                "});\n"
+                "var hypoMarker = new L.marker(myLatlng, {\n"
+                "   zIndexOffset: 1000,\n"
+                "   icon: hypoStarIcon,\n"
+                "   title: \'%s\'\n"
+                "})"
+                //".addTo(map)"
+                ";\n"
+                //"hypoMarker.bindPopup('%s');\n"
+                "hypoMarker.on('click', function(){window.open('%s');});\n",
+                hypo_description_str, event_url_str
+                );
+        fprintf(mapJavascriptStream,
+                "myRepeatingMarkers.addMarker(hypoMarker);\n"
+                );
+
+        // add hypocenter scatter sample
+        int nscatter = phypo_map->nscatter_sample;
+        if (nscatter > 0) {
+            fprintf(mapJavascriptStream,
+                    "// Create an object containing LatLng each scatter sample.\n"
+                    "var samp = {};\n"
+                    );
+            int ns;
+            int istep = nscatter / MAX_NUM_SCATTTER_POINTS_MAP;
+            if (istep < 1)
+                istep = 1;
+            float *sample = phypo_map->scatter_sample;
+            double lat, lon;
+            int nsamp = 0;
+            for (ns = 0; ns < nscatter; ns += istep) {
+                sample += (istep - 1) * 4; // skip samples if istep > 1
+                lon = *sample;
+                sample++;
+                lat = *sample;
+                sample++;
+                sample++; // depth
+                sample++; // value
+                fprintf(mapJavascriptStream,
+                        "samp[%d] = {\n"
+                        "   center: new L.LatLng(%f, %f)\n"
+                        "};\n",
+                        nsamp++, lat, lon
+                        );
+            }
+            fprintf(mapJavascriptStream,
+                    "// Construct the circle for each value in samp.\n"
+                    "for (var nsamp in samp) {\n"
+                    "   var sampleOptions = {\n"
+                    "      zIndex: 5,\n"
+                    "      interactive: false,\n"
+                    "      color: 'red',\n"
+                    "      opacity: 1.0,\n"
+                    "      weight: 0,\n"
+                    "      fillColor: 'red',\n"
+                    "      fillOpacity: 1.0,\n"
+                    "      radius: 1,\n"
+                    "   };\n"
+                    "   // Add the circle to the map.\n"
+                    "   sampCircle = new L.circleMarker(samp[nsamp].center, sampleOptions).addTo(map);\n"
+                    "}\n"
+                    );
+        }
+
+        // add ellipse
+        fprintf(mapJavascriptStream,
+                "// Define the LatLng coordinates for the ellipse polygon's path\n"
+                "var ellipseCoords = [\n"
+                );
+        // ellipse is centered on expectation hypo
+        double expect_lat = phypo_map->expect.y;
+        double expect_lon = phypo_map->expect.x;
+        double xrect_hyp, yrect_hyp;
+        latlon2rect_simple(expect_lat, expect_lon, &xrect_hyp, &yrect_hyp, expect_lat, expect_lon);
+        double lat, lon, xrect, yrect;
+        double ell_az_major = DE2RA * (90.0 - (phypo_map->ellipse.az1 + 90.0));
+        double ell_len_major = phypo_map->ellipse.len2;
+        double ell_len_minor = phypo_map->ellipse.len1;
+        int npt = 72;
+        double daz = DE2RA * 360.0 / (double) npt;
+        double az = 0.0;
+        for (int n = 0; n < npt; n++) {
+            xrect = xrect_hyp + ell_len_major * cos(az) * cos(ell_az_major) - ell_len_minor * sin(az) * sin(ell_az_major);
+            yrect = yrect_hyp + ell_len_major * cos(az) * sin(ell_az_major) + ell_len_minor * sin(az) * cos(ell_az_major);
+            rect2latlon_simple(xrect, yrect, &lat, &lon, expect_lat, expect_lon);
+            if (n > 0) { // IE8 (and below) will parse trailing commas in array and object literals incorrectly.
+                fprintf(mapJavascriptStream, ",\n");
+            }
+            fprintf(mapJavascriptStream,
+                    "[%f, %f]",
+                    lat, lon);
+            az += daz;
+        }
+        fprintf(mapJavascriptStream,
+                "];\n"
+                "// Construct the polygon.\n"
+                "var ellipsePolygon = new L.Polygon(ellipseCoords, {\n"
+                "   interactive: false,\n"
+                //"   zIndex: 10,\n"
+                "   color : 'orange',\n"
+                "   opacity : 0.7,\n"
+                "   weight : 2,\n"
+                "   fill : false\n"
+                "});\n"
+                "ellipsePolygon.addTo(map);\n"
+                );
+
+    }
+
+    // add recent hypocenter symbol markers
+    int nhyp;
+    for (nhyp = 0; nhyp < num_hypocenters; nhyp++) {
+        HypocenterDesc* phypo = hypo_list[nhyp];
+        if (phypo_map != NULL && phypo->unique_id == phypo_map->unique_id) { // do not add marker for current map hypocenter
+            continue;
+        }
+        create_compact_hypo_info_string(phypo, hypo_description_str2, 1);
+        double prefMag = 0.0;
+        if (useMwpForReport(phypo, 0, 0)) {
+            prefMag = phypo->mwpLevelStatistics.centralValue;
+        } else if (phypo->mbLevelStatistics.numLevel >= reportMinNumberValuesUse.mb) {
+            prefMag = phypo->mbLevelStatistics.centralValue;
+        }
+        int radius = 5 * (int) fmax(prefMag * prefMag / 36.0, 1.0);
+        int weight = 1;
+        static char color[32];
+        strcpy(color, "white");
+        if (prefMag > 6.95) {
+            weight = 3;
+            strcpy(color, "red");
+        }
+        if (prefMag > 5.95) {
+            weight = 2;
+            strcpy(color, "yellow");
+        }
+        fprintf(mapJavascriptStream,
+                "// Define the hypocenter symbols\n"
+                "var hypo%d = new L.circleMarker([%f,%f], {\n"
+                "   zIndexOffset: 20,\n"
+                "   radius: %d,\n"
+                "   color: '%s',\n"
+                "   weight: %d,\n"
+                "});hypo%d.bindTooltip('%s').addTo(pastEvents);\n",
+                nhyp, phypo->lat, phypo->lon, radius, color, weight, nhyp, hypo_description_str2
+                );
+        create_event_link("..", phypo->unique_id, event_url_str, event_link_str, feregion(phypo->lat, phypo->lon, feregion_str, FEREGION_STR_SIZE));
+        fprintf(mapJavascriptStream,
+                "hypo%d.on('click', function(){\n"
+                "window.open('%s');\n"
+                //"map.panTo(hypo%d.getLatLng());\n"
+                "});\n",
+                nhyp, event_url_str
+                );
+    }
+
+    // add station symbol markers
+    fprintf(mapJavascriptStream,
+            "var staTriangleAssocIcon = L.icon({\n"
+            "iconUrl: path + '/../map_data/staTriangleAssoc.png',\n"
+            "iconSize:     [18, 16],\n" // size of the icon
+            "iconAnchor:   [8, 7],\n" // point of the icon which will correspond to marker's location
+            //"popupAnchor:  [-3, -76],\n" // point from which the popup should open relative to the iconAnchor
+            "});\n"
+            );
+    fprintf(mapJavascriptStream,
+            "var staTriangleUnAssocIcon = L.icon({\n"
+            "iconUrl: path + '/../map_data/staTriangleUnAssoc.png',\n"
+            "iconSize:     [18, 16],\n" // size of the icon
+            "iconAnchor:   [8, 7],\n" // point of the icon which will correspond to marker's location
+            //"popupAnchor:  [-3, -76],\n" // point from which the popup should open relative to the iconAnchor
+            "});\n"
+            );
+    fprintf(mapJavascriptStream,
+            "var staTriangleUnAssocLatencyYellowIcon = L.icon({\n"
+            "iconUrl: path + '/../map_data/staTriangleUnAssocLatencyYellow.png',\n"
+            "iconSize:     [18, 16],\n" // size of the icon
+            "iconAnchor:   [8, 7],\n" // point of the icon which will correspond to marker's location
+            //"popupAnchor:  [-3, -76],\n" // point from which the popup should open relative to the iconAnchor
+            "});\n"
+            );
+    fprintf(mapJavascriptStream,
+            "var staTriangleUnAssocLatencyRedIcon = L.icon({\n"
+            "iconUrl: path + '/../map_data/staTriangleUnAssocLatencyRed.png',\n"
+            "iconSize:     [18, 16],\n" // size of the icon
+            "iconAnchor:   [8, 7],\n" // point of the icon which will correspond to marker's location
+            //"popupAnchor:  [-3, -76],\n" // point from which the popup should open relative to the iconAnchor
+            "});\n"
+            );
+    ChannelParameters* staParams;
+    int duration;
+    double start_time;
+    int nmarker = 0;
+    // loop over stations, add markers for all stations
+    fprintf(mapJavascriptStream,
+            "// Define the station markers\n");
+    int nsta;
+    for (nsta = 0; nsta < num_sources_total; nsta++) {
+        staParams = &(channelParameters[nsta]);
+        if (!staParams->process_this_channel_orientation) {
+            continue;
+        }
+        fprintf(mapJavascriptStream,
+                "var marker%d = new L.marker([%f,%f], {\n"
+                "   zIndexOffset: 30,\n"
+                "   icon: %s,\n"
+                "   title: \'%s_%s\'\n"
+                "});\n"
+                //"marker%d.addTo(map);\n",
+                ,
+                nmarker, staParams->lat, staParams->lon,
+                staParams->data_latency >= LATENCY_RED_CUTOFF ? "staTriangleUnAssocLatencyRedIcon"
+                : staParams->data_latency >= LATENCY_YELLOW_CUTOFF ? "staTriangleUnAssocLatencyYellowIcon" : "staTriangleUnAssocIcon",
+                staParams->network, staParams->station
+                );
+        // otime near middle of plot window
+        double gcd = 0.0;
+        double center_time = (time_max + time_min) / 2;
+        if (phypo_map != NULL) { // creating map for associated/located event
+            gcd = GCDistance(phypo_map->lat, phypo_map->lon, staParams->lat, staParams->lon);
+            center_time = phypo_map->otime + get_ttime(get_P_phase_index(), gcd, phypo_map->depth); // predicted P arrival time
+        }
+        duration = 2 * (time_max - (int) center_time);
+        duration += 60; // try to make sure latest data is displayed
+        if (duration > 3600)
+            duration = 3600;
+        else if (duration < 300)
+            duration = 300;
+        start_time = center_time - (double) duration / 2.0;
+        if (phypo_map != NULL) {
+            fprintf(mapJavascriptStream,
+                    "marker%d.bindPopup(\n"
+                    "\'<strong>"
+                    "%s&nbsp;%s<br>"
+                    "dist=%.1f&deg;&nbsp; az=%.0f&deg;<br>"
+                    "no pick or not associated"
+                    "</strong>\'\n"
+                    ");\n",
+                    nmarker, create_channel_links(staParams->network, staParams->station, staParams->location, staParams->channel,
+                    STREAM_NULL, "unassociated", staParams->n_int_tseries, start_time, duration,
+                    tmp_str, tmp_str_2), tmp_str_2,
+                    gcd, phypo_map != NULL ? GCAzimuth(phypo_map->lat, phypo_map->lon, staParams->lat, staParams->lon) : 0.0
+                    );
+        } else {
+            fprintf(mapJavascriptStream,
+                    "marker%d.bindPopup(\n"
+                    "\'<strong>"
+                    "%s&nbsp;%s<br>"
+                    "latency=%s&nbsp;  qualityWt=%.1f"
+                    "</strong>\'\n"
+                    ");\n",
+                    nmarker, create_channel_links(staParams->network, staParams->station, staParams->location, staParams->channel,
+                    STREAM_NULL, "unassociated", staParams->n_int_tseries, start_time, duration,
+                    tmp_str, tmp_str_2), tmp_str_2,
+                    staParams->data_latency_str, staParams->qualityWeight
+                    );
+        }
+        fprintf(mapJavascriptStream,
+                "myRepeatingMarkers.addMarker(marker%d);\n",
+                nmarker
+                );
+        nmarker++;
+    }
+    if (phypo_map != NULL) { // creating map for associated/located event
+        // loop over data, find associated data
+        double fmquality = 0.0;
+        int fmpolarity = POLARITY_UNKNOWN;
+        char fmtype[32] = "Err";
+        int ndata;
+        //for (ndata = 0; ndata < num_de_data; ndata++) {
+        for (ndata = num_de_data - 1; ndata >= 0; ndata--) { // 20150515 reverse time order so that fist association for each station is priority marker
+            TimedomainProcessingData* deData = data_list[ndata];
+            if (deData->is_associated == phypo_map->hyp_assoc_index + 1) {
+                staParams = &(channelParameters[deData->source_id]);
+                fprintf(mapJavascriptStream,
+                        "// Define the station markers\n"
+                        "var marker%d = new L.marker([%f,%f], {\n"
+                        "   zIndexOffset: 30,\n"
+                        "   icon: staTriangleAssocIcon,\n"
+                        "   title: \'%s_%s\'\n"
+                        "});\n"
+                        //"marker%d.addTo(map);\n",
+                        ,
+                        nmarker, staParams->lat, staParams->lon, staParams->network, staParams->station
+                        );
+                // pick near middle of plot window
+                duration = 2 * (time_max - deData->t_time_t);
+                duration += 60; // try to make sure latest data is displayed
+                if (duration > 3600)
+                    duration = 3600;
+                start_time = (double) (deData->t_time_t) + deData->t_decsec - (double) duration / 2.0;
+                fprintf(mapJavascriptStream,
+                        "marker%d.bindPopup(\n"
+                        "\'<strong>"
+                        "%s&nbsp;%s<br>"
+                        "dist=%.1f&deg;&nbsp; az=%.0f&deg;<br>"
+                        "%s%c&nbsp; res=%.1fsec&nbsp; wt=%.2f"
+                        "</strong>\'\n"
+                        ");\n",
+                        nmarker, create_channel_links(staParams->network, staParams->station, staParams->location, staParams->channel,
+                        deData->pick_stream, pick_stream_name(deData), staParams->n_int_tseries, start_time, duration,
+                        tmp_str, tmp_str_2), tmp_str_2,
+                        deData->epicentral_distance, deData->epicentral_azimuth,
+                        deData->phase, setPolarity(deData, &fmquality, &fmpolarity, fmtype),
+                        deData->residual, deData->loc_weight
+                        );
+                fprintf(mapJavascriptStream,
+                        "myRepeatingMarkers.addMarker(marker%d);\n",
+                        nmarker
+                        );
+
+            }
+            nmarker++;
+        }
+    }
+
+    // close script
+    fprintf(mapJavascriptStream,
+            "   }\n"
+            );
+
+    fclose_counter(mapJavascriptStream);
+
+}
+
+
+
+#ifdef GOOGLE_API_KEY
+
+/** create Google maps page with Google Maps JavaScript API https://developers.google.com/maps/documentation/javascript/reference */
+// 20150909 AJL - added plotting of un-associated stations, station parameters and station health map
+
+#define MAX_NUM_SCATTTER_POINTS_MAP 1000
+
+void create_map_html_page_Google(char *outnameroot, HypocenterDesc* phypo_map, time_t time_min, time_t time_max, int zoom_level) {
+
+    if (phypo_map != NULL) { // creating map for associated/located event
+        create_map_link(outnameroot, phypo_map->unique_id, map_link_str, zoom_level);
+        create_compact_hypo_info_string(phypo_map, hypo_description_str, 0);
+        create_map_javascript_file_link(outnameroot, phypo_map->unique_id, js_file_str, js_link_str, zoom_level);
+    } else { // creating map for station status/health
+        create_map_link(outnameroot, -1, map_link_str, zoom_level);
+        strcpy(hypo_description_str, "Station Map");
+        create_map_javascript_file_link(outnameroot, -1, js_file_str, js_link_str, zoom_level);
+    }
+    //printf("DEBUG: js_file_str %s\n js_link_str %s\n map_link_str %s\n", js_file_str, js_link_str, map_link_str);
+
+    // write Google javascript map html page
+    if (ee_verbose > 2)
+        printf("Opening output file: %s\n", map_link_str);
+    FILE * mapHtmlStream = fopen_counter(map_link_str, "w");
+    if (mapHtmlStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", map_link_str);
+        perror(tmp_str);
+        return;
+    }
+
+    // start html and scripts
+    fprintf(mapHtmlStream,
+            "<!DOCTYPE html>\n"
+            "<html>\n"
+            "<!-- Automatically generated by %s [v%s %s] www.alomax.net -->\n"
+            "<head>\n"
+            "<meta name='viewport' content='initial - scale = 1.0, user - scalable = no'>\n"
+            "<meta charset='utf-8'>\n"
+            "<title>%s - %s</title>\n"
+            "<style type='text/css'>\n"
+            "  html { height: 100%% }\n"
+            "  body { height: 100%%; margin: 0; padding: 0 }\n"
+            "  #map-canvas { height: 97%% }\n"
+            "h1 { font-family: sans-serif; font-size: medium; text-align: center; border: 0px solid #ffffff; background-color: #ffffff; }\n"
+            "</style>\n"
+            "<script src='https://maps.googleapis.com/maps/api/js?key=%s'></script>\n"
+            "<script src='%s'></script>\n"
+            "</head>\n"
+            "<body>\n"
+            "<div id='map-canvas'></div>\n"
+            "<h1>%s &nbsp;&nbsp; [%s v%s %s] &nbsp;&nbsp; (Plate Bdys & Faults: USGS, EU-SHARE)</h1>"
+            "</body>\n"
+            "</html>\n",
+            EARLY_EST_MONITOR_SHORT_NAME, EARLY_EST_MONITOR_VERSION, EARLY_EST_MONITOR_VERSION_DATE,
+            EARLY_EST_MONITOR_SHORT_NAME, hypo_description_str,
+            GOOGLE_API_KEY, js_file_str,
+            hypo_description_str, EARLY_EST_MONITOR_SHORT_NAME, EARLY_EST_MONITOR_VERSION, EARLY_EST_MONITOR_VERSION_DATE
+            );
+
+    fclose_counter(mapHtmlStream);
+
+    // write Google javascript map html page
+    if (ee_verbose > 2)
+        printf("Opening output file: %s\n", js_link_str);
+    FILE * mapJavascriptStream = fopen_counter(js_link_str, "w");
+    if (mapJavascriptStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", map_link_str);
+        perror(tmp_str);
+        return;
+    }
+
+    double lat = 0.0;
+    double lon = 150.0;
+    if (phypo_map != NULL) { // creating map for associated/located event
+        lat = phypo_map->lat;
+        lon = phypo_map->lon;
+    }
+
+    fprintf(mapJavascriptStream,
+            "// Automatically generated by %s [v%s %s] www.alomax.net\n\n"
+            "function initialize() {\n"
+            "   var myLatlng = new google.maps.LatLng(%f,%f);\n"
+            "   var mapOptions = {\n"
+            "      zoom: %d,\n"
+            "      center: myLatlng,\n"
+            "      mapTypeId: google.maps.MapTypeId.HYBRID,\n"
+            "      scaleControl: true,\n"
+            "      panControlOptions: {\n"
+            "         position: google.maps.ControlPosition.LEFT_BOTTOM\n"
+            "      },\n"
+            "      zoomControlOptions: {\n"
+            "          position: google.maps.ControlPosition.LEFT_BOTTOM\n"
+            "      },\n"
+            "      overviewMapControl: true,\n"
+            "      overviewMapControlOptions: {\n"
+            "         opened: true\n"
+            "      }\n"
+            "   };\n"
+            "var map = new google.maps.Map(document.getElementById('map-canvas'), mapOptions);\n"
+            //
+            "//\n"
+            "var loc = window.location.href;\n"
+            "var path = loc.substring(0, loc.lastIndexOf('/'));\n"
+            "//\n"
+            "// kml layer elements from http://earthquake.usgs.gov/learn/plate-boundaries.kmz\n"
+            "var kmlUrl1 = path + '/../map_data/PlateBoundaries.kmz';\n"
+            //var kmlUrl = path + '/../map_data/EarthsTectonicPlates.kmz';\n"
+            "var kmlLayer1 = new google.maps.KmlLayer(kmlUrl1, {\n"
+            "  suppressInfoWindows: true,\n"
+            "  preserveViewport: true,\n"
+            "});\n"
+            "kmlLayer1.setMap(map);\n"
+            "//\n"
+            //
+            "//\n"
+            "// kml layer elements from http://diss.rm.ingv.it/share-edsf\n"
+            "var kmlUrl2 = path + '/../map_data/Europe_Crustal_fault_sources_TOP.kmz';\n"
+            "var kmlLayer2 = new google.maps.KmlLayer(kmlUrl2, {\n"
+            "  suppressInfoWindows: false,\n"
+            "  preserveViewport: true,\n"
+            "});\n"
+            "kmlLayer2.setMap(map);\n"
+            //
+            "//\n"
+            "// kml layer elements from http://earthquake.usgs.gov/hazards/qfaults/KML/Historic.kmz\n"
+            "var kmlUrl3 = path + '/../map_data/Historic.kmz';\n"
+            "var kmlLayer3 = new google.maps.KmlLayer(kmlUrl3, {\n"
+            "  suppressInfoWindows: false,\n"
+            "  preserveViewport: true,\n"
+            "});\n"
+            "kmlLayer3.setMap(map);\n"
+            //
+            "//\n"
+            "// kml layer elements from http://earthquake.usgs.gov/hazards/qfaults/KML/Holocene_LatestPleistocene.kmz\n"
+            "// Too big! > 3MB?  var kmlUrl4 = path + '/../map_data/Holocene_LatestPleistocene.kmz';\n"
+            "// kml layer elements from genarc.shp\n"
+            "var kmlUrl4 = path + '/../map_data/CalifFaults.kmz';\n"
+            "var kmlLayer4 = new google.maps.KmlLayer(kmlUrl4, {\n"
+            "  suppressInfoWindows: false,\n"
+            "  preserveViewport: true,\n"
+            "});\n"
+            "kmlLayer4.setMap(map);\n",
+            EARLY_EST_MONITOR_SHORT_NAME, EARLY_EST_MONITOR_VERSION, EARLY_EST_MONITOR_VERSION_DATE,
+            lat, lon, zoom_level
+            );
+
+    if (phypo_map != NULL) { // creating map for associated/located event
+
+        // main map hypocenter marker
+        create_event_link("..", phypo_map->unique_id, event_url_str, event_link_str, feregion(phypo_map->lat, phypo_map->lon, feregion_str, FEREGION_STR_SIZE));
+        fprintf(mapJavascriptStream,
+                "//\n"
+                "var hypoStar = {\n"
+                "   path: 'M 0,-100 30,-30 100,-30 40,10 60,80 0,35 -60,80 -40,10 -100,-30 -30,-30 z',\n"
+                "   fillColor: 'yellow',\n"
+                "   fillOpacity: 1.0,\n"
+                "   scale: 0.17,\n"
+                "   strokeColor: 'red',\n"
+                "   strokeWeight: 2\n"
+                "};\n"
+                "var hypoMarker = new google.maps.Marker({\n"
+                "   zIndex: google.maps.Marker.MAX_ZINDEX + 1000,\n"
+                "   position: myLatlng,\n"
+                "   icon: hypoStar,\n"
+                "   map: map,\n"
+                "   title: \'%s\'\n"
+                "});\n"
+                "google.maps.event.addListener(hypoMarker, 'click', function() {\n"
+                "  map.setCenter(hypoMarker.getPosition());\n"
+                "  window.open('%s', '_blank');\n"
+                "});\n",
+                hypo_description_str, event_url_str
+                );
+
+        // add hypocenter scatter sample
+        int nscatter = phypo_map->nscatter_sample;
+        if (nscatter > 0) {
+            fprintf(mapJavascriptStream,
+                    "// Create an object containing LatLng each scatter sample.\n"
+                    "var samp = {};\n"
+                    );
+            int ns;
+            int istep = nscatter / MAX_NUM_SCATTTER_POINTS_MAP;
+            if (istep < 1)
+                istep = 1;
+            float *sample = phypo_map->scatter_sample;
+            double lat, lon;
+            int nsamp = 0;
+            for (ns = 0; ns < nscatter; ns += istep) {
+                sample += (istep - 1) * 4; // skip samples if istep > 1
+                lon = *sample;
+                sample++;
+                lat = *sample;
+                sample++;
+                sample++; // depth
+                sample++; // value
+                fprintf(mapJavascriptStream,
+                        "samp[%d] = {\n"
+                        "   center: new google.maps.LatLng(%f, %f)\n"
+                        "};\n",
+                        nsamp++, lat, lon
+                        );
+            }
+            /* 20150818 AJL - no longer works in Google Maps - Circle radius is scaled to true distance
+               fprintf(mapJavascriptStream,
+                    "// Construct the circle for each value in samp.\n"
+                    "for (var nsamp in samp) {\n"
+                    "   var sampleOptions = {\n"
+                    "      zIndex: 10,\n"
+                    "      strokeColor: 'red',\n"
+                    "      strokeOpacity: 1.0,\n"
+                    "      strokeWeight: 3,\n"
+                    "      fillColor: 'red',\n"
+                    "      fillOpacity: 1.0,\n"
+                    "      map: map,\n"
+                    "      center: samp[nsamp].center,\n"
+                    "      radius: 3\n"
+                    "   };\n"
+                    "   // Add the circle to the map.\n"
+                    "   sampCircle = new google.maps.Circle(sampleOptions);\n"
+                    "}\n"
+                    );*/
+            // 20150818 AJL - added Marker version of Circle to allow constant pixel scaling
+            fprintf(mapJavascriptStream,
+                    "// Construct the circle for each value in samp.\n"
+                    "for (var nsamp in samp) {\n"
+                    "   var sampleOptions = {\n"
+                    "      map: map,\n"
+                    "      zIndex: google.maps.Marker.MAX_ZINDEX + 5,\n"
+                    "      position: samp[nsamp].center,\n"
+                    "      clickable: false,\n"
+                    "      icon: {\n"
+                    "         path: google.maps.SymbolPath.CIRCLE,\n"
+                    "         scale: 1, //pixels\n"
+                    "         strokeColor: 'red',\n"
+                    "         strokeOpacity: 1.0,\n"
+                    "         strokeWeight: 0,\n"
+                    "         fillColor: 'red',\n"
+                    "         fillOpacity: 1.0\n"
+                    "      }\n"
+                    "   };\n"
+                    "   // Add the circle to the map.\n"
+                    "   sampCircle = new google.maps.Marker(sampleOptions);\n"
+                    "}\n"
+                    );
+        }
+
+        // add ellipse
+        fprintf(mapJavascriptStream,
+                "// Define the LatLng coordinates for the ellipse polygon's path\n"
+                "var ellipseCoords = [\n"
+                );
+        // ellipse is centered on expectation hypo
+        double expect_lat = phypo_map->expect.y;
+        double expect_lon = phypo_map->expect.x;
+        double xrect_hyp, yrect_hyp;
+        latlon2rect_simple(expect_lat, expect_lon, &xrect_hyp, &yrect_hyp, expect_lat, expect_lon);
+        double lat, lon, xrect, yrect;
+        double ell_az_major = DE2RA * (90.0 - (phypo_map->ellipse.az1 + 90.0));
+        double ell_len_major = phypo_map->ellipse.len2;
+        double ell_len_minor = phypo_map->ellipse.len1;
+        int npt = 72;
+        double daz = DE2RA * 360.0 / (double) npt;
+        double az = 0.0;
+        for (int n = 0; n < npt; n++) {
+            xrect = xrect_hyp + ell_len_major * cos(az) * cos(ell_az_major) - ell_len_minor * sin(az) * sin(ell_az_major);
+            yrect = yrect_hyp + ell_len_major * cos(az) * sin(ell_az_major) + ell_len_minor * sin(az) * cos(ell_az_major);
+            rect2latlon_simple(xrect, yrect, &lat, &lon, expect_lat, expect_lon);
+            if (n > 0) { // IE8 (and below) will parse trailing commas in array and object literals incorrectly.
+                fprintf(mapJavascriptStream, ",\n");
+            }
+            fprintf(mapJavascriptStream,
+                    "   new google.maps.LatLng(%f, %f)",
+                    lat, lon);
+            az += daz;
+        }
+        fprintf(mapJavascriptStream,
+                "];\n"
+                "// Construct the polygon.\n"
+                "ellipsePolygon = new google.maps.Polygon({\n"
+                "   clickable: false,\n"
+                "   zIndex: google.maps.Marker.MAX_ZINDEX + 10,\n"
+                "   paths : ellipseCoords,\n"
+                "   strokeColor : 'orange',\n"
+                "   strokeOpacity : 0.7,\n"
+                "   strokeWeight : 2,\n"
+                "   fillColor : 'orange',\n"
+                "   fillOpacity : 0.0\n"
+                "});\n"
+                "ellipsePolygon.setMap(map);\n"
+                );
+
+    }
+
+
+    // add background hypocenter symbol markers
+    int nhyp;
+    for (nhyp = 0; nhyp < num_hypocenters; nhyp++) {
+        HypocenterDesc* phypo = hypo_list[nhyp];
+        if (phypo_map != NULL && phypo->unique_id == phypo_map->unique_id) { // do not add marker for current map hypocenter
+            continue;
+        }
+        create_compact_hypo_info_string(phypo, hypo_description_str2, 0);
+        double prefMag = 0.0;
+        if (useMwpForReport(phypo, 0)) {
+            prefMag = phypo->mwpLevelStatistics.centralValue;
+        } else if (phypo->mbLevelStatistics.numLevel >= reportMinNumberValuesUse.mb) {
+            prefMag = phypo->mbLevelStatistics.centralValue;
+        }
+        double iconScale = fmax(prefMag * prefMag / 3.0, 4.0);
+        int strokeWeight = 1;
+        static char strokeColor[32];
+        strcpy(strokeColor, "white");
+        if (prefMag > 6.95) {
+            strokeWeight = 3;
+            strcpy(strokeColor, "red");
+        }
+        if (prefMag > 5.95) {
+            strokeWeight = 2;
+            strcpy(strokeColor, "yellow");
+        }
+        fprintf(mapJavascriptStream,
+                "// Define the hypocenter markers\n"
+                "var hypo%d = new google.maps.Marker({\n"
+                "   zIndex: google.maps.Marker.MAX_ZINDEX + 20,\n"
+                "   position: new google.maps.LatLng(%f,%f),\n"
+                "   icon: {\n"
+                "      path: google.maps.SymbolPath.CIRCLE,\n"
+                "      scale: %f,\n"
+                "      strokeColor: '%s',\n"
+                "      strokeWeight: %d,\n"
+                "   },\n"
+                "   map: map,\n"
+                "   title: \'%s\'\n"
+                "});\n",
+                nhyp, phypo->lat, phypo->lon, iconScale, strokeColor, strokeWeight, hypo_description_str2
+                );
+        create_event_link("..", phypo->unique_id, event_url_str, event_link_str, feregion(phypo->lat, phypo->lon, feregion_str, FEREGION_STR_SIZE));
+        fprintf(mapJavascriptStream,
+                "google.maps.event.addListener(hypo%d, 'click', function() {\n"
+                "  map.setCenter(hypo%d.getPosition());\n"
+                "  window.open('%s', '_blank');\n"
+                "});\n",
+                nhyp, nhyp, event_url_str
+                );
+    }
+
+    // add station symbol markers
+    fprintf(mapJavascriptStream,
+            "//\n"
+            "var staTriangleAssoc = {\n"
+            "   path: 'M -100,100 0,-100 100,100 z',\n"
+            "   fillColor: 'blue',\n"
+            "   fillOpacity: 1.0,\n"
+            "   scale: 0.08,\n"
+            "   strokeColor: 'red',\n"
+            "   strokeWeight: 2\n"
+            "};\n"
+            );
+    fprintf(mapJavascriptStream,
+            "//\n"
+            "var staTriangleUnAssoc = {\n"
+            "   path: 'M -100,100 0,-100 100,100 z',\n"
+            "   fillColor: 'gray',\n"
+            "   fillOpacity: 1.0,\n"
+            "   scale: 0.08,\n"
+            "   strokeColor: 'white',\n"
+            "   strokeWeight: 1\n"
+            "};\n"
+            );
+    fprintf(mapJavascriptStream,
+            "//\n"
+            "var staTriangleUnAssocLatencyYellow = {\n"
+            "   path: 'M -100,100 0,-100 100,100 z',\n"
+            "   fillColor: '#FFFFCC',\n"
+            "   fillOpacity: 1.0,\n"
+            "   scale: 0.08,\n"
+            "   strokeColor: 'white',\n"
+            "   strokeWeight: 1\n"
+            "};\n"
+            );
+    fprintf(mapJavascriptStream,
+            "//\n"
+            "var staTriangleUnAssocLatencyRed = {\n"
+            "   path: 'M -100,100 0,-100 100,100 z',\n"
+            "   fillColor: '#FFBBBB',\n"
+            "   fillOpacity: 1.0,\n"
+            "   scale: 0.08,\n"
+            "   strokeColor: 'white',\n"
+            "   strokeWeight: 1\n"
+            "};\n"
+            );
+    fprintf(mapJavascriptStream,
+            "var info_open = null;\n"
+            "google.maps.event.addListener(map, 'click', function() {\n"
+            "   if (info_open !== null)\n"
+            "      info_open.close();\n"
+            "   info_open = null;\n"
+            "});\n"
+            );
+    ChannelParameters* staParams;
+    int duration;
+    double start_time;
+    int nmarker = 0;
+    // loop over stations, add markers for all stations
+    int nsta;
+    for (nsta = 0; nsta < num_sources_total; nsta++) {
+        staParams = &(channelParameters[nsta]);
+        if (!staParams->process_this_channel_orientation) {
+            continue;
+        }
+        fprintf(mapJavascriptStream,
+                "// Define the station markers\n"
+                "var marker%d = new google.maps.Marker({\n"
+                "   zIndex: google.maps.Marker.MAX_ZINDEX + 30,\n"
+                "   position: new google.maps.LatLng(%f,%f),\n"
+                "   icon: %s,\n"
+                "   map: map,\n"
+                "   title: \'%s_%s\'\n"
+                "});\n",
+                nmarker, staParams->lat, staParams->lon,
+                staParams->data_latency >= LATENCY_RED_CUTOFF ? "staTriangleUnAssocLatencyRed"
+                : staParams->data_latency >= LATENCY_YELLOW_CUTOFF ? "staTriangleUnAssocLatencyYellow" : "staTriangleUnAssoc",
+                staParams->network, staParams->station
+                );
+        // otime near middle of plot window
+        double gcd = 0.0;
+        double center_time = (time_max + time_min) / 2;
+        if (phypo_map != NULL) { // creating map for associated/located event
+            gcd = GCDistance(phypo_map->lat, phypo_map->lon, staParams->lat, staParams->lon);
+            center_time = phypo_map->otime + get_ttime(get_P_phase_index(), gcd, phypo_map->depth); // predicted P arrival time
+        }
+        duration = 2 * (time_max - (int) center_time);
+        duration += 60; // try to make sure latest data is displayed
+        if (duration > 3600)
+            duration = 3600;
+        else if (duration < 300)
+            duration = 300;
+        start_time = center_time - (double) duration / 2.0;
+        if (phypo_map != NULL) {
+            fprintf(mapJavascriptStream,
+                    "var info%d = new google.maps.InfoWindow({\n"
+                    "   content: \'<strong>"
+                    "%s&nbsp;%s<br>"
+                    "dist=%.1f&deg;&nbsp; az=%.0f&deg;<br>"
+                    "no pick or not associated"
+                    "</strong>\'\n"
+                    "});\n",
+                    nmarker, create_channel_links(staParams->network, staParams->station, staParams->location, staParams->channel,
+                    STREAM_NULL, "unassociated", staParams->n_int_tseries, start_time, duration,
+                    tmp_str, tmp_str_2), tmp_str_2,
+                    gcd, phypo_map != NULL ? GCAzimuth(phypo_map->lat, phypo_map->lon, staParams->lat, staParams->lon) : 0.0
+                    );
+        } else {
+            fprintf(mapJavascriptStream,
+                    "var info%d = new google.maps.InfoWindow({\n"
+                    "   content: \'<strong>"
+                    "%s&nbsp;%s<br>"
+                    "latency=%s&nbsp;  qualityWt=%.1f"
+                    "</strong>\'\n"
+                    "});\n",
+                    nmarker, create_channel_links(staParams->network, staParams->station, staParams->location, staParams->channel,
+                    STREAM_NULL, "unassociated", staParams->n_int_tseries, start_time, duration,
+                    tmp_str, tmp_str_2), tmp_str_2,
+                    staParams->data_latency_str, staParams->qualityWeight
+                    );
+        }
+        fprintf(mapJavascriptStream,
+                "google.maps.event.addListener(marker%d, 'click', function() {\n"
+                "   if (info_open !== null)\n"
+                "      info_open.close();\n"
+                "   info%d.open(marker%d.get('map'), marker%d);\n"
+                "   info_open = info%d;\n"
+                "});\n",
+                nmarker, nmarker, nmarker, nmarker, nmarker
+                );
+        nmarker++;
+    }
+    if (phypo_map != NULL) { // creating map for associated/located event
+        // loop over data, find associated data
+        double fmquality = 0.0;
+        int fmpolarity = POLARITY_UNKNOWN;
+        char fmtype[32] = "Err";
+        int ndata;
+        //for (ndata = 0; ndata < num_de_data; ndata++) {
+        for (ndata = num_de_data - 1; ndata >= 0; ndata--) { // 20150515 reverse time order so that fist association for each station is priority marker
+            TimedomainProcessingData* deData = data_list[ndata];
+            if (deData->is_associated == phypo_map->hyp_assoc_index + 1) {
+                staParams = &(channelParameters[deData->source_id]);
+                fprintf(mapJavascriptStream,
+                        "// Define the station markers\n"
+                        "var marker%d = new google.maps.Marker({\n"
+                        "   zIndex: google.maps.Marker.MAX_ZINDEX + 30,\n"
+                        "   position: new google.maps.LatLng(%f,%f),\n"
+                        "   icon: staTriangleAssoc,\n"
+                        "   map: map,\n"
+                        "   title: \'%s_%s\'\n"
+                        "});\n",
+                        nmarker, staParams->lat, staParams->lon, staParams->network, staParams->station
+                        );
+                // pick near middle of plot window
+                duration = 2 * (time_max - deData->t_time_t);
+                duration += 60; // try to make sure latest data is displayed
+                if (duration > 3600)
+                    duration = 3600;
+                start_time = (double) (deData->t_time_t) + deData->t_decsec - (double) duration / 2.0;
+                fprintf(mapJavascriptStream,
+                        "var info%d = new google.maps.InfoWindow({\n"
+                        "   content: \'<strong>"
+                        "%s&nbsp;%s<br>"
+                        "dist=%.1f&deg;&nbsp; az=%.0f&deg;<br>"
+                        "%s%c&nbsp; res=%.1fsec&nbsp; wt=%.2f"
+                        "</strong>\'\n"
+                        "});\n",
+                        nmarker, create_channel_links(staParams->network, staParams->station, staParams->location, staParams->channel,
+                        deData->pick_stream, pick_stream_name(deData), staParams->n_int_tseries, start_time, duration,
+                        tmp_str, tmp_str_2), tmp_str_2,
+                        deData->epicentral_distance, deData->epicentral_azimuth,
+                        deData->phase, setPolarity(deData, &fmquality, &fmpolarity, fmtype),
+                        deData->residual, deData->loc_weight
+                        );
+
+                fprintf(mapJavascriptStream,
+                        "google.maps.event.addListener(marker%d, 'click', function() {\n"
+                        "   if (info_open !== null)\n"
+                        "      info_open.close();\n"
+                        "   info%d.open(marker%d.get('map'), marker%d);\n"
+                        "   info_open = info%d;\n"
+                        "});\n",
+                        nmarker, nmarker, nmarker, nmarker, nmarker
+                        );
+            }
+            nmarker++;
+        }
+    }
+
+    // close script and write html
+    fprintf(mapJavascriptStream,
+            "   }\n"
+            "   google.maps.event.addDomListener(window, 'load', initialize);\n"
+            );
+
+    fclose_counter(mapJavascriptStream);
+
+}
+
+#endif
+
+void printHypoDataHeaderString(char *hypoDataHeaderString) {
+
+    sprintf(hypoDataHeaderString,
+            "event_id assoc_ndx loc_seq_num ph_assoc ph_used dmin(deg) gap1(deg) gap2(deg) atten sigma_otime(sec) otime(UTC) lat(deg) lon(deg) errH(km) depth(km)"
+            " errZ(km) Q T50Ex n Td(sec) n TdT50Ex WL_col mb n Mwp n T0(sec) n Mwpd n region"
+            " n_sta_tot n_sta_active assoc_latency n_sta_avail_first_arr_P n_sta_avail_first_arr_P_dist_max");
+
+}
+
+/** read hypo data string in csv format
+ */
+int readHypoDataString(HypocenterDesc* phypo, char *hypoDataString, long *pfirst_assoc_latency) {
+
+    char time_str[64];
+
+
+#ifdef USE_MWP_MO_POS_NEG
+    static char format[] = "%ld %d %d %d %d %lf %lf %lf %lf %lf %s %lf %lf %lf %lf %lf %s %lf %d %lf %d %lf %s %lf %d %lf %d %lf %d %lf %d %*s %d %d %ld %d %lf %lf %d";
+#else
+    static char format[] = "%ld %d %d %d %d %lf %lf %lf %lf %lf %s %lf %lf %lf %lf %lf %s %lf %d %lf %d %lf %s %lf %d %lf %d %lf %d %lf %d %*s %d %d %ld %d %lf";
+#endif
+
+    int istat = sscanf(hypoDataString,
+            format,
+            &phypo->unique_id, &phypo->hyp_assoc_index, &phypo->loc_seq_num, &phypo->nassoc, &phypo->nassoc_P,
+            &phypo->dist_min, &phypo->gap_primary, &phypo->gap_secondary,
+            &phypo->linRegressPower.power, // amplitude attenuation
+            &phypo->ot_std_dev, time_str,
+            &phypo->lat, &phypo->lon, &phypo->errh, &phypo->depth, &phypo->errz, phypo->qualityIndicators.quality_code,
+            &phypo->t50ExLevelStatistics.centralValue, &phypo->t50ExLevelStatistics.numLevel,
+            &phypo->taucLevelStatistics.centralValue, &phypo->taucLevelStatistics.numLevel,
+            &phypo->tdT50ExLevelStatistics.centralValue, phypo->warningLevelString,
+            &phypo->mbLevelStatistics.centralValue, &phypo->mbLevelStatistics.numLevel,
+            &phypo->mwpLevelStatistics.centralValue, &phypo->mwpLevelStatistics.numLevel,
+            &phypo->t0LevelStatistics.centralValue, &phypo->t0LevelStatistics.numLevel,
+            &phypo->mwpdLevelStatistics.centralValue, &phypo->mwpdLevelStatistics.numLevel,
+            // region ignored
+            &phypo->nstaHasBeenActive, &phypo->nstaIsActive, pfirst_assoc_latency, &phypo->nStaAvailableFirstArrP, &phypo->nStaAvailableFirstArrP_distMax
+#ifdef USE_MWP_MO_POS_NEG
+            , &phypo->mwpdMoPosNegLevelStatistics.centralValue, &phypo->mwpdMoPosNegLevelStatistics.numLevel
+#endif
+            );
+
+    phypo->otime = string2timeDecSec(time_str);
+
+    return (istat);
+
+}
+
+/** set preferred magnitude flag
+ */
+void setPreferredMagnitudeFlags(HypocenterDesc* phypo, char *mb_preferred, char *mwp_preferred, char *mwpd_preferred) {
+
+    // 20171116 AJL - added
+
+    mb_preferred[0] = '\0';
+    mwp_preferred[0] = '\0';
+    mwpd_preferred[0] = '\0';
+
+    int pref_mag = getPreferredMagnitude(phypo);
+
+    if (pref_mag == MAG_MWPD_PREFERRED) {
+        mwpd_preferred[0] = '*';
+        return;
+    }
+
+    if (pref_mag == MAG_MWP_PREFERRED) {
+        mwp_preferred[0] = '*';
+        return;
+    }
+
+    if (pref_mag == MAG_MB_PREFERRED) {
+        mb_preferred[0] = '*';
+        return;
+    }
+}
+
+/** print hypo data string in csv format
+ */
+void printHypoDataString(HypocenterDesc* phypo, char *hypoDataString, int iDecPrecision, int flag_preferred_magnitude) {
+
+    // set preferred magnitude flag if requested
+    // 20171114 AJL - added
+    char mb_preferred[2] = "";
+    char mwp_preferred[2] = "";
+    char mwpd_preferred[2] = "";
+    if (flag_preferred_magnitude) {
+        setPreferredMagnitudeFlags(phypo, mb_preferred, mwp_preferred, mwpd_preferred);
+        //printf("DEBUG: mb_preferred <%s>  mwp_preferred <%s>  mwpd_preferred <%s>\n", mb_preferred, mwp_preferred, mwpd_preferred);
+    }
+
+    // remove spaces from FE region string
+    feregion(phypo->lat, phypo->lon, feregion_str, FEREGION_STR_SIZE);
+    char *c = feregion_str;
+    while ((c = strchr(c, ' ')) != NULL)
+        *c = '_';
+
+    long first_assoc_latency = phypo->first_assoc_time - (long) (0.5 + phypo->otime);
+    first_assoc_latency = first_assoc_latency < 0 ? -1 : first_assoc_latency;
+
+    // hypo data csv string
+    if (iDecPrecision) {
+        sprintf(hypoDataString, "%ld %d %d %d %d %.3f %.3f %.3f ",
+                phypo->unique_id, phypo->hyp_assoc_index + 1, phypo->loc_seq_num, phypo->nassoc, phypo->nassoc_P, phypo->dist_min, phypo->gap_primary, phypo->gap_secondary
+                );
+        // amplitude attenuation
+        sprintf(hypoDataString + strlen(hypoDataString), "%.3f ",
+                phypo->linRegressPower.power
+                );
+        sprintf(hypoDataString + strlen(hypoDataString), "%.3f %s %.3f %.3f %.2f %.2f %.2f %s %.3f %d %.3f %d %.3f %s %.3f%s %d %.3f%s %d %.2f %d %.3f%s %d %s",
+                phypo->ot_std_dev,
+                timeDecSec2string(phypo->otime, tmp_str, DEFAULT_TIME_FORMAT),
+                phypo->lat, phypo->lon, phypo->errh, phypo->depth, phypo->errz, phypo->qualityIndicators.quality_code,
+                phypo->t50ExLevelStatistics.centralValue, phypo->t50ExLevelStatistics.numLevel,
+                phypo->taucLevelStatistics.centralValue, phypo->taucLevelStatistics.numLevel,
+                phypo->tdT50ExLevelStatistics.centralValue, phypo->warningLevelString,
+                phypo->mbLevelStatistics.numLevel >= reportMinNumberValuesUse.mb ? phypo->mbLevelStatistics.centralValue : MB_INVALID, mb_preferred, phypo->mbLevelStatistics.numLevel,
+                useMwpForReport(phypo, 1, 0) ? phypo->mwpLevelStatistics.centralValue : MWP_INVALID, mwp_preferred, phypo->mwpLevelStatistics.numLevel,
+                phypo->t0LevelStatistics.numLevel >= reportMinNumberValuesUse.t0 && useMwpForReport(phypo, 1, 0) // 20211215 AJL - only use To if Mwp valid
+                ? phypo->t0LevelStatistics.centralValue : T0_INVALID, phypo->t0LevelStatistics.numLevel,
+                useMwpdForReport(phypo, 1, 0) ? phypo->mwpdLevelStatistics.centralValue : MWPD_INVALID, mwpd_preferred, phypo->mwpdLevelStatistics.numLevel,
+                feregion_str
+                );
+        // available station count
+        // 20141212 AJL - added to enable later statistical analysis of events (e.g. mag vs. n_sta/n_sta_available)
+        sprintf(hypoDataString + strlen(hypoDataString), " %d %d %ld %d %.3f",
+                phypo->nstaHasBeenActive, phypo->nstaIsActive, first_assoc_latency, phypo->nStaAvailableFirstArrP, phypo->nStaAvailableFirstArrP_distMax
+                );
+#ifdef USE_MWP_MO_POS_NEG
+        sprintf(hypoDataString + strlen(hypoDataString), " %.3f %d",
+                phypo->mwpdMoPosNegLevelStatistics.centralValue, phypo->mwpdMoPosNegLevelStatistics.numLevel
+                );
+#endif
+    } else {
+
+        sprintf(hypoDataString, "%ld %d %d %d %d %.1f %.1f %.1f ",
+                phypo->unique_id, phypo->hyp_assoc_index + 1, phypo->loc_seq_num, phypo->nassoc, phypo->nassoc_P, phypo->dist_min, phypo->gap_primary, phypo->gap_secondary
+                );
+        // amplitude attenuation
+        sprintf(hypoDataString + strlen(hypoDataString), "%.1f ",
+                phypo->linRegressPower.power
+                );
+        sprintf(hypoDataString + strlen(hypoDataString), "%.1f %s %.1f %.1f %.0f %.0f %.0f %s %.1f %d %.1f %d %.1f %s %.1f%s %d %.1f%s %d %.0f %d %.1f%s %d %s",
+                phypo->ot_std_dev,
+                time2string(phypo->otime, tmp_str),
+                phypo->lat, phypo->lon, phypo->errh, phypo->depth, phypo->errz, phypo->qualityIndicators.quality_code,
+                phypo->t50ExLevelStatistics.centralValue, phypo->t50ExLevelStatistics.numLevel,
+                phypo->taucLevelStatistics.centralValue, phypo->taucLevelStatistics.numLevel,
+                phypo->tdT50ExLevelStatistics.centralValue, phypo->warningLevelString,
+                phypo->mbLevelStatistics.numLevel >= reportMinNumberValuesUse.mb ? phypo->mbLevelStatistics.centralValue : MB_INVALID, mb_preferred, phypo->mbLevelStatistics.numLevel,
+                useMwpForReport(phypo, 1, 0) ? phypo->mwpLevelStatistics.centralValue : MWP_INVALID, mwp_preferred, phypo->mwpLevelStatistics.numLevel,
+                phypo->t0LevelStatistics.numLevel >= reportMinNumberValuesUse.t0 && useMwpForReport(phypo, 1, 0) // 20211215 AJL - only use To if Mwp valid
+                ? phypo->t0LevelStatistics.centralValue : T0_INVALID, phypo->t0LevelStatistics.numLevel,
+                useMwpdForReport(phypo, 1, 0) ? phypo->mwpdLevelStatistics.centralValue : MWPD_INVALID, mwpd_preferred, phypo->mwpdLevelStatistics.numLevel,
+                feregion_str
+                );
+        // available station counts, elapsed time after origin of first association/location
+        // 20141212 AJL - added to enable later statistical analysis of events (e.g. mag vs. n_sta/n_sta_available)
+        sprintf(hypoDataString + strlen(hypoDataString), " %d %d %ld %d %.3f",
+                phypo->nstaHasBeenActive, phypo->nstaIsActive, first_assoc_latency, phypo->nStaAvailableFirstArrP, phypo->nStaAvailableFirstArrP_distMax
+                );
+#ifdef USE_MWP_MO_POS_NEG
+
+        sprintf(hypoDataString + strlen(hypoDataString), " %.1f %d",
+                phypo->mwpdMoPosNegLevelStatistics.centralValue, phypo->mwpdMoPosNegLevelStatistics.numLevel
+                );
+#endif
+    }
+}
+
+void printHypoMessageHtmlHeaderString(char *messageString) {
+
+    sprintf(messageString, "<tr align=right bgcolor=\"#BBBBBB\">\n");
+    sprintf(messageString + strlen(messageString), "<th>&nbsp;event id</th><th>locSeq</th><th>ph&nbsp;&nbsp;<br>assoc</th><th>ph&nbsp;&nbsp;<br>used</th>\n");
+    sprintf(messageString + strlen(messageString), "<th>&nbsp;dmin<br>&nbsp;(deg)</th></th><th>&nbsp;gap1<br>&nbsp;(deg)</th></th><th>&nbsp;gap2<br>&nbsp;(deg)</th>\n");
+    sprintf(messageString + strlen(messageString), "<th>&nbsp;atten</th>\n");
+    sprintf(messageString + strlen(messageString), "<th>&nbsp;&sigma; otime<br>&nbsp;(sec)</th><th>&nbsp;otime<br>&nbsp;(UTC)</th><th>&nbsp;lat&nbsp;<br>&nbsp;(deg)</th>\n");
+    sprintf(messageString + strlen(messageString), "<th>&nbsp;lon&nbsp;<br>&nbsp;(deg)</th><th align=left>&nbsp;&nbsp;errH<br>&nbsp;(km)</th>\n");
+    sprintf(messageString + strlen(messageString), "<th>depth<br>&nbsp;(km)</th><th align=left>&nbsp;&nbsp;errZ<br>&nbsp;(km)&nbsp;</th>\n");
+    sprintf(messageString + strlen(messageString), "<th>Q</th>\n");
+    sprintf(messageString + strlen(messageString), "<th>&nbsp;T50Ex</th><th align=left>&nbsp;n</th>\n");
+    sprintf(messageString + strlen(messageString), "<th>&nbsp;Td&nbsp;<br>&nbsp;(sec)</th><th align=left>&nbsp;n</th><th>&nbsp;TdT50Ex</th>\n");
+    sprintf(messageString + strlen(messageString), "<th>&nbsp;mb</th><th align=left>&nbsp;n</th>\n");
+    sprintf(messageString + strlen(messageString), "<th>&nbsp;Mwp</th><th align=left>&nbsp;n</th>\n");
+    sprintf(messageString + strlen(messageString), "<th>&nbsp;T0&nbsp;<br>&nbsp;(sec)</th><th align=left>&nbsp;n</th>\n");
+    sprintf(messageString + strlen(messageString), "<th>&nbsp;Mwpd</th><th align=left>&nbsp;n</th>\n");
+    sprintf(messageString + strlen(messageString), "<th align=left>fm</th>\n");
+    sprintf(messageString + strlen(messageString), "<th align=left>region</th>\n");
+    sprintf(messageString + strlen(messageString), "</tr>\n");
+
+}
+
+/** print hypo data string in html format
+ */
+
+void printHypoMessageHtmlString(HypocenterDesc* phypo, char *messageString, char* hypoBackground, char* rowBackground, long event_index, long event_id) {
+
+    // enable highlight border around preferred magnitude
+    // 20171114 AJL - added
+    static char mb_preferred[2] = "";
+    static char mwp_preferred[2] = "";
+    static char mwpd_preferred[2] = "";
+    setPreferredMagnitudeFlags(phypo, mb_preferred, mwp_preferred, mwpd_preferred);
+    static char border[] = "style=\"border:solid 2px #b00\"";
+
+
+    // set feregion string
+    feregion(phypo->lat, phypo->lon, feregion_str, FEREGION_STR_SIZE);
+
+    // hypo message html
+    sprintf(messageString, "<tr align=right %s>", hypoBackground);
+    create_event_link(".", event_id, event_url_str, event_link_str, feregion_str);
+    sprintf(messageString + strlen(messageString), "<td>%s&nbsp;%ld&nbsp;</a></td>", event_link_str, event_index);
+    // location sequence number
+    sprintf(messageString + strlen(messageString), "<td>%d</td>", phypo->loc_seq_num);
+    sprintf(messageString + strlen(messageString), "<td>%d</td><td>%d</td><td>%.1f</td></td><td>%.0f</td></td><td>%.0f</td><td>%.2f</td><td>%.1f&nbsp;&nbsp;</td>",
+            phypo->nassoc, phypo->nassoc_P, phypo->dist_min, phypo->gap_primary, phypo->gap_secondary, phypo->linRegressPower.power, phypo->ot_std_dev);
+    sprintf(messageString + strlen(messageString), "<td><strong>%s</strong></td><td><strong>%.2f</strong></td><td><strong>%.2f</strong></td>",
+            time2string(phypo->otime, tmp_str), phypo->lat, phypo->lon);
+    // errh, with map link
+    create_map_link("./", phypo->unique_id, map_link_str, MAP_LINK_BIG_ZOOM);
+    sprintf(messageString + strlen(messageString), "<td align=left>&nbsp;&nbsp;&nbsp;<a href=\"%s\" title=\"View epicenter error in Google Maps\" target=map_%ld>%.0f</a></td>",
+            map_link_str, phypo->unique_id, phypo->errh);
+    //
+    sprintf(messageString + strlen(messageString), "<td><strong>%.0f</strong></td><td align=left>&nbsp;&nbsp;&nbsp;%.0f</td>",
+            phypo->depth, phypo->errz);
+    sprintf(messageString + strlen(messageString), "<td align=\"center\" bgcolor=%s><strong>%s</strong></td>",
+            getQualityCodeBackgroundColorStringHtml(phypo->qualityIndicators.quality_code), phypo->qualityIndicators.quality_code);
+    int highlight = 0;
+    highlight = setLevelStringHtml(phypo->t50ExLevelStatistics.numLevel, phypo->t50ExLevelStatistics.centralValue, "bgcolor=", rowBackground, levelStringHtml,
+            reportMinNumberValuesUse.t50Ex, T50EX_RED_CUTOFF, T50EX_YELLOW_CUTOFF, -1.0, warning_colors_show);
+    sprintf(messageString + strlen(messageString), "<td %s>%s%.1f%s</td><td %s align=left>&nbsp;%d</td>",
+            levelStringHtml, highlight ? "<strong>" : "", phypo->t50ExLevelStatistics.centralValue, highlight ? "&nbsp;</strong>" : "&nbsp;", rowBackground, phypo->t50ExLevelStatistics.numLevel);
+    highlight = setLevelStringHtml(phypo->taucLevelStatistics.numLevel, phypo->taucLevelStatistics.centralValue, "bgcolor=", rowBackground, levelStringHtml,
+            reportMinNumberValuesUse.tauc, TAUC_RED_CUTOFF, TAUC_YELLOW_CUTOFF, -1.0, warning_colors_show);
+    sprintf(messageString + strlen(messageString), "<td %s>%s%.1f%s</td><td %s align=left>&nbsp;%d</td>",
+            levelStringHtml, highlight ? "<strong>" : "", phypo->taucLevelStatistics.centralValue, highlight ? "&nbsp;</strong>" : "&nbsp;", rowBackground, phypo->taucLevelStatistics.numLevel);
+    highlight = setLevelStringHtml(IMIN(phypo->t50ExLevelStatistics.numLevel, phypo->taucLevelStatistics.numLevel), phypo->tdT50ExLevelStatistics.centralValue,
+            "bgcolor=", rowBackground, levelStringHtml,
+            reportMinNumberValuesUse.tdT50Ex, TDT50EX_RED_CUTOFF, TDT50EX_YELLOW_CUTOFF, -1.0, warning_colors_show);
+    sprintf(messageString + strlen(messageString), "<td %s>%s%.1f%s</td>",
+            levelStringHtml, highlight ? "<strong>" : "", phypo->tdT50ExLevelStatistics.centralValue, highlight ? "&nbsp;</strong>" : "&nbsp;");
+    highlight = setLevelStringHtml(phypo->mbLevelStatistics.numLevel, phypo->mbLevelStatistics.centralValue, "bgcolor=", rowBackground, levelStringHtml,
+            reportMinNumberValuesUse.mb, MB_RED_CUTOFF, MB_YELLOW_CUTOFF, MB_INVALID, magnitude_colors_show);
+    sprintf(messageString + strlen(messageString), "<td %s %s>%s%.1f%s</td><td %s align=left>&nbsp;%d</td>",
+            mb_preferred[0] == '*' ? border : "", levelStringHtml, highlight ? "<strong>" : "", phypo->mbLevelStatistics.numLevel >= reportMinNumberValuesUse.mb ?
+            phypo->mbLevelStatistics.centralValue : MB_INVALID,
+            highlight ? "&nbsp;</strong>" : "&nbsp;", rowBackground, phypo->mbLevelStatistics.numLevel);
+    highlight = setLevelStringHtml(phypo->mwpLevelStatistics.numLevel * useMwpForReport(phypo, 1, 0), phypo->mwpLevelStatistics.centralValue,
+            "bgcolor=", rowBackground, levelStringHtml,
+            reportMinNumberValuesUse.mwp, MWP_RED_CUTOFF, MWP_YELLOW_CUTOFF, MWP_INVALID, magnitude_colors_show) * useMwpForReport(phypo, 0, 0);
+    sprintf(messageString + strlen(messageString), "<td %s %s>%s%.1f%s</td><td %s align=left>&nbsp;%d</td>",
+            mwp_preferred[0] == '*' ? border : "", levelStringHtml, highlight ? "<strong>" : "", useMwpForReport(phypo, 1, 0) ? phypo->mwpLevelStatistics.centralValue : MWP_INVALID,
+            highlight ? "&nbsp;</strong>" : "&nbsp;", rowBackground, phypo->mwpLevelStatistics.numLevel);
+    highlight = setLevelStringHtml(phypo->t0LevelStatistics.numLevel * useMwpForReport(phypo, 1, 0), // 20211215 AJL - only use To if Mwp valid
+            phypo->t0LevelStatistics.centralValue, "bgcolor=", rowBackground, levelStringHtml,
+            reportMinNumberValuesUse.t0, T0_RED_CUTOFF, T0_YELLOW_CUTOFF, T0_INVALID, warning_colors_show) * useMwpForReport(phypo, 0, 0);
+    sprintf(messageString + strlen(messageString), "<td %s>%s%.0f%s</td><td %s align=left>&nbsp;%d</td>",
+            levelStringHtml, highlight ? "<strong>" : "",
+            phypo->t0LevelStatistics.numLevel >= reportMinNumberValuesUse.t0 && useMwpForReport(phypo, 1, 0) // 20211215 AJL - only use To if Mwp valid
+            ? phypo->t0LevelStatistics.centralValue : T0_INVALID,
+            highlight ? "&nbsp;</strong>" : "&nbsp;", rowBackground, phypo->t0LevelStatistics.numLevel);
+    int nLevels = phypo->mwpdLevelStatistics.numLevel;
+    // check if Mwpd below minimum value or Mwp too low
+
+    if (phypo->mwpdLevelStatistics.centralValue < MWPD_MIN_VALUE_USE || phypo->mwpLevelStatistics.centralValue < MIN_MWP_FOR_VALID_MWPD)
+        nLevels = -1; // force grey color
+    highlight = setLevelStringHtml(nLevels, phypo->mwpdLevelStatistics.centralValue, "bgcolor=", rowBackground, levelStringHtml,
+            reportMinNumberValuesUse.mwpd, MWPD_RED_CUTOFF, MWPD_YELLOW_CUTOFF, MWPD_INVALID, magnitude_colors_show);
+    sprintf(messageString + strlen(messageString), "<td %s %s>%s%.1f%s</td><td %s align=left>&nbsp;%d</td>",
+            mwpd_preferred[0] == '*' ? border : "", levelStringHtml, highlight ? "<strong>" : "", useMwpdForReport(phypo, 1, 0)
+            ? phypo->mwpdLevelStatistics.centralValue : MWPD_INVALID, highlight ? "&nbsp;</strong>" : "&nbsp;", rowBackground, phypo->mwpdLevelStatistics.numLevel);
+    // focal mechanism image
+    create_mech_image_tag(".", event_id, image_tag_str, feregion_str);
+    sprintf(messageString + strlen(messageString), "<td align=center>%s</td>", image_tag_str);
+    // region, with map link
+    create_map_link("./", phypo->unique_id, map_link_str, MAP_LINK_MED_ZOOM);
+    sprintf(messageString + strlen(messageString), "<td align=left>&nbsp;<a href=\"%s\" title=\"View epicenter in Google Maps\" target=map_%ld>%s</a></td>",
+            map_link_str, phypo->unique_id, feregion_str);
+    //
+    sprintf(messageString + strlen(messageString), "</tr>");
+
+}
+
+/** write a hypocenter kml file */
+
+int write_hypocenter_kml(char *outnameroot, HypocenterDesc* phypo, int verbose) {
+
+    char outname[STANDARD_STRLEN];
+    snprintf(outname, STANDARD_STRLEN, "%s/hypo.%d.kml", outnameroot, phypo->hyp_assoc_index);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * kmlStream = fopen_counter(outname, "w");
+    if (kmlStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+
+    fprintf(kmlStream,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            "<kml xmlns=\"http://earth.google.com/kml/2.1\">"
+            "	<Document>"
+            "		<name>Sismicite</name>"
+            "		<description><![CDATA[<B>SISMOS à l'École - Sismicité</B>]]></description>"
+            "		<LookAt id=\"khLookAt704\">"
+            "			<longitude>7.0</longitude>"
+            "			<latitude>44.0</latitude>"
+            "			<altitude>0</altitude>"
+            "			<range>250000</range>"
+            "			<tilt>0</tilt>"
+            "			<heading>0</heading>"
+            "		</LookAt>"
+            "		<Style id=\"myDefaultStyles\">"
+            "			<BalloonStyle>"
+            "				<!-- a background color for the balloon -->"
+            "				<bgColor>C5D8F5</bgColor>"
+            "				<!-- styling of the balloon text -->"
+            "				<text><![CDATA["
+            "					       <strong><font color=\"#CC0000\" size=\"+3\">$[name]</font></strong>"
+            "					       <br/><br/>"
+            "					       <font color=\"#000033\" size=\"+2\">$[description]</font>"
+            "					       <br/><br/>"
+            "					       \"SISMOS à l'École\""
+            "					       <br/><br/>"
+            "					       <a href=\"http://aster.unice.fr/EduSeisExplorer\">http://aster.unice.fr/EduSeisExplorer</a>"
+            "					       ]]></text>"
+            "			       </BalloonStyle>"
+            "			<IconStyle>"
+            "				<color>ff00ffff</color>"
+            "				<scale>0.3</scale>"
+            "				<Icon>"
+            "					<href>/windows/E/www/free/projects/google/cataseism/images/dot.gif</href>"
+            "				</Icon>"
+            "				<hotSpot x=\"32\" y=\"1\" xunits=\"pixels\" yunits=\"pixels\"/>"
+            "			</IconStyle>"
+            "			<LabelStyle>"
+            "				<color>ccccccff</color>"
+            "				<scale>0.75</scale>"
+            "			</LabelStyle>"
+            "			<LineStyle>"
+            "				<color>ffffffff</color>"
+            "				<width>15</width>"
+            "			</LineStyle>"
+            "			<PolyStyle>"
+            "				<color>ffffff</color>"
+            "				<colorMode>random</colorMode>"
+            "			</PolyStyle>"
+            "		</Style>"
+            "  <Placemark><styleUrl>#myDefaultStyles</styleUrl><Point><coordinates>007.3750,43.8010,-002500</coordinates></Point>  <description><![CDATA[<B> 2000  1019 063254.1  7,3750 43,8010  2,5   M= 1,1]]></description> </Placemark>"
+            "	</Document>"
+            "</kml>"
+            );
+
+    fclose_counter(kmlStream);
+
+    return (0);
+}
+
+
+/** Send a hypocenter mail message */
+static char send_mail_params_copy[2 * STANDARD_STRLEN] = "\0";
+static char mail_file[STANDARD_STRLEN] = "\0";
+static char info_link[STANDARD_STRLEN] = "\0";
+static char map_link[STANDARD_STRLEN] = "\0";
+static char event_url[STANDARD_STRLEN] = "\0";
+static char event_link[STANDARD_STRLEN] = "\0";
+static char mail_from[STANDARD_STRLEN] = "\0";
+static char mail_to[16384] = "\0";
+static char mail_trigger_string[STANDARD_STRLEN] = "\0";
+static char mb_str[16] = "\0";
+static char mwp_str[16] = "\0";
+static char t0_str[16] = "\0";
+static char mwpd_str[16] = "\0";
+static char alarm_str[16] = "\0";
+static char warningLevelString[16] = "\0";
+static char alarm_color_open[1024] = "\0";
+static char alarm_color_close[1024] = "\0";
+static char hypo_info_string[2 * STANDARD_STRLEN] = "\0";
+static char latency_string[STANDARD_STRLEN] = "\0";
+static char tsunami_subject[STANDARD_STRLEN] = "\0";
+static char tsunami_info_string[STANDARD_STRLEN] = "\0";
+static char mail_subject[STANDARD_STRLEN] = "\0";
+static char sys_command[16384] = "\0";
+static message_trigger_theshold messageTriggerThresholdInitial;
+//
+static char alert_file[STANDARD_STRLEN] = "\0";
+
+int send_hypocenter_alert(HypocenterDesc* phypo, int is_new_hypocenter, HypocenterDesc* pexisting_hypo, char *sendMailParams, char *outnameroot, char *agencyId, int verbose) {
+
+    // time processing
+    time_t current_time = time(&current_time);
+
+    // check if new or existing hypocenter and if passed a magnitude cutoff for issuing a mail
+    int send_alert = 0;
+    int trigger_time = 0;
+    int trigger_mb = 0;
+    int trigger_mwp = 0;
+    int trigger_mwpd = 0;
+    int trigger_alarm = 0;
+    int trigger_alarm_dropped = 0;
+    if (is_new_hypocenter || pexisting_hypo == NULL) {
+        phypo->messageTriggerThreshold = messageTriggerThresholdInitial;
+    } else {
+        //printf("DEBUG: pexisting_hypo->messageTriggerThreshold %g %g %g %g\n",
+        //        pexisting_hypo->messageTriggerThreshold.mb, pexisting_hypo->messageTriggerThreshold.mwp, pexisting_hypo->messageTriggerThreshold.mwpd, pexisting_hypo->messageTriggerThreshold.alarm);
+        phypo->messageTriggerThreshold = pexisting_hypo->messageTriggerThreshold;
+    }
+    //printf("DEBUG: phypo->messageTriggerThreshold %g %g %g %g\n", phypo->messageTriggerThreshold.mb, phypo->messageTriggerThreshold.mwp, phypo->messageTriggerThreshold.mwpd, phypo->messageTriggerThreshold.alarm);
+
+
+    // 20160304 AJL - only send alert for acceptable (A or B) quality events
+    if (strstr(LOC_QUALITY_ACCEPTABLE, phypo->qualityIndicators.quality_code) == NULL) {
+        return (0);
+    }
+
+
+    // new, check if Mwp, mb, Mwpd or TdT50Ex greater than cutoff
+    if (phypo->mbLevelStatistics.numLevel >= reportMinNumberValuesUse.mb && phypo->mbLevelStatistics.centralValue >= phypo->messageTriggerThreshold.mb) {
+        trigger_mb = 1;
+        send_alert = 1;
+        phypo->messageTriggerThreshold.mb = phypo->mbLevelStatistics.centralValue + MB_MIN_MAIL_INCREMENT;
+    }
+    if (useMwpForReport(phypo, 0, 0) && phypo->mwpLevelStatistics.centralValue >= phypo->messageTriggerThreshold.mwp) {
+        trigger_mwp = 1;
+        send_alert = 1;
+        phypo->messageTriggerThreshold.mwp = phypo->mwpLevelStatistics.centralValue + MWP_MIN_MAIL_INCREMENT;
+    }
+    if (useMwpdForReport(phypo, 0, 0) && phypo->mwpdLevelStatistics.centralValue >= phypo->messageTriggerThreshold.mwpd) {
+        trigger_mwpd = 1;
+        send_alert = 1;
+        //phypo->messageTriggerThreshold.mwpd = phypo->mwpLevelStatistics.centralValue + MWPD_MIN_MAIL_INCREMENT;   // 20110623 AJL - Bug fix: mwp should be mwpd
+        phypo->messageTriggerThreshold.mwpd = phypo->mwpdLevelStatistics.centralValue + MWPD_MIN_MAIL_INCREMENT;
+    }
+    if (phypo->tdT50ExLevelStatistics.numLevel >= reportMinNumberValuesUse.tdT50Ex) {
+        if (phypo->tdT50ExLevelStatistics.centralValue >= phypo->messageTriggerThreshold.alarm) { // value rises above trigger threshold
+            trigger_alarm = 1;
+            send_alert = 1;
+            phypo->messageTriggerThreshold.alarm = phypo->tdT50ExLevelStatistics.centralValue + TDT50EX_MIN_MAIL_INCREMENT;
+        } else {
+            double previous_trigger_level = phypo->messageTriggerThreshold.alarm - TDT50EX_MIN_MAIL_INCREMENT;
+            if (previous_trigger_level > TDT50EX_RED_CUTOFF && phypo->tdT50ExLevelStatistics.centralValue < TDT50EX_YELLOW_CUTOFF) { // alarm level dropped from above RED to below YELLOW
+                trigger_alarm_dropped = 1;
+                send_alert = 1;
+                phypo->messageTriggerThreshold.alarm = phypo->tdT50ExLevelStatistics.centralValue + TDT50EX_MIN_MAIL_INCREMENT;
+            }
+        }
+    }
+
+    // if an alert has been sent, resend after specified time delay after hypo origin time
+    double time_since_otime = difftime(current_time, (time_t) phypo->otime);
+    //printf("DEBUG: ALERT: if (phypo->alert_sent_count [%d] > 0 && !phypo->alert_sent_time [%d] && time_since_otime [%f] > ALERT_RESEND_TIME_DELAY [%d] (diff=%f)\n",
+    //        phypo->alert_sent_count, phypo->alert_sent_time, time_since_otime, phypo->messageTriggerThreshold.resend_time_delay, time_since_otime - phypo->messageTriggerThreshold.resend_time_delay);
+    if (phypo->messageTriggerThreshold.resend_time_delay > 0
+            && phypo->alert_sent_count > 0 && !phypo->alert_sent_time
+            && time_since_otime > phypo->messageTriggerThreshold.resend_time_delay) {
+        phypo->alert_sent_time = 1; // flags not to send again alert on time delay
+        trigger_time = 1;
+        send_alert = 1;
+    }
+
+    if (!send_alert)
+        return (0);
+
+    phypo->alert_sent_count++;
+
+    // mails trigger string
+    sprintf(mail_trigger_string, " ");
+    if (trigger_time == 1)
+        sprintf(mail_trigger_string, " Time_since_origin>%ds ", phypo->messageTriggerThreshold.resend_time_delay);
+    if (trigger_mb == 1)
+        strcat(mail_trigger_string, "mb ");
+    if (trigger_mwp == 1)
+        strcat(mail_trigger_string, "Mwp ");
+    if (trigger_mwpd == 1)
+        strcat(mail_trigger_string, "Mwpd ");
+    if (trigger_alarm == 1)
+        strcat(mail_trigger_string, "Td*T50Ex ");
+    if (trigger_alarm_dropped == 1)
+        strcat(mail_trigger_string, "Td*T50Ex_Decreased ");
+
+    // set magnitudes
+    if (phypo->mbLevelStatistics.numLevel >= reportMinNumberValuesUse.mb)
+        sprintf(mb_str, "%.1f", phypo->mbLevelStatistics.centralValue);
+    else strcpy(mb_str, "N/A");
+    if (useMwpForReport(phypo, 1, 0))
+        sprintf(mwp_str, "%.1f", phypo->mwpLevelStatistics.centralValue);
+    else strcpy(mwp_str, "N/A");
+    if (phypo->t0LevelStatistics.numLevel >= reportMinNumberValuesUse.t0 && useMwpForReport(phypo, 1, 0)) // 20211215 AJL - only use To if Mwp valid
+        sprintf(t0_str, "%.0f", phypo->t0LevelStatistics.centralValue);
+    else strcpy(t0_str, "N/A");
+    if (useMwpdForReport(phypo, 1, 0))
+        sprintf(mwpd_str, "%.1f", phypo->mwpdLevelStatistics.centralValue);
+    else strcpy(mwpd_str, "N/A");
+    if (phypo->tdT50ExLevelStatistics.numLevel >= reportMinNumberValuesUse.tdT50Ex)
+        sprintf(alarm_str, "%.1f", phypo->tdT50ExLevelStatistics.centralValue);
+    else strcpy(alarm_str, "N/A");
+
+    // check Td*T50Ex level
+    strcpy(warningLevelString, phypo->warningLevelString);
+    strcpy(alarm_color_close, "</font>");
+    if (!warning_colors_show) {
+        warningLevelString[0] = (char) 0;
+        strcpy(alarm_color_open, "");
+        strcpy(alarm_color_close, "");
+    }
+    if ((phypo->t50ExLevelStatistics.numLevel < reportMinNumberValuesUse.tauc) || (phypo->taucLevelStatistics.numLevel < reportMinNumberValuesUse.tauc)) {
+        if (warning_colors_show)
+            strcpy(alarm_color_open, "<font style=\"background-color: #BDBDBD\">");
+        sprintf(tsunami_info_string, "Tsunami evaluation:\n<br>&nbsp;&nbsp;&nbsp;not available (Td*T50Ex Level: %s%s%s%s)",
+                alarm_str, alarm_color_open, warningLevelString, alarm_color_close);
+        tsunami_subject[0] = (char) 0;
+    } else if (phypo->tdT50ExLevelStatistics.centralValue >= TDT50EX_RED_CUTOFF) {
+        if (warning_colors_show)
+            strcpy(alarm_color_open, "<font style=\"background-color: #FF5B5B\">");
+        sprintf(tsunami_info_string, "Tsunami evaluation:\n<br>&nbsp;&nbsp;&nbsp;<strong>LIKELY TSUNAMIGENIC EVENT if shallow, non-strike-slip, oceanic event (Td*T50Ex Level: %s%s%s%s)</strong>",
+                alarm_str, alarm_color_open, warningLevelString, alarm_color_close);
+        sprintf(tsunami_subject, "LIKELY TSUNAMIGENIC: ");
+    } else if (phypo->tdT50ExLevelStatistics.centralValue >= TDT50EX_YELLOW_CUTOFF) {
+        if (warning_colors_show)
+            strcpy(alarm_color_open, "<font style=\"background-color: #FFFF5B\">");
+        sprintf(tsunami_info_string, "Tsunami evaluation:\n<br>&nbsp;&nbsp;&nbsp;<strong>Possible tsunamigenic event if shallow, non-strike-slip, oceanic event (Td*T50Ex Level: %s%s%s%s)</strong>",
+                alarm_str, alarm_color_open, warningLevelString, alarm_color_close);
+        sprintf(tsunami_subject, "Possible tsunamigenic: ");
+    } else {
+        if (warning_colors_show)
+            strcpy(alarm_color_open, "<font style=\"background-color: #5BFF5B\">");
+        sprintf(tsunami_info_string, "Tsunami evaluation:\n<br>&nbsp;&nbsp;&nbsp;unlikely tsunamigenic event (Td*T50Ex Level: %s%s%s%s)",
+                alarm_str, alarm_color_open, warningLevelString, alarm_color_close);
+        tsunami_subject[0] = (char) 0;
+    }
+    if (!tsunami_evaluation_write) {
+        tsunami_info_string[0] = (char) 0;
+        tsunami_subject[0] = (char) 0;
+    }
+    if (tsunami_evaluation_write) {
+        strcat(tsunami_info_string,
+                "\n<br>&nbsp;&nbsp;&nbsp;(DISCLAIMER: Tsunamigenic evaluation is based on the value of the Td*T50Ex Level."
+                "\n<br>&nbsp;&nbsp;&nbsp;&nbsp;This evaluation only concerns the likelihood that this earthquake generated a regional or larger scale tsunami."
+                "\n<br>&nbsp;&nbsp;&nbsp;&nbsp;This evaluation DOES NOT concern the size and effects of a possible tsunami, which depend on details of the"
+                "\n<br>&nbsp;&nbsp;&nbsp;&nbsp;earthquake source, ocean bathymetry, coastal distances and population density, and many other factors.)"
+                "\n<br>&nbsp;&nbsp;&nbsp;&nbsp;This evaluation DOES NOT apply to and DOES NOT EXCLUDE the possibility that this earthquake generated a local tsunami,"
+                "\n<br>&nbsp;&nbsp;&nbsp;&nbsp;which can be destructive along coasts within a 100 km or more from the earthquake epicenter."
+                );
+    }
+
+    // set FE-region
+    feregion(phypo->lat, phypo->lon, feregion_str, FEREGION_STR_SIZE);
+
+    // print hypocenter information string
+    if (warning_colors_show) {
+        sprintf(hypo_info_string, "%s %s mb%s Mwp%s T0%s Mwpd%s TdT50Ex%s%s%s",
+                feregion_str,
+                time2string(phypo->otime, tmp_str),
+                mb_str, mwp_str, t0_str, mwpd_str,
+                alarm_str, strlen(warningLevelString) > 0 ? "|" : "", warningLevelString
+                );
+    } else {
+        sprintf(hypo_info_string, "%s %s mb%s Mwp%s T0%s Mwpd%s TdT50Ex%s",
+                feregion_str,
+                time2string(phypo->otime, tmp_str),
+                mb_str, mwp_str, t0_str, mwpd_str,
+                alarm_str
+                );
+    }
+    snprintf(mail_subject, STANDARD_STRLEN, "[Early-est] %s%s", tsunami_subject, hypo_info_string);
+
+    // print multi-line hypocenter information string
+    double azMaxHorUnc = phypo->ellipse.az1 + 90.0;
+    if (azMaxHorUnc >= 360.0)
+        azMaxHorUnc -= 360.0;
+    if (azMaxHorUnc >= 180.0)
+        azMaxHorUnc -= 180.0;
+    sprintf(hypo_info_string,
+            "&nbsp;&nbsp;&nbsp;<strong>mb: %s</strong> [%d] &nbsp;&nbsp;&nbsp;<strong>Mwp: %s</strong> [%d] &nbsp;&nbsp;&nbsp;<strong>"
+            "T0: %ss</strong> [%d] &nbsp;&nbsp;&nbsp;<strong>Mwpd: %s</strong> [%d] &nbsp;&nbsp;&nbsp;",
+            mb_str, phypo->mbLevelStatistics.numLevel, mwp_str, phypo->mwpLevelStatistics.numLevel, t0_str, phypo->t0LevelStatistics.numLevel, mwpd_str, phypo->mwpdLevelStatistics.numLevel
+            );
+    if (warning_colors_show) {
+        sprintf(hypo_info_string + strlen(hypo_info_string),
+                "<strong>Td*T50Ex Level: %s</strong> [%d]%s%s%s\n",
+                alarm_str, phypo->tdT50ExLevelStatistics.numLevel, alarm_color_open, warningLevelString, alarm_color_close
+                );
+    } else {
+        sprintf(hypo_info_string + strlen(hypo_info_string),
+                "<strong>Td*T50Ex Level: %s</strong> [%d]\n",
+                alarm_str, phypo->tdT50ExLevelStatistics.numLevel
+                );
+    }
+    sprintf(hypo_info_string + strlen(hypo_info_string),
+            "<br>"
+            "&nbsp;&nbsp;&nbsp;<strong>%s</strong>\n"
+            "<br>"
+            "&nbsp;&nbsp;&nbsp;<strong>%s UTC</strong>\n"
+            "<br>"
+            "&nbsp;&nbsp;&nbsp;<strong>lat: %.1fdeg &nbsp;&nbsp;lon: %.1fdeg</strong> &nbsp;&nbsp;[+/-%.0fkm]  &nbsp;&nbsp;&nbsp;<strong>depth: %.0fkm</strong>[+/-%.0fkm]\n"
+            "  &nbsp;&nbsp;&nbsp;<strong>Q: %s</strong>\n"
+            "<br>"
+            "&nbsp;&nbsp;&nbsp;stdErr: %.1fs &nbsp;&nbsp;assocPhases: %d &nbsp;&nbsp;usedPhases: %d"
+            " &nbsp;&nbsp;minDist: %.1fdeg &nbsp;&nbsp;maxDist: %.1fdeg &nbsp;&nbsp;AzGap: %.0fdeg &nbsp;&nbsp;2ndAzGap: %.0fdeg\n",
+            feregion_str,
+            timeDecSec2string(phypo->otime, tmp_str, DEFAULT_TIME_FORMAT),
+            phypo->lat, phypo->lon, phypo->errh, phypo->depth, phypo->errz, phypo->qualityIndicators.quality_code,
+            phypo->ot_std_dev, phypo->nassoc, phypo->nassoc_P, phypo->dist_min, phypo->dist_max, phypo->gap_primary, phypo->gap_secondary
+            );
+    sprintf(hypo_info_string + strlen(hypo_info_string),
+            " &nbsp;&nbsp;AmpAtten: %.2f",
+            phypo->linRegressPower.power
+            );
+    sprintf(hypo_info_string + strlen(hypo_info_string),
+            "<br>"
+            "&nbsp;&nbsp;&nbsp;68%%ConfEllipse: &nbsp;&nbsp;minHorUnc: %.1fkm &nbsp;&nbsp;maxHorUnc: %.1fkm &nbsp;&nbsp;azMaxHorUnc: %.0fdeg",
+            phypo->ellipse.len1, phypo->ellipse.len2, azMaxHorUnc
+            );
+
+    // print latency string
+    timeDiff2string(current_time, (time_t) phypo->otime, latency_string);
+
+    sprintf(mail_file, "%s/mail_%ld.txt", outnameroot, phypo->unique_id);
+    FILE * mailTmpStream = fopen_counter(mail_file, "w");
+    if (mailTmpStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", mail_file);
+        perror(tmp_str);
+        return (0);
+    }
+
+    // parse and check sendmail parameters
+    int can_send_mail = 0;
+    strcpy(info_link, "ERROR");
+    strcpy(mail_from, "ERROR");
+    strcpy(mail_to, "ERROR");
+    strncpy(send_mail_params_copy, sendMailParams, STANDARD_STRLEN);
+    while (1) {
+        // info link
+        char *str_pos = strtok(send_mail_params_copy, ",");
+        if (str_pos == NULL) break;
+        strcpy(info_link, str_pos);
+        // mail from
+        str_pos = strtok(NULL, ",");
+        if (str_pos == NULL) break;
+        strcpy(mail_from, str_pos);
+        // mail to
+        str_pos = strtok(NULL, ",");
+        if (str_pos == NULL) break;
+        strcpy(mail_to, str_pos);
+        //
+        can_send_mail = 1;
+        // additional mail to
+        while (1) {
+            str_pos = strtok(NULL, ",");
+            if (str_pos == NULL) break;
+            strcat(mail_to, ",");
+            strcat(mail_to, str_pos);
+        }
+        //printf("===========>DEBUG: mail_to: %s\n", mail_to);
+        break;
+    }
+
+    // create Google map link
+    create_map_link(info_link, phypo->unique_id, map_link, MAP_LINK_MED_ZOOM);
+
+    fprintf(mailTmpStream, "Subject: %s\n", mail_subject);
+    fprintf(mailTmpStream, "Content-Type: text/html; charset=ISO-8859-1\n");
+    fprintf(mailTmpStream, "\n");
+    fprintf(mailTmpStream, "\n<html><body style=\"font-family:sans-serif;font-size:small\">\n");
+    fprintf(mailTmpStream, "---------------------------------------------------------------------------\n<br>");
+    fprintf(mailTmpStream, "%s    %s\n<br>", EARLY_EST_MONITOR_NAME, EARLY_EST_MONITOR_AGENCY);
+    fprintf(mailTmpStream, "---------------------------------------------------------------------------\n<br>");
+    fprintf(mailTmpStream, "\n<br>---- ALERT MESSAGE ----\n<br>");
+    fprintf(mailTmpStream, "\n<br><strong>Automatic solution - this event has not been reviewed by a seismologist</strong>\n<br>");
+    fprintf(mailTmpStream, "<strong>Automatically determined event information may be erroneous!</strong>\n<br>");
+    fprintf(mailTmpStream, "\n<br>Elapsed time since event origin: %s\n<br>", latency_string);
+    fprintf(mailTmpStream, "Alert trigger:%s\n<br>", mail_trigger_string);
+    fprintf(mailTmpStream, "\n<br>Earthquake details:\n<br>%s\n<br>", hypo_info_string);
+    if (tsunami_evaluation_write) {
+        fprintf(mailTmpStream, "\n<br>%s\n<br>", tsunami_info_string);
+    }
+    fprintf(mailTmpStream, "\n<br>Real-time information: <a href='%s'>%s real-time display</a>", info_link, EARLY_EST_MONITOR_SHORT_NAME);
+    create_event_link(info_link, phypo->unique_id, event_url, event_link, feregion_str);
+    fprintf(mailTmpStream, "\n<br>Event page: %s%s event information</a>", event_link, EARLY_EST_MONITOR_SHORT_NAME);
+    fprintf(mailTmpStream, "\n<br>Epicenter in Google Maps: ");
+    fprintf(mailTmpStream, " <a href='%s'>Google Map</a>\n<br>", map_link);
+    printHypoDataHeaderString(hypoDataString);
+    printHypoDataString(phypo, hypo_info_string, 1, 0);
+    fprintf(mailTmpStream, "\n\n<br>%s\n<br>%s\n<br>", hypoDataString, hypo_info_string);
+    fprintf(mailTmpStream, "Elapsed time after origin of first association/location: %s\n\n<br>", timeDiff2string((time_t) phypo->first_assoc_time, (time_t) phypo->otime, latency_string));
+    fprintf(mailTmpStream, "\n<br>Reporting agency: %s\n<br>", agencyId);
+    fprintf(mailTmpStream, "Message time (UTC): %s\n<br>", asctime(gmtime(&current_time)));
+    fprintf(mailTmpStream, "%s software version: %s (%s)\n<br>", EARLY_EST_MONITOR_SHORT_NAME, EARLY_EST_MONITOR_VERSION, EARLY_EST_MONITOR_VERSION_DATE);
+    fprintf(mailTmpStream, "</body></html>\n");
+    fprintf(mailTmpStream, "\n.\n");
+    fclose_counter(mailTmpStream);
+
+    if (can_send_mail) {
+        snprintf(sys_command, 16384, "sendmail -f %s %s < %s &", mail_from, mail_to, mail_file);
+        if (verbose > 1)
+            printf("Running command: %s\n", sys_command);
+        int process_status = system(sys_command);
+        if (verbose > 1)
+            printf("Return %d from running command: %s\n", process_status, sys_command);
+    }
+
+    if (verbose) {
+        if (can_send_mail)
+            printf("Info: Hypocenter alert e-mail sent: %s\n", mail_subject);
+        else
+            printf("Warning: Hypocenter alert e-mail not sent: error in parsing -sendmail parameters:  %s  ->  info_link: %s  mail_from:%s  mail_to:%s\n",
+                sendMailParams, info_link, mail_from, mail_to);
+        printf("Info: Hypocenter alert e-mail file: %s\n", mail_file);
+    }
+
+    // run external alert command
+    if (1) {
+        // save hypocenter to alert file
+        sprintf(alert_file, "%s/alert_%ld.txt", outnameroot, phypo->unique_id);
+        FILE * fp_alert = fopen_counter(alert_file, "w");
+        if (fp_alert == NULL) {
+            snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", alert_file);
+            perror(tmp_str);
+        } else {
+
+            printHypoDataString(phypo, hypoDataString, 0, 0);
+            fprintf(fp_alert, "%s\n", hypoDataString);
+            fclose_counter(fp_alert);
+            // run alert script
+            sprintf(sys_command, "./run_action__alert_sent.bash %s %s &", alert_file, event_url);
+            //DEBUG if (verbose > 1)
+            printf("Running command: %s\n", sys_command);
+            int process_status = system(sys_command);
+            //DEBUG if (verbose > 1)
+            printf("Return %d from running command: %s\n", process_status, sys_command);
+        }
+    }
+
+
+    // write kml
+    // TODO: create correct KML...
+    //write_hypocenter_kml(outnameroot, phypo, verbose);
+
+    return (1);
+
+}
+
+/** calculate and write station health information */
+// 20150909 AJL - added stations map
+
+void updateStaHealthInformation(char *outnameroot, FILE* staHealthHtmlStream, double report_time_window, double report_interval, double time_since_last_report, time_t time_min, time_t time_max) {
+
+
+    // initialize work fields
+    for (int n = 0; n < num_sources_total; n++) {
+        channelParameters[n].numData = 0;
+        channelParameters[n].numDataAssoc = 0;
+        channelParameters[n].qualityWeight = 1.0;
+    }
+
+    // count station deData
+    TimedomainProcessingData* deData = NULL;
+    int source_id = -1;
+    for (int n = 0; n < num_de_data; n++) {
+        deData = data_list[n];
+        source_id = deData->source_id;
+        // 20120316 AJL - add check on flag_complete_t50 and only count assoc data when data counted
+        //      avoids premature downweight of station qualityWeight from data that may later be ignored
+        if (deData->flag_complete_t50 && !ignoreData(deData)) {
+            channelParameters[source_id].numData++;
+            if (deData->is_associated)
+                channelParameters[source_id].numDataAssoc++;
+        }
+        // END - 20120316 AJL
+    }
+
+    ChannelParameters* chan_params = NULL;
+    if (num_sources_total != num_sorted_chan_params)
+        printf("Warning: num_sources_total %d != num_sorted_chan_params %d: OK if data from some sources is earlier than report window.\n", num_sources_total, num_sorted_chan_params);
+
+    // accumulate statistics for stations
+    nstaHasBeenActive = 0;
+    nstaIsActive = 0;
+    double data_latency_sum = 0.0;
+    double data_latency_sum_sqr = 0.0;
+    double data_latency;
+    int num_data_unassoc_sum = 0;
+    int num_data_unassoc_sum_sqr = 0;
+    int num_data_unassoc = 0;
+    for (int n = 0; n < num_sorted_chan_params; n++) {
+        chan_params = sorted_chan_params_list[n];
+        // 20160906 AJL  if (chan_params->inactive_duplicate || !chan_params->process_this_channel_orientation) {
+        if (chan_params->inactive_duplicate) {
+            chan_params->data_latency = -1.0;
+            chan_params->staActiveInReportInterval = 0;
+            continue;
+        }
+        /* 20151117 AJL
+        if (!chan_params->staActiveInReportInterval) // new station data did not arrive in report interval, increase latency by report_interval
+            chan_params->data_latency += report_interval;*/
+        if (!chan_params->staActiveInReportInterval) // new station data did not arrive in report interval, increase latency by report_interval
+            chan_params->data_latency += time_since_last_report;
+        chan_params->staActiveInReportInterval = 0;
+        if (!chan_params->process_this_channel_orientation) {
+            continue;
+        }
+        nstaHasBeenActive++;
+        data_latency = chan_params->data_latency;
+        data_latency_sum += data_latency;
+        data_latency_sum_sqr += data_latency * data_latency;
+        num_data_unassoc = chan_params->numData - chan_params->numDataAssoc;
+        num_data_unassoc_sum += num_data_unassoc;
+        num_data_unassoc_sum_sqr += num_data_unassoc * num_data_unassoc;
+        if (data_latency < report_interval) {
+            nstaIsActive++;
+        }
+    }
+    // 20180321 AJL  double data_latency_mean = 0.0;
+    // 20180321 AJL  double data_latency_variance = 999.0 * 999.0;
+    double num_data_unassoc_mean = 0.0;
+    double num_data_unassoc_variance = 999.0 * 999.0;
+    if (nstaHasBeenActive > 0) {
+        data_latency_mean = data_latency_sum / (double) nstaHasBeenActive;
+        num_data_unassoc_mean = num_data_unassoc_sum / (double) nstaHasBeenActive;
+        if (nstaHasBeenActive > 1) {
+            data_latency_variance = (data_latency_sum_sqr - (double) nstaHasBeenActive * data_latency_mean * data_latency_mean) / ((double) nstaHasBeenActive - 1.0);
+            num_data_unassoc_variance = (num_data_unassoc_sum_sqr - (double) nstaHasBeenActive * num_data_unassoc_mean * num_data_unassoc_mean) / ((double) nstaHasBeenActive - 1.0);
+        }
+    }
+    double data_latency_std_dev = sqrt(data_latency_variance);
+    double num_data_unassoc_std_dev = sqrt(num_data_unassoc_variance);
+
+    // write output
+
+    fprintf(staHealthHtmlStream, "<html>\n<head>\n<title>Station Health - %s</title>\n", EARLY_EST_MONITOR_NAME);
+    fprintf(staHealthHtmlStream, "<meta http-equiv=\"refresh\" content=\"30\">\n");
+    fprintf(staHealthHtmlStream, "</head>\n");
+    fprintf(staHealthHtmlStream, "<body style=\"font-family:sans-serif;font-size:small\">\n");
+
+    //fprintf(staHealthHtmlStream, "\n<table border=0 cellpadding=0 cellspacing=2>\n<tbody>\n");
+    fprintf(staHealthHtmlStream, "\n<table border=0 cellpadding=1 frame=box rules=rows>\n<tbody>\n");
+    fprintf(staHealthHtmlStream, "<tr align=right bgcolor=\"#BBBBBB\">\n");
+    fprintf(staHealthHtmlStream, "<th>&nbsp;Stations:</th>");
+    fprintf(staHealthHtmlStream, "<th>&nbsp;total</th>");
+    fprintf(staHealthHtmlStream, "<th>&nbsp;DataLatency:</th>");
+    fprintf(staHealthHtmlStream, "<th>&nbsp;n<%gs</th>", report_interval);
+    fprintf(staHealthHtmlStream, "<th>&nbsp;mean&nbsp;<br>&nbsp;(sec)</th>");
+    fprintf(staHealthHtmlStream, "<th>&nbsp;std_dev&nbsp;<br>&nbsp;(sec)</th>");
+    fprintf(staHealthHtmlStream, "<th>&nbsp;DataUnassoc:</th>");
+    fprintf(staHealthHtmlStream, "<th>&nbsp;mean</th>");
+    fprintf(staHealthHtmlStream, "<th>&nbsp;std_dev</th>");
+    fprintf(staHealthHtmlStream, "</tr>\n");
+    fprintf(staHealthHtmlStream, "<tr align=right bgcolor=\"#FFFFFF\">\n");
+    fprintf(staHealthHtmlStream, "<td></td>");
+    // 20141212 AJL fprintf(staHealthHtmlStream, "<td>%d</td>", num_sources_total);
+    fprintf(staHealthHtmlStream, "<td>%d</td>", nstaHasBeenActive);
+    fprintf(staHealthHtmlStream, "<td></td>");
+    fprintf(staHealthHtmlStream, "<td>%d</td>", nstaIsActive);
+    fprintf(staHealthHtmlStream, "<td>%.1f</td>", data_latency_mean);
+    fprintf(staHealthHtmlStream, "<td>%.1f</td>", data_latency_std_dev);
+    fprintf(staHealthHtmlStream, "<td></td>");
+    fprintf(staHealthHtmlStream, "<td>%.2f</td>", num_data_unassoc_mean);
+    fprintf(staHealthHtmlStream, "<td>%.2f</td>", num_data_unassoc_std_dev);
+    fprintf(staHealthHtmlStream, "</tr>\n");
+    fprintf(staHealthHtmlStream, "\n</tbody>\n</table>\n");
+
+    fprintf(staHealthHtmlStream, "<br>\n");
+
+    // create map page after station health values updated
+    //create_map_html_page(outnameroot, NULL, time_min, time_max, MAP_LINK_GLOBAL_ZOOM);
+    create_map_link("./", -1, map_link_str, MAP_LINK_GLOBAL_ZOOM);
+    fprintf(staHealthHtmlStream, "\n<table border=0 cellpadding=1 frame=box rules=rows>\n<tbody>\n");
+    fprintf(staHealthHtmlStream, "<tr align=right bgcolor=\"#FFFFFF\">\n");
+    fprintf(staHealthHtmlStream, "<th><a href=\"%s\" title=\"View statopms in Google Maps\" target=map_stations>Station map</a></td>", map_link_str);
+    fprintf(staHealthHtmlStream, "</tr>\n");
+    fprintf(staHealthHtmlStream, "\n</tbody>\n</table>\n");
+
+    fprintf(staHealthHtmlStream, "<br>\n");
+
+    //fprintf(staHealthHtmlStream, "\n<table border=0 cellpadding=0 cellspacing=2>\n<tbody>\n");
+    fprintf(staHealthHtmlStream, "\n<table border=0 cellpadding=1 frame=box rules=rows>\n<tbody>\n");
+    fprintf(staHealthHtmlStream, "<tr bgcolor=\"#BBBBBB\">\n");
+    fprintf(staHealthHtmlStream, "<th>net</th><th>sta</th><th>loc</th><th>chan</th><th>streams</th><th>&nbsp;Hz</th>");
+    fprintf(staHealthHtmlStream, "<th>&nbsp;lat&nbsp;<br>&nbsp;(deg)</th><th>&nbsp;lon&nbsp;<br>&nbsp;(deg)</th><th>&nbsp;elev&nbsp;<br>(m)</th>");
+    fprintf(staHealthHtmlStream, "<th>&nbsp;cmpAz&nbsp;<br>&nbsp;(deg)</th><th>&nbsp;cmpDip&nbsp;<br>&nbsp;(deg)</th><th>&nbsp;gain&nbsp;<br>(cts/m/s)</th><th>&nbsp;staCorr&nbsp;<br>(s)</th>");
+    fprintf(staHealthHtmlStream, "<th>&nbsp;latency</th>");
+    fprintf(staHealthHtmlStream, "<th>&nbsp;nUnassoc</th><th>&nbsp;qualityWt</th>");
+    fprintf(staHealthHtmlStream, "<th>&nbsp;notContig&nbsp;<br>&nbsp;level</th>");
+    fprintf(staHealthHtmlStream, "<th>&nbsp;conflctDt&nbsp;<br>&nbsp;level</th>");
+    fprintf(staHealthHtmlStream, "<th>&nbsp;notes</th>");
+    fprintf(staHealthHtmlStream, "</tr>\n");
+    int ierror;
+    double value;
+    int latency_hour, latency_min, latency_tenths_sec;
+    static char bgColor[64];
+    // 20151117 AJL  double decay_factor = (report_time_window - report_interval) / report_time_window;
+    double decay_factor = (report_time_window - time_since_last_report) / report_time_window;
+    //double std_dev_cutoff = NUM_DATA_UNASSOC_STD_CUTOFF * num_data_unassoc_std_dev;
+    int duration = 3600; // 1
+    double start_time = (double) (time_max - duration);
+    for (int n = 0; n < num_sorted_chan_params; n++) {
+        chan_params = sorted_chan_params_list[n];
+        if (chan_params->inactive_duplicate || !chan_params->process_this_channel_orientation)
+            strcpy(bgColor, "bgcolor=\"#EEEEEE\"");
+        else
+            strcpy(bgColor, "bgcolor=\"#FFFFFF\"");
+        fprintf(staHealthHtmlStream, "<tr align=right %s>\n", bgColor);
+        // create links for channel data
+        create_channel_links(chan_params->network, chan_params->station, chan_params->location, chan_params->channel,
+                STREAM_RAW, STREAM_RAW_NAME, chan_params->n_int_tseries, start_time, duration,
+                tmp_str, tmp_str_2);
+        fprintf(staHealthHtmlStream,
+                "<td align=left>%s</td><td align=left>%s</td><td align=left>%s</td><td align=left>%s</td><td align=left>%s</td><td>%g</td><td>&nbsp;&nbsp;%.3f</td><td>%.3f</td><td>%.0f</td>",
+                chan_params->network, chan_params->station, chan_params->location,
+                tmp_str, tmp_str_2, 1.0 / chan_params->deltaTime,
+                chan_params->lat, chan_params->lon, chan_params->elev);
+        int source_id = chan_params - channelParameters;
+        fprintf(staHealthHtmlStream,
+                "<td>%.1f</td><td>%.1f</td><td>&nbsp;&nbsp;%g</td><td>%.2f</td>",
+                chan_params->azimuth, chan_params->dip,
+                chan_resp[source_id].gain, chan_params->sta_corr->mean);
+        // latency
+        value = chan_params->data_latency;
+        if (chan_params->inactive_duplicate)
+            ;
+        else if (value >= LATENCY_RED_CUTOFF) {
+            strcpy(bgColor, "bgcolor=\"#FFBBBB\"");
+        } else if (value >= LATENCY_YELLOW_CUTOFF) {
+            strcpy(bgColor, "bgcolor=\"#FFFFCC\"");
+        } else {
+            strcpy(bgColor, "bgcolor=\"#DDFFDD\"");
+        }
+        latency_tenths_sec = (int) (0.5 + 10.0 * value);
+        latency_hour = latency_min = 0;
+        while (latency_tenths_sec >= 36000) {
+            latency_tenths_sec -= 36000;
+            latency_hour++;
+        }
+        while (latency_tenths_sec >= 600) {
+            latency_tenths_sec -= 600;
+            latency_min++;
+        }
+        if (latency_hour > 0)
+            sprintf(chan_params->data_latency_str, "%dh%2.2dm%2.2ds", latency_hour, latency_min, latency_tenths_sec / 10);
+        else if (latency_min > 0)
+            sprintf(chan_params->data_latency_str, "%dm%2.2ds", latency_min, latency_tenths_sec / 10);
+        else if (latency_tenths_sec > 0)
+            sprintf(chan_params->data_latency_str, "%ds", latency_tenths_sec / 10);
+        else
+            sprintf(chan_params->data_latency_str, "0s");
+        fprintf(staHealthHtmlStream, "<td %s>%s</td>", bgColor, chan_params->data_latency_str);
+        // quality
+        /*
+        double num_data_unassoc_value = (double) (chan_params->numData - chan_params->numDataAssoc - DATA_UNASSOC_CUTOFF);
+        if (num_data_unassoc_value <= 0.0)
+            chan_params->qualityWeight = 1.0;
+        else
+            chan_params->qualityWeight = 1.0 / (num_data_unassoc_value + 1.0);
+         */
+        //
+        if (chan_params->numData - DATA_UNASSOC_CUTOFF > 0) {
+            chan_params->qualityWeight = (double) (chan_params->numDataAssoc + 1) / (double) (chan_params->numData - DATA_UNASSOC_CUTOFF + 1);
+            //printf("DEBUG: chan_params->qualityWeight %f = (double) (chan_params->numDataAssoc %d + 1) / (double) (chan_params->numData %d - DATA_UNASSOC_CUTOFF + 1)\n",
+            //        chan_params->qualityWeight, chan_params->numDataAssoc, chan_params->numData);
+            if (chan_params->qualityWeight > 1.0)
+                chan_params->qualityWeight = 1.0;
+        } else {
+            chan_params->qualityWeight = 1.0;
+        }
+        value = chan_params->qualityWeight;
+        //
+        if (chan_params->inactive_duplicate || !chan_params->process_this_channel_orientation)
+            ;
+        else if (value < DATA_UNASSOC_WT_RED_CUTOFF) {
+            strcpy(bgColor, "bgcolor=\"#FFBBBB\"");
+        } else if (value < DATA_UNASSOC_WT_YELLOW_CUTOFF) {
+            strcpy(bgColor, "bgcolor=\"#FFFFCC\"");
+        } else {
+            strcpy(bgColor, "bgcolor=\"#DDFFDD\"");
+        }
+        fprintf(staHealthHtmlStream, "<td %s>%d</td><td %s>%.2f</td>",
+                bgColor, chan_params->numData - chan_params->numDataAssoc, bgColor, chan_params->qualityWeight);
+        // errors
+        double level_non_contiguous = chan_params->level_non_contiguous * decay_factor;
+        level_non_contiguous += chan_params->count_non_contiguous;
+        if (chan_params->inactive_duplicate)
+            ;
+        else if (level_non_contiguous >= LEVEL_NON_CONTIGUOUS_RED_CUTOFF) {
+            strcpy(bgColor, "bgcolor=\"#FFBBBB\"");
+        } else if (level_non_contiguous >= LEVEL_NON_CONTIGUOUS_YELLOW_CUTOFF) {
+            strcpy(bgColor, "bgcolor=\"#FFFFCC\"");
+        } else {
+            strcpy(bgColor, "bgcolor=\"#DDFFDD\"");
+        }
+        fprintf(staHealthHtmlStream, "<td %s>%.1f</td>", bgColor, level_non_contiguous);
+        chan_params->level_non_contiguous = level_non_contiguous;
+        //
+        double level_conflicting_dt = chan_params->level_conflicting_dt * decay_factor;
+        level_conflicting_dt += chan_params->count_conflicting_dt;
+        if (chan_params->inactive_duplicate)
+            ;
+        else if (level_conflicting_dt >= LEVEL_CONFLICTING_DT_RED_CUTOFF) {
+            strcpy(bgColor, "bgcolor=\"#FFBBBB\"");
+        } else if (level_conflicting_dt >= LEVEL_CONFLICTING_DT_YELLOW_CUTOFF) {
+            strcpy(bgColor, "bgcolor=\"#FFFFCC\"");
+        } else {
+            strcpy(bgColor, "bgcolor=\"#DDFFDD\"");
+        }
+        fprintf(staHealthHtmlStream, "<td %s>%.1f</td>", bgColor, level_conflicting_dt);
+        chan_params->level_conflicting_dt = level_conflicting_dt;
+        //
+        ierror = chan_params->error;
+        if (ierror > 0 || chan_params->inactive_duplicate) {
+            if (chan_params->inactive_duplicate) {
+                fprintf(staHealthHtmlStream, "<td %s>inactive_duplicate", bgColor);
+                //} else if (!chan_params->process_this_channel_orientation) {
+                //    fprintf(staHealthHtmlStream, "<td %s>other_orientation ", bgColor);
+            } else {
+                strcpy(bgColor, "bgcolor=\"#FFBBBB\"");
+                fprintf(staHealthHtmlStream, "<td %s>", bgColor);
+            }
+            if (ierror & ERROR_DIFFERENT_SAMPLE_RATES) {
+                fprintf(staHealthHtmlStream, "conflicting_dt");
+            }
+            if (ierror & ERROR_DATA_NON_CONTIGUOUS) {
+                fprintf(staHealthHtmlStream, "data_not_contig");
+            }
+            if (ierror & ERROR_DT_NOT_SUPPORTED_BY_FILTER)
+                fprintf(staHealthHtmlStream, "dt_not_supported_by_filter");
+            fprintf(staHealthHtmlStream, "</td>");
+        } else {
+
+            strcpy(bgColor, "bgcolor=\"#DDFFDD\"");
+            fprintf(staHealthHtmlStream, "<td %s>-</td>", bgColor);
+        }
+        //
+        fprintf(staHealthHtmlStream, "</tr>\n");
+        // re-initilize station health counters
+        chan_params->error = 0;
+        chan_params->count_non_contiguous = 0;
+        chan_params->count_conflicting_dt = 0;
+    }
+
+    fprintf(staHealthHtmlStream, "\n</tbody>\n</table>\n");
+
+
+    fprintf(staHealthHtmlStream, "</body>\n</html>\n");
+
+    // create map page after station health values updated
+    create_map_html_page(outnameroot, NULL, time_min, time_max, MAP_LINK_GLOBAL_ZOOM);
+
+}
+
+/** evaluate and set level statistics */
+
+int setStatistics(char *levelName, double **statisticsArray, int numLevel, statistic_level* pLevelStatistics, int verbose) {
+
+    double **statisticsArray_tmp;
+    double* percentiles;
+
+    pLevelStatistics->numLevel = numLevel;
+
+    // trim before weighting
+    int allocated_tmp = 0;
+    if (TRIM_BEFORE_WEIGHTING && numLevel > 2) {
+        percentiles = vector_percentiles(statisticsArray[0], numLevel, 'a');
+        statisticsArray_tmp = calloc(3, sizeof (double*));
+        for (int m = 0; m < 3; m++) {
+            statisticsArray_tmp[m] = calloc(numLevel, sizeof (double));
+        }
+        allocated_tmp = 1;
+        int ntrim = 0;
+        double value;
+        for (int n = 0; n < numLevel; n++) {
+            value = statisticsArray[0][n];
+            if (value >= percentiles[10] && value <= percentiles[90]) {
+                statisticsArray_tmp[0][ntrim] = value;
+                statisticsArray_tmp[1][ntrim] = statisticsArray[1][n];
+                statisticsArray_tmp[2][ntrim] = statisticsArray[2][n];
+                ntrim++;
+            }
+        }
+        numLevel = ntrim;
+        free(percentiles);
+    } else {
+        statisticsArray_tmp = statisticsArray;
+    }
+
+    // station distribution weighting
+    if (USE_DISTRIBUTION_WEIGHTING) {
+        double* weights = setDistributionWeights(statisticsArray_tmp[1], statisticsArray_tmp[2], numLevel);
+        if (verbose) {
+            int im;
+            fprintf(stdout, "= %s levelStatistics ====================\n", levelName);
+            for (im = 0; im < numLevel; im++) {
+                fprintf(stdout, "stats.addValue(%f, new Position(%f, %f), w=%f);\n",
+                        statisticsArray_tmp[0][im], statisticsArray_tmp[1][im], statisticsArray_tmp[2][im], weights[im]);
+            }
+            fprintf(stdout, "========================\n");
+        }
+        percentiles = vector_percentiles_weighted(statisticsArray_tmp[0], weights, numLevel);
+        free(weights);
+    } else {
+        percentiles = vector_percentiles(statisticsArray_tmp[0], numLevel, 'a');
+    }
+    // use all values
+    pLevelStatistics->centralValue = percentiles[50];
+    pLevelStatistics->upperBound = percentiles[84]; // median plus 1-std-dev
+    pLevelStatistics->lowerBound = percentiles[16]; // median minus 1-std-dev
+
+    free(percentiles);
+    if (allocated_tmp) {
+        for (int m = 0; m < 3; m++) {
+
+            free(statisticsArray_tmp[m]);
+        }
+        free(statisticsArray_tmp);
+    }
+
+    return (0);
+
+}
+
+/** evaluate and set level statistics */
+/*
+int setStatisticsGeometric(char *levelName, double **statisticsArray, int numLevel, statistic_level* pLevelStatistics, int verbose) {
+
+    int n, m;
+
+    double **statisticsArray_tmp = calloc(3, sizeof (double*));
+    for (int m = 0; m < 3; m++) {
+        statisticsArray_tmp[m] = calloc(numLevel, sizeof (double));
+    }
+
+    // set logarithmic values
+    for (int n = 0; n < numLevel; n++) {
+        statisticsArray_tmp[0][n] = log10(statisticsArray[0][n]);
+        statisticsArray_tmp[1][n] = statisticsArray[1][n];
+        statisticsArray_tmp[2][n] = statisticsArray[2][n];
+    }
+
+    setStatistics(levelName, statisticsArray_tmp, numLevel, pLevelStatistics, verbose);
+
+    for (int m = 0; m < 3; m++) {
+        free(statisticsArray_tmp[m]);
+    }
+    free(statisticsArray_tmp);
+
+    // unset logarithmic values
+    pLevelStatistics->centralValue = pow(10.0, pLevelStatistics->centralValue);
+    pLevelStatistics->upperBound = pow(10.0, pLevelStatistics->upperBound); // median plus 1-std-dev
+    pLevelStatistics->lowerBound = pow(10.0, pLevelStatistics->lowerBound); // median minus 1-std-dev
+
+    return (0);
+
+}
+ */
+
+/** calculated the vector sum of station locations in a flat distance-azimuth geometry for all stations less than a specified distance from a specified point
+ *
+ * returns number of stations used
+ */
+
+int calcStationVectorSum(ChannelParameters* sta_coordinates, int num_sta_coordinates, double lat, double lon, double distance_max,
+        double *pvector_distance, double *pvector_azimuth) {
+
+    double x_vector_sum = 0.0; // x accumulation for vector sum of epicenter to station vectors
+    double y_vector_sum = 0.0; // y accumulation for vector sum of epicenter to station vectors
+    int n_vector_sum = 0;
+
+    double distance, azimuth;
+    int nsta;
+    for (nsta = 0; nsta < num_sta_coordinates; nsta++) {
+        // 20160902 AJL - bug fix  if (sta_coordinates[nsta].have_coords && !channelParameters[nsta].inactive_duplicate && channelParameters->process_this_channel_orientation) {
+        if (sta_coordinates[nsta].have_coords && !channelParameters[nsta].inactive_duplicate && channelParameters[nsta].process_this_channel_orientation) {
+            ChannelParameters* coords = sta_coordinates + nsta;
+            distance = GCDistance(lat, lon, coords->lat, coords->lon);
+            if (distance <= distance_max) {
+                azimuth = GCAzimuth(lat, lon, coords->lat, coords->lon);
+                x_vector_sum += distance * sin(azimuth * DE2RA);
+                y_vector_sum += distance * cos(azimuth * DE2RA);
+                n_vector_sum++;
+            }
+        }
+    }
+
+    // set mean vector of epicenter to station vectors
+    *pvector_azimuth = atan2(x_vector_sum, y_vector_sum) * RA2DE;
+    if (*pvector_azimuth < 0.0)
+        *pvector_azimuth += 360.0;
+    *pvector_distance = sqrt(x_vector_sum * x_vector_sum + y_vector_sum * y_vector_sum);
+
+    return (n_vector_sum);
+
+}
+
+
+
+// from http://stackoverflow.com/questions/5377450/maximum-number-of-open-filehandles-per-process-on-osx-and-how-to-increase
+
+struct rlimit limit;
+
+/*
+ * Set max number of files.
+ */
+void setLimit(int lim) {
+    if (getrlimit(RLIMIT_NOFILE, &limit) != 0) {
+        printf("getrlimit() failed with errno=%d\n", errno);
+        exit(1);
+    }
+    limit.rlim_cur = lim;
+    //limit.rlim_max = lim;
+    printf("Info: Attempting to set maximum number of open files for this process to: soft limit: %lu, hard limit: %lu\n",
+            (unsigned long) limit.rlim_cur, (unsigned long) limit.rlim_max);
+    if (setrlimit(RLIMIT_NOFILE, &limit) != 0) {
+
+        printf("setrlimit() failed with errno=%d\n", errno);
+        exit(1);
+    }
+}
+
+/*
+ * Get max number of files.
+ */
+void getLimit() {
+    if (getrlimit(RLIMIT_NOFILE, &limit) != 0) {
+
+        printf("getrlimit() failed with errno=%d\n", errno);
+        exit(1);
+    }
+    printf("Info: Maximum number of open files for this process set to: soft limit: %lu, hard limit: %lu\n",
+            (unsigned long) limit.rlim_cur, (unsigned long) limit.rlim_max);
+}
+
+/*
+ * Calculate T50Ex level
+ */
+double getT50Level(TimedomainProcessingData* deData) {
+
+    double t50Level = T50EX_LEVEL_MIN;
+    if (deData->flag_complete_t50)
+        if (!isnan(deData->t50) && !isnan(deData->a_ref) && deData->a_ref > FLT_MIN) // avoid divide by zero
+            t50Level = deData->t50 / deData->a_ref;
+
+    // 20140407 AJL - bug fix.
+    if (isnan(t50Level)) {
+
+        t50Level = T50EX_LEVEL_MIN;
+    }
+
+    return (t50Level);
+
+}
+
+/*
+ * Determine if T0 should be used for reporting
+ */
+int useT0Report(TimedomainProcessingData* deData) {
+
+    double distance = deData->epicentral_distance;
+
+    if (distance > MIN_EPICENTRAL_DISTANCE_T0) {
+        if (distance < MAX_EPICENTRAL_DISTANCE_T0_CONDITIONAL) {
+            double t50Level = getT50Level(deData);
+            if (t50Level >= T0_CONDITIONAL_T50_LIMIT && !deData->flag_snr_brb_too_low && deData->tauc_peak != TAUC_INVALID && deData->tauc_peak > T0_CONDITIONAL_TAUC_LIMIT)
+                return (1);
+        } else if (distance < MAX_EPICENTRAL_DISTANCE_T0) {
+
+            return (1);
+        }
+    }
+
+    return (0);
+}
+
+/***************************************************************************
+ * td_timedomainProcessingReport_init:
+ *
+ * Do necessary initialization.
+ ***************************************************************************/
+int td_timedomainProcessingReport_init(
+        char* outnameroot_archive
+        ) {
+
+    // if many events associated/located will open many files, increase file number limit
+    /* does not seem to work on OS X 10.6
+    getLimit();
+    setLimit(4096);
+    getLimit();
+     */
+
+    // set relevant program properties
+    char out_buf[STANDARD_STRLEN];
+
+
+    // get application properties settings
+    double double_param;
+    int int_param;
+
+    // set phase names to use in location/association
+    // default is use all (see ttimes.c)
+    if (settings_get(app_prop_settings, "AssociateLocate", "phase.names.use", out_buf, STANDARD_STRLEN)) {
+        num_phase_names_use = 0;
+        printf("Info: property set: [AssociateLocate] phase.names.use %s -> ", out_buf);
+        char *str_pos = strtok(out_buf, ", ");
+        while (str_pos != NULL && num_phase_names_use < get_num_ttime_phases()) {
+            *channel_names_use[num_phase_names_use] = '\0';
+            *time_delay_use[num_phase_names_use] = '\0'; // 20150410 AJL - added
+            char *str_pos_pha_chan = strchr(str_pos, ':');
+            if (str_pos_pha_chan != NULL) { // there is a ':' separator character, should be a channel string following
+                char *str_pos_pha_tdelay = strchr(str_pos_pha_chan + 1, ':');
+                if (str_pos_pha_tdelay != NULL) { // there is a ':' separator character, should be a time delay string following // 20150410 AJL - added
+                    strcpy(time_delay_use[num_phase_names_use], str_pos_pha_tdelay + 1);
+                    *str_pos_pha_tdelay = '\0';
+                }
+                strcpy(channel_names_use[num_phase_names_use], str_pos_pha_chan + 1);
+                *str_pos_pha_chan = '\0';
+            }
+            strcpy(phase_names_use[num_phase_names_use], str_pos);
+            printf(" <%s:%s:%s>,", phase_names_use[num_phase_names_use], channel_names_use[num_phase_names_use], time_delay_use[num_phase_names_use]);
+            num_phase_names_use++;
+            str_pos = strtok(NULL, ",");
+        }
+        printf("\n"); // DEBUG
+    }
+
+    // associate_locate_octtree parameters
+    depth_step_full = get_dist_time_depth_max();
+    depth_min_full = 0.0; // range defines grid cell limits
+    depth_max_full = get_dist_time_depth_max(); // range defines grid cell limits
+    if ((double_param = settings_get_double(app_prop_settings, "AssociateLocate", "assoc_loc.depth.step")) != DBL_INVALID)
+        depth_step_full = double_param;
+    if ((double_param = settings_get_double(app_prop_settings, "AssociateLocate", "assoc_loc.depth.min")) != DBL_INVALID)
+        depth_min_full = double_param;
+    if ((double_param = settings_get_double(app_prop_settings, "AssociateLocate", "assoc_loc.depth.max")) != DBL_INVALID)
+        depth_max_full = double_param;
+    printf("Info: property set: [AssociateLocate] assoc_loc.depth. step %f min %f max %f\n", depth_step_full, depth_min_full, depth_max_full);
+    // check
+    if (depth_max_full > get_dist_time_depth_max()) {
+        printf("ERROR: Property AssociateLocate->assoc_loc.depth.max (%f km) > maximum depth in travel time tables (%f km).\n",
+                depth_max_full, get_dist_time_depth_max());
+        return (-1);
+    }
+    // 20111110 AJL double lat_step = 5.0;
+    lat_step_full = 7.2; // 20111110 AJL
+    lat_min_full = -90.0; // range defines grid cell limits
+    lat_max_full = 90.0; // range defines grid cell limits
+    if ((double_param = settings_get_double(app_prop_settings, "AssociateLocate", "assoc_loc.lat.step")) != DBL_INVALID)
+        lat_step_full = double_param;
+    if ((double_param = settings_get_double(app_prop_settings, "AssociateLocate", "assoc_loc.lat.min")) != DBL_INVALID)
+        lat_min_full = double_param;
+    if ((double_param = settings_get_double(app_prop_settings, "AssociateLocate", "assoc_loc.lat.max")) != DBL_INVALID)
+        lat_max_full = double_param;
+    printf("Info: property set: [AssociateLocate] assoc_loc.lat. step %f min %f max %f\n", lat_step_full, lat_min_full, lat_max_full);
+    // 20111110 AJL double lon_step_smallest = 5.0; // lon step is nominal for lat = 0 (on equator), will  be adjusted by 1/cos(lat) in assoc/location routine
+    lon_step_smallest_full = 7.2; // 20111110 AJL // lon step is nominal for lat = 0 (on equator), will  be adjusted by 1/cos(lat) in assoc/location routine
+    lon_min_full = -180.0; // range defines grid cell limits
+    lon_max_full = 180.0; // range defines grid cell limits
+    if ((double_param = settings_get_double(app_prop_settings, "AssociateLocate", "assoc_loc.lon.step")) != DBL_INVALID)
+        lon_step_smallest_full = double_param;
+    if ((double_param = settings_get_double(app_prop_settings, "AssociateLocate", "assoc_loc.lon.min")) != DBL_INVALID)
+        lon_min_full = double_param;
+    if ((double_param = settings_get_double(app_prop_settings, "AssociateLocate", "assoc_loc.lon.max")) != DBL_INVALID)
+        lon_max_full = double_param;
+    printf("Info: property set: [AssociateLocate] assoc_loc.lon. step %f min %f max %f\n", lon_step_smallest_full, lon_min_full, lon_max_full);
+    //
+    nomimal_critical_oct_tree_node_size = 50.0; // for global / teleseismic monitor mode
+    if ((double_param = settings_get_double(app_prop_settings, "AssociateLocate", "assoc_loc.nomimal_critical_oct_tree_node_size")) != DBL_INVALID)
+        nomimal_critical_oct_tree_node_size = double_param;
+    printf("Info: property set: [AssociateLocate] assoc_loc.nomimal_critical_oct_tree_node_size %f\n", nomimal_critical_oct_tree_node_size);
+    //
+    min_critical_oct_tree_node_size = 1.0; // for global / teleseismic monitor mode
+    if ((double_param = settings_get_double(app_prop_settings, "AssociateLocate", "assoc_loc.min_critical_oct_tree_node_size")) != DBL_INVALID)
+        min_critical_oct_tree_node_size = double_param;
+    printf("Info: property set: [AssociateLocate] assoc_loc.min_critical_oct_tree_node_size %f\n", min_critical_oct_tree_node_size);
+    //
+    nominal_oct_tree_min_node_size = 5.0; // for global / teleseismic monitor mode
+    if ((double_param = settings_get_double(app_prop_settings, "AssociateLocate", "assoc_loc.nominal_oct_tree_min_node_size")) != DBL_INVALID)
+        nominal_oct_tree_min_node_size = double_param;
+    printf("Info: property set: [AssociateLocate] assoc_loc.nominal_oct_tree_min_node_size %f\n", nominal_oct_tree_min_node_size);
+    //
+    min_weight_sum_assoc = 4.5; // for global / teleseismic monitor mode
+    if ((double_param = settings_get_double(app_prop_settings, "AssociateLocate", "assoc_loc.min_weight_sum_associate")) != DBL_INVALID)
+        min_weight_sum_assoc = double_param;
+    printf("Info: property set: [AssociateLocate] assoc_loc.min_weight_sum_associate %f\n", min_weight_sum_assoc);
+    //
+    min_time_delay_between_picks_for_location = 25.0; // same as aref, for global / teleseismic monitor mode
+    if ((double_param = settings_get_double(app_prop_settings, "AssociateLocate", "assoc_loc.min_time_delay_between_picks_for_location")) != DBL_INVALID)
+        min_time_delay_between_picks_for_location = double_param;
+    printf("Info: property set: [AssociateLocate] assoc_loc.min_time_delay_between_picks_for_location %f\n", min_time_delay_between_picks_for_location);
+    //
+    // 20160906 AJL  gap_primary_critical = 225; // for global / teleseismic monitor mode
+    gap_primary_critical = 270; // for global / teleseismic monitor mode
+    if ((double_param = settings_get_double(app_prop_settings, "AssociateLocate", "assoc_loc.gap_primary_critical")) != DBL_INVALID)
+        gap_primary_critical = double_param;
+    printf("Info: property set: [AssociateLocate] assoc_loc.gap_primary_critical %f\n", gap_primary_critical);
+    // 20160906 AJL  gap_secondary_critical = 270; // for global / teleseismic monitor mode
+    gap_secondary_critical = 315; // for global / teleseismic monitor mode
+    if ((double_param = settings_get_double(app_prop_settings, "AssociateLocate", "assoc_loc.gap_secondary_critical")) != DBL_INVALID)
+        gap_secondary_critical = double_param;
+    printf("Info: property set: [AssociateLocate] assoc_loc.gap_secondary_critical %f\n", gap_secondary_critical);
+
+    // associate/locate station corrections (used here and in timedomain_processing.c)
+    //
+    if (settings_get_int_helper(app_prop_settings,
+            "AssociateLocate", "sta_corr.nmin", &sta_corr_min_num_to_use, MIN_NUM_STATION_CORRECTIONS_USE,
+            ee_verbose) == INT_INVALID) {
+        ; // handle error
+    }
+    //
+    if (settings_get_helper(app_prop_settings,
+            "AssociateLocate", "sta_corr.filename", sta_corr_filename, sizeof (sta_corr_filename), "",
+            ee_verbose) == 0) {
+        ; // handle error
+    }
+    use_station_corrections = 0;
+    if (strlen(sta_corr_filename) > 0) {
+        use_station_corrections = 1;
+    }
+
+    // associate/locate station misc settings
+    //
+    // upweight_picks_sn_cutoff declared in location.h
+    if (settings_get_double_helper(app_prop_settings,
+            "AssociateLocate", "assoc_loc.upweight_picks_sn_cutoff", &upweight_picks_sn_cutoff, LOCATION_UPWEIGHT_HIGH_SN_PICKS_SN_CUTOFF_DEFAULT,
+            ee_verbose
+            ) == DBL_INVALID) {
+        ; // handle error
+    }
+    //
+    // upweight_picks_dist_max declared in location.h
+    if (settings_get_double_helper(app_prop_settings,
+            "AssociateLocate", "assoc_loc.upweight_picks_dist_full", &upweight_picks_dist_full, LOCATION_UPWEIGHT_HIGH_SN_PICKS_DIST_MIN_DEFAULT,
+            ee_verbose
+            ) == DBL_INVALID) {
+        ; // handle error
+    }
+    //
+    // declared in location.h
+    if (settings_get_double_helper(app_prop_settings,
+            "AssociateLocate", "assoc_loc.upweight_picks_dist_max", &upweight_picks_dist_max, LOCATION_UPWEIGHT_HIGH_SN_PICKS_DIST_MAX_DEFAULT,
+            ee_verbose
+            ) == DBL_INVALID) {
+        ; // handle error
+    }
+    //
+    // use_amplitude_attenuation declared in location.h
+    if (settings_get_int_helper(app_prop_settings,
+            "AssociateLocate", "assoc_loc.use_amplitude_attenuation", &use_amplitude_attenuation, LOCATION_USE_AMPLITUDE_ATTENUATION_DEFAULT,
+            ee_verbose
+            ) == INT_INVALID) {
+        ; // handle error
+    }
+    //
+    initAssociateLocateParameters(upweight_picks_sn_cutoff, upweight_picks_dist_max, upweight_picks_dist_full, use_amplitude_attenuation);
+
+    // event persistence
+    //
+    if (settings_get_int_helper(app_prop_settings,
+            "AssociateLocate", "assoc_loc.persistence.min_num_def_phases", &event_persistence_min_num_defining_phases, EVENT_PERSISTENCE_MIN_NUM_DEFINING_PHASES_DEFAULT,
+            ee_verbose
+            ) == INT_INVALID) {
+        ; // handle error
+    }
+    use_event_persistence = (event_persistence_min_num_defining_phases > 0);
+    //
+    if (settings_get_double_helper(app_prop_settings,
+            "AssociateLocate", "assoc_loc.persistence.frac_poss_assoc_cutoff", &event_persistence_frac_poss_assoc_cutoff, EVENT_PERSISTENCE_FRAC_POSS_ASSOC_CUTOFF_DEFAULT,
+            ee_verbose
+            ) == DBL_INVALID) {
+        ; // handle error
+    }
+    //
+    if (settings_get_double_helper(app_prop_settings,
+            "AssociateLocate", "assoc_loc.persistence.time_after_otime_cutoff", &event_persistence_time_after_otime_cutoff, EVENT_PERSISTENCE_TIME_AFTER_OTIME_CUTOFF_DEFAULT,
+            ee_verbose
+            ) == DBL_INVALID) {
+        ; // handle error
+    }
+    //
+    if (settings_get_double_helper(app_prop_settings,
+            "AssociateLocate", "assoc_loc.persistence.tt_err_fact", &event_persistence_tt_err_fact, EVENT_PERSISTENCE_TT_ERR_FACTOR_DEFAULT,
+            ee_verbose
+            ) == DBL_INVALID) {
+        ; // handle error
+    }
+
+
+    // existing event association location  // 20160915 AJL - added
+    //
+    if (settings_get_double_helper(app_prop_settings,
+            "AssociateLocate", "assoc_loc.existing_event_assoc.delay_otime.min", &existing_assoc_delay_otime_min, EXISTING_EVENT_ASSOC_DELAY_OTIME_MIN_DEFAULT,
+            ee_verbose
+            ) == DBL_INVALID) {
+        ; // handle error
+    }
+    //
+    if (settings_get_int_helper(app_prop_settings,
+            "AssociateLocate", "assoc_loc.existing_event_assoc.min_num_def_phases", &existing_assoc_min_num_defining_phases, EXISTING_EVENT_ASSOC_MIN_NUM_DEFINING_PHASES,
+            ee_verbose
+            ) == INT_INVALID) {
+        ; // handle error
+    }
+    use_existing_assoc = (existing_assoc_min_num_defining_phases > 0);
+
+    //
+    // use_reference_phase_ttime_error
+    int use_reference_phase_ttime_error = 1; // if = 1 use reference_phase_ttime_error, use 0 to disable reference_phase_ttime_error weighting
+    if (settings_get_int_helper(app_prop_settings,
+            "AssociateLocate", "assoc_loc.use_reference_phase_ttime_error", &use_reference_phase_ttime_error, LOCATION_USE_REFERENCE_PHASE_TIME_ERROR_DEFAULT,
+            ee_verbose
+            ) == INT_INVALID) {
+        ; // handle error
+    }
+    if (!use_reference_phase_ttime_error) {
+        reference_phase_ttime_error = -1.0;
+    }
+
+
+    // magnitude corrections and checks
+    //
+    if (settings_get_int_helper(app_prop_settings,
+            "AssociateLocate", "assoc_loc.use_mwp_distance_correction", &use_mwp_distance_correction, LOCATION_USE_MWP_DISTANCE_CORRECTION_DEFAULT,
+            ee_verbose
+            ) == INT_INVALID) {
+        ; // handle error
+    }
+    //
+    if (settings_get_int_helper(app_prop_settings,
+            "AssociateLocate", "assoc_loc.use_mb_correction", &use_mb_correction, LOCATION_USE_MB_CORRECTION_DEFAULT,
+            ee_verbose
+            ) == INT_INVALID) {
+        ; // handle error
+    }
+    //
+    if (settings_get_int_helper(app_prop_settings,
+            "AssociateLocate", "assoc_loc.use_magnitude_amp_atten_check", &use_magnitude_amp_atten_check, LOCATION_USE_MAGNITUDE_AMP_ATTEN_CHECK_DEFAULT,
+            ee_verbose
+            ) == INT_INVALID) {
+        ; // handle error
+    }
+
+
+    // enable and configure waveform export (miniseed data files) for specified time window around associated P picks.
+    waveform_export_enable = 0;
+    if ((int_param = settings_get_int(app_prop_settings, "WaveformExport", "enable")) != INT_INVALID)
+        waveform_export_enable = int_param;
+    printf("Info: property set: [WaveformExport] enable %d\n", waveform_export_enable);
+    //
+    if (settings_get_int_helper(app_prop_settings,
+            "WaveformExport", "file_archive.age_max", &waveform_export_file_archive_age_max, WAVEFORM_EXPORT_FILE_ARCHIVE_AGE_MAX,
+            ee_verbose) == INT_INVALID) {
+        ; // handle error
+    }
+    //
+    if (settings_get_int_helper(app_prop_settings,
+            "WaveformExport", "memory.sliding_window.length", &waveform_export_memory_sliding_window_length, WAVEFORM_EXPORT_MEMORY_SLIDING_WINDOW_LENGTH,
+            ee_verbose) == INT_INVALID) {
+        ; // handle error
+    }
+    //
+    if (settings_get_int_helper(app_prop_settings,
+            "WaveformExport", "window.start.before.P", &waveform_export_window_start_before_P, WAVEFORM_EXPORT_WINDOW_START_BEFORE_P,
+            ee_verbose) == INT_INVALID) {
+        ; // handle error
+    }
+    //
+    if (settings_get_int_helper(app_prop_settings,
+            "WaveformExport", "window.end.after.S", &waveform_export_window_end_after_S, WAVEFORM_EXPORT_WINDOW_END_AFTER_S,
+            ee_verbose) == INT_INVALID) {
+        ; // handle error
+    }
+
+    //
+
+    // report
+    if (settings_get_int_helper(app_prop_settings,
+            "Report", "warning.colors.show", &warning_colors_show, WARNING_COLORS_SHOW_DEFAULT,
+            ee_verbose) == INT_INVALID) {
+        ; // handle error
+    }
+    if (settings_get_int_helper(app_prop_settings,
+            "Report", "tsunami.evaluation.write", &tsunami_evaluation_write, TSUNAMI_EVALUATION_WRITE_DEFAULT,
+            ee_verbose) == INT_INVALID) {
+        ; // handle error
+    }
+
+#ifdef USE_JSON_OUTPUT
+    // 20211103 AJL - added GeoJSON
+    if (settings_get_int_helper(app_prop_settings,
+            "Report", "save.plotfiles.geojson", &save_plotfiles_geojson, SAVE_PLOTFILES_GEOJSON_DEFAULT,
+            ee_verbose) == INT_INVALID) {
+        ; // handle error
+    }
+#endif
+    /*
+    if (settings_get_int_helper(app_prop_settings,
+            "Report", "magnitude.colors.show", &magnitude_colors_show, MAGNITUDE_COLORS_SHOW_DEFAULT,
+            ee_verbose) == INT_INVALID) {
+        ; // handle error
+    }*/
+    magnitude_colors_show = warning_colors_show;
+    //
+    if (settings_get_double_helper(app_prop_settings,
+            "Report", "alert.mb_min", &mb_min_mail, MB_MIN_MAIL_DEFAULT,
+            ee_verbose
+            ) == DBL_INVALID) {
+        ; // handle error
+    }
+    //
+    if (settings_get_double_helper(app_prop_settings,
+            "Report", "alert.mwp_min", &mwp_min_mail, MWP_MIN_MAIL_DEFAULT,
+            ee_verbose
+            ) == DBL_INVALID) {
+        ; // handle error
+    }
+    //
+    if (settings_get_double_helper(app_prop_settings,
+            "Report", "alert.mwpd_min", &mwpd_min_mail, MWPD_MIN_MAIL_DEFAULT,
+            ee_verbose
+            ) == DBL_INVALID) {
+        ; // handle error
+    }
+    //
+    if (settings_get_double_helper(app_prop_settings,
+            "Report", "alert.tdt50ex_min", &tdt50ex_min_mail, TDT50EX_MIN_MAIL_DEFAULT,
+            ee_verbose
+            ) == DBL_INVALID) {
+        ; // handle error
+    }
+    //
+    if (settings_get_double_helper(app_prop_settings,
+            "Report", "alert.resend_time_delay", &alert_resend_time_delay_mail, ALERT_RESEND_TIME_DELAY_DEFAULT,
+            ee_verbose
+            ) == DBL_INVALID) {
+        ; // handle error
+    }
+    messageTriggerThresholdInitial.mb = mb_min_mail;
+    messageTriggerThresholdInitial.mwp = mwp_min_mail;
+    messageTriggerThresholdInitial.mwpd = mwpd_min_mail;
+    messageTriggerThresholdInitial.alarm = tdt50ex_min_mail;
+    messageTriggerThresholdInitial.resend_time_delay = alert_resend_time_delay_mail;
+
+
+
+    // minimum number of readings for measure to be valid
+    // 20171114 AJL - added
+    if (settings_get_int_helper(app_prop_settings,
+            "Report", "min_num_valid.mb", &reportMinNumberValuesUse.mb, MIN_NUM_VALUES_USE_DEFAULT,
+            ee_verbose) == INT_INVALID) {
+        ; // handle error
+    }
+    //
+    if (settings_get_int_helper(app_prop_settings,
+            "Report", "min_num_valid.mwp", &reportMinNumberValuesUse.mwp, MIN_NUM_VALUES_USE_DEFAULT,
+            ee_verbose) == INT_INVALID) {
+        ; // handle error
+    }
+    //
+    if (settings_get_int_helper(app_prop_settings,
+            "Report", "min_num_valid.mwpd", &reportMinNumberValuesUse.mwpd, MIN_NUM_VALUES_USE_DEFAULT,
+            ee_verbose) == INT_INVALID) {
+        ; // handle error
+    }
+    reportMinNumberValuesUse.t0 = reportMinNumberValuesUse.mwpd;
+    //
+    if (settings_get_int_helper(app_prop_settings,
+            "Report", "min_num_valid.tdT50Ex", &reportMinNumberValuesUse.tdT50Ex, MIN_NUM_VALUES_USE_DEFAULT,
+            ee_verbose) == INT_INVALID) {
+        ; // handle error
+    }
+    reportMinNumberValuesUse.t50Ex = reportMinNumberValuesUse.tdT50Ex;
+    reportMinNumberValuesUse.tauc = reportMinNumberValuesUse.tdT50Ex;
+
+
+
+    // minimum value of magnitude measure to be preferred
+    // 20171114 AJL - added
+    if (settings_get_double_helper(app_prop_settings,
+            "Report", "preferred.min_value.mb", &reportPreferredMinValue.mb, PREFERRED_MIN_VALUE_MB_DEFAULT,
+            ee_verbose
+            ) == DBL_INVALID) {
+        ; // handle error
+    }
+    //
+    if (settings_get_double_helper(app_prop_settings,
+            "Report", "preferred.min_value.mwp", &reportPreferredMinValue.mwp, PREFERRED_MIN_VALUE_MWP_DEFAULT,
+            ee_verbose
+            ) == DBL_INVALID) {
+        ; // handle error
+    }
+    //
+    if (settings_get_double_helper(app_prop_settings,
+            "Report", "preferred.min_value.mwp", &reportPreferredMinValue.mwpd, PREFERRED_MIN_VALUE_MWPD_DEFAULT,
+            ee_verbose
+            ) == DBL_INVALID) {
+        ; // handle error
+    }
+    //
+
+
+    // enable and configure hypocenter_sequence_xml archive parameters
+    hypocenter_sequence_xml_enable = 0;
+    if ((int_param = settings_get_int(app_prop_settings, "Report", "hypocenter_sequence_xml.enable")) != INT_INVALID)
+        hypocenter_sequence_xml_enable = int_param;
+    printf("Info: property set: [Report] hypocenter_sequence_xml.enable %d\n", hypocenter_sequence_xml_enable);
+    //
+    hypocenter_sequence_xml_write_arrivals = 0;
+    if ((int_param = settings_get_int(app_prop_settings, "Report", "hypocenter_sequence_xml.write_arrivals")) != INT_INVALID)
+        hypocenter_sequence_xml_write_arrivals = int_param;
+    printf("Info: property set: [Report] hypocenter_sequence_xml.write_arrivals %d\n", hypocenter_sequence_xml_write_arrivals);
+    //
+    if (settings_get_int_helper(app_prop_settings,
+            "Report", "hypocenter_sequence_xml.file_archive.age_max", &hypocenter_sequence_xml_file_archive_age_max, HYPOCENTER_SEQUENCE_XML_FILE_ARCHIVE_AGE_MAX,
+            ee_verbose) == INT_INVALID) {
+        ; // handle error
+    }
+    printf("Info: property set: [Report] hypocenter_sequence_xml.file_archive.age_max %d\n", hypocenter_sequence_xml_file_archive_age_max);
+    //
+
+    // initialize list of id's for phase types to use in location/association, set reference phase ttime error
+    if (numPhaseTypesUse < 0) { //  not initialized
+        numPhaseTypesUse = 0;
+        //printf("DEBUG: numPhaseTypesUse %d: ", numPhaseTypesUse);
+        //printf("DEBUG: num_phase_names_use %d: ", num_phase_names_use);
+        int j;
+        if (num_phase_names_use > 0) {
+            for (j = 0; j < num_phase_names_use; j++) {
+                int phase_id_use = phase_id_for_name(phase_names_use[j]);
+                //printf("DEBUG: phase.names.use: <%s>->%d:", phase_names_use[j], phase_id_use);
+                if (phase_id_use >= 0 && phase_id_use < get_num_ttime_phases()) {
+                    phaseTypesUse[numPhaseTypesUse] = phase_id_use;
+                    strcpy(channelNamesUse[numPhaseTypesUse], channel_names_use[j]);
+                    // 20150410 AJL - added time delay check
+                    timeDelayUse[numPhaseTypesUse][0] = timeDelayUse[numPhaseTypesUse][1] = -1.0;
+                    char *str_pos = NULL;
+                    if (strlen(time_delay_use[j]) > 2 && (str_pos = strchr(time_delay_use[j], '$')) != NULL) { // have min/max time delay
+                        timeDelayUse[numPhaseTypesUse][0] = strtod(time_delay_use[j], NULL); // min delay
+                        timeDelayUse[numPhaseTypesUse][1] = strtod(str_pos + 1, NULL); // max delay
+                    }
+                    //printf(" %s ch:%s tdelay:<%s>%f->%f\n", phase_names_use[j], channelNamesUse[numPhaseTypesUse], // DEBUG
+                    //        time_delay_use[j],
+                    //        timeDelayUse[numPhaseTypesUse][0], timeDelayUse[numPhaseTypesUse][1]);
+                    numPhaseTypesUse++;
+                    if (use_reference_phase_ttime_error && get_phase_ttime_error(phase_id_use) < reference_phase_ttime_error)
+                        reference_phase_ttime_error = get_phase_ttime_error(phase_id_use);
+                } else {
+                    fprintf(stderr, "ERROR: phase name to use in location not found: %s\n", phase_names_use[j]);
+                }
+            }
+        } else { // set reference phase ttime error for all phases
+            for (j = 0; j < get_num_ttime_phases(); j++) {
+                if (use_reference_phase_ttime_error && get_phase_ttime_error(j) < reference_phase_ttime_error)
+                    reference_phase_ttime_error = get_phase_ttime_error(j);
+            }
+        }
+        //printf("\n"); // DEBUG
+    }
+
+    int nhyp;
+
+    // allocate work hypocenters for associate/locate
+    hyp_assoc_loc = calloc(MAX_NUM_HYPO, sizeof (HypocenterDesc*));
+    for (nhyp = 0; nhyp < MAX_NUM_HYPO; nhyp++) {
+        hyp_assoc_loc[nhyp] = new_HypocenterDesc();
+        // initialize hypocenter arrays for scatter sample
+        hyp_assoc_loc[nhyp]->scatter_sample = (float*) calloc(4 * NUM_LOC_SCATTER_SAMPLE, sizeof (float));
+        //printf("DEBUG: calloc hyp_assoc_loc[nhyp]->scatter_sample: %X\n", hyp_assoc_loc[nhyp]->scatter_sample);
+        hyp_assoc_loc[nhyp]->nscatter_sample = 0;
+    }
+    // allocate scatter sample arrays for associate/locate
+    assoc_scatter_sample = calloc(MAX_NUM_HYPO, sizeof (float*));
+    for (nhyp = 0; nhyp < MAX_NUM_HYPO; nhyp++) {
+        assoc_scatter_sample[nhyp] = NULL;
+        n_alloc_scatter_sample[nhyp] = 0;
+        n_assoc_scatter_sample[nhyp] = 0;
+        global_max_nassociated_P_lat_lon[nhyp] = -1.0;
+    }
+
+
+    // read previously archived events from existing hypolist.csv file
+    char outname[STANDARD_STRLEN];
+    snprintf(outname, STANDARD_STRLEN, "%s/hypolist.csv", outnameroot_archive);
+    FILE* hypoListStream = fopen_counter(outname, "r"); // NOTE: opened for reading
+    if (hypoListStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "Warning: opening output file: %s", outname);
+        perror(tmp_str);
+        printf("Info: file may not yet have been created: %s\n", outname);
+        return (0);
+    }
+
+    // read header line
+    fgets(tmp_str, STANDARD_STRLEN - 1, hypoListStream);
+    //"event_id assoc_ndx ph_assoc ph_used dmin(deg) gap1(deg) gap2(deg) atten sigma_otime(sec) otime(UTC) lat(deg) lon(deg) errH(km) depth(km)"
+    //        " errZ(km) Q T50Ex n Td(sec) n TdT50Ex WL_col mb n Mwp n T0(sec) n Mwpd n region n_sta_tot n_sta_active assoc_latency"
+    HypocenterDesc *phypo = new_HypocenterDesc();
+    int icheck_duplicates = 1;
+    //char time_str[64];
+    long first_assoc_latency = -1;
+    int istat = 0;
+    while (1) {
+        if (fgets(tmp_str, STANDARD_STRLEN - 1, hypoListStream) == NULL)
+            break;
+        istat = readHypoDataString(phypo, tmp_str, &first_assoc_latency);
+        //if (istat < 29) { // format error
+        if (istat < 31) { // format error  TODO: use this line when all files have phypo->nstaHasBeenActive and phypo->nstaIsActive
+            //if (istat < 32) { // format error  TODO: [20160905] use this line when all files have phypo->loc_seq_num
+#ifdef USE_MWP_MO_POS_NEG
+            //if (istat < 34) { // format error  TODO: [20161227] use this line when all files have phypo->mwpdMoPosNegLevelStatistics
+#endif
+            //printf("\nDEBUG: hypo read error: istat=%d\n", istat);
+            // try to read to end of line
+            if (fgets(tmp_str, STANDARD_STRLEN - 1, hypoListStream) == NULL)
+                break;
+            continue;
+        }
+        phypo->hyp_assoc_index = -1; // is not actively associated if read from hypolist
+        //phypo->otime = string2timeDecSec(time_str);
+        if (first_assoc_latency > 0) {
+            phypo->first_assoc_time = first_assoc_latency + (long) (0.5 + phypo->otime);
+        } else {
+            phypo->first_assoc_time = LONG_MIN / 2;
+        }
+        phypo->messageTriggerThreshold = messageTriggerThresholdInitial;
+        phypo->messageTriggerThreshold.mb = phypo->mbLevelStatistics.centralValue + MB_MIN_MAIL_INCREMENT;
+        phypo->messageTriggerThreshold.mwp = phypo->mwpLevelStatistics.centralValue + MWP_MIN_MAIL_INCREMENT;
+        phypo->messageTriggerThreshold.mwpd = phypo->mwpLevelStatistics.centralValue + MWPD_MIN_MAIL_INCREMENT;
+        phypo->messageTriggerThreshold.alarm = phypo->tdT50ExLevelStatistics.centralValue + TDT50EX_MIN_MAIL_INCREMENT;
+        // DEBUG
+        //printHypoDataString(phypo, hypoDataString, 1, 0);
+        //printf("\nDEBUG: hypo read: %s\n", hypoDataString);
+        //
+        HypocenterDesc* phypocenter_desc_inserted = NULL;
+        addHypocenterDescToHypoList(phypo, &hypo_list, &hypo_list_size, &num_hypocenters, icheck_duplicates, NULL, &phypocenter_desc_inserted); // hypocenter unique_id is set here
+    }
+    free(phypo);
+
+    fclose_counter(hypoListStream);
+
+    return (0);
+
+}
+
+/***************************************************************************
+ * td_timedomainProcessingReport_cleanup:
+ *
+ * Do necessary cleanup.
+ ***************************************************************************/
+void td_timedomainProcessingReport_cleanup() {
+
+    // free work hypocenters for associate/locate
+    int nhyp;
+    for (nhyp = 0; nhyp < MAX_NUM_HYPO; nhyp++) {
+        //printf("DEBUG: free hyp_assoc_loc[nhyp]->scatter_sample: %X\n", hyp_assoc_loc[nhyp]->scatter_sample);
+
+        free(hyp_assoc_loc[nhyp]->scatter_sample);
+        free(hyp_assoc_loc[nhyp]);
+    }
+    free(hyp_assoc_loc);
+
+    // free reference full search oct-tree
+    if (pOctTree != NULL) {
+
+        int freeDataPointer = 1;
+        freeTree3D(pOctTree, freeDataPointer);
+        pOctTree = NULL;
+    }
+
+    /*
+    int ilat, n;
+    for (ilat = 0; ilat < nlat_alloc_coarse; ilat++) {
+        for (int n = 0; n < nlon_alloc_coarse; n++) {
+            free((weight_count_grid_coarse)[ilat][n]);
+        }
+        free((weight_count_grid_coarse)[ilat]);
+    }
+    free(weight_count_grid_coarse);
+
+    for (ilat = 0; ilat < nlat_alloc; ilat++) {
+        for (int n = 0; n < nlon_alloc; n++) {
+
+            free((weight_count_grid)[ilat][n]);
+        }
+        free((weight_count_grid)[ilat]);
+    }
+    free(weight_count_grid);
+     */
+
+}
+
+/***************************************************************************
+ * associate_locate_octtree:
+ *
+ * Do association and location using an oct-tree search
+ ***************************************************************************/
+int associate_locate_octtree(int num_pass, char *outnameroot, HypocenterDesc **hyp_assoc_loc, int num_hypocenters_associated, ChannelParameters* channelParameters,
+        int reassociate_only, time_t time_min, time_t time_max, double lat_min, double lat_max, double lat_step, double lon_min, double lon_max, double lon_step_smallest,
+        double depth_min, double depth_max, double depth_step, int is_local_search, int verbose) {
+
+
+    // do association/location search
+
+    HypocenterDesc* hyp_work = hyp_assoc_loc[num_hypocenters_associated];
+    double wt_count_assoc = 0.0;
+    int i_get_assoc_scatter_sample = 1;
+
+    if (reassociate_only) {
+        i_get_assoc_scatter_sample = 0;
+    } else {
+        hyp_work->linRegressPower.power = -9.9;
+        if (!is_local_search) { // 20160919 AJL
+            hyp_work->ot_std_dev = 0.0;
+            hyp_work->otime = 0.0;
+        }
+        hyp_work->lat = 0.0;
+        hyp_work->lon = 0.0;
+        hyp_work->depth = 0.0;
+        hyp_work->nassoc_P = 0;
+        hyp_work->nassoc = 0;
+        hyp_work->dist_min = -1.0;
+    }
+    wt_count_assoc = octtreeGlobalAssociationLocation(num_pass, min_weight_sum_assoc, MAX_NUM_OCTTREE_NODES,
+            nomimal_critical_oct_tree_node_size, min_critical_oct_tree_node_size, nominal_oct_tree_min_node_size,
+            gap_primary_critical, gap_secondary_critical,
+            lat_min, lat_max, lat_step, lon_min, lon_max, lon_step_smallest,
+            depth_min, depth_max, depth_step, is_local_search,
+            numPhaseTypesUse, phaseTypesUse, channelNamesUse, timeDelayUse,
+            reference_phase_ttime_error,
+            data_list, num_de_data,
+            hyp_work,
+            &assoc_scatter_sample[num_hypocenters_associated], &n_alloc_scatter_sample[num_hypocenters_associated], i_get_assoc_scatter_sample,
+            &n_assoc_scatter_sample[num_hypocenters_associated], &global_max_nassociated_P_lat_lon[num_hypocenters_associated],
+            channelParameters, reassociate_only, time_min, time_max);
+    printf(" -> %d n=%d/%d/%.1f/%g ",
+            num_pass, hyp_work->nassoc, hyp_work->nassoc_P, wt_count_assoc, hyp_work->prob);
+    printf("a=%1f ",
+            hyp_work->linRegressPower.power
+            );
+    printf("ot_sd=%.1f ot=%s lat/lon=%.1f/%.1f+/-%.0f depth=%.0f+/-%.0f dist=%.1f->%.1f gap=%.1f/%.1f -> %s",
+            hyp_work->ot_std_dev, timeDecSec2string(hyp_work->otime, tmp_str, DEFAULT_TIME_FORMAT),
+            hyp_work->lat, hyp_work->lon, hyp_work->errh, hyp_work->depth, hyp_work->errz,
+            hyp_work->dist_min, hyp_work->dist_max, hyp_work->gap_primary, hyp_work->gap_secondary,
+            wt_count_assoc < min_weight_sum_assoc ? "NOT ASSOCIATED" : feregion(hyp_work->lat, hyp_work->lon, feregion_str, FEREGION_STR_SIZE)
+            );
+    // 20150904 AJL - added ABCD hypo quality level
+    double critical_errh = 10.0 * nominal_oct_tree_min_node_size; // TODO: add specific program property for critical_errh
+    double critical_errz = 20.0 * nominal_oct_tree_min_node_size; // TODO: add specific program property for critical_errz
+    setHypocenterQuality(hyp_work, min_weight_sum_assoc, critical_errh, critical_errz);
+    printf("\n      (qual=aso%.2f/otv%.2f/erh%.2f/erz%.2f/att%.2f/gap%.2f/dcl%.2f/dfr%.2f -> %.2f %s)",
+            //printf("\n      (qual=aso%.2f/otv%.2f/erh%.2f/erz%.2f/dep%.2f/att%.2f/gap%.2f/dcl%.2f/dfr%.2f -> %.2f %s)",   // 20160509 AJL - added
+            hyp_work->qualityIndicators.wt_count_assoc_weight, hyp_work->qualityIndicators.ot_variance_weight,
+            hyp_work->qualityIndicators.errh_weight, hyp_work->qualityIndicators.errz_weight,
+            //hyp_work->qualityIndicators.depth_weight,   // 20160509 AJL - added
+            hyp_work->qualityIndicators.amp_att_weight, hyp_work->qualityIndicators.gap_weight,
+            hyp_work->qualityIndicators.distanceClose_weight, hyp_work->qualityIndicators.distanceFar_weight,
+            hyp_work->qualityIndicators.quality_weight, hyp_work->qualityIndicators.quality_code);
+    printf("\n");
+    //printf("   --->    nlat=%d nlon=%d  nlat_alloc=%d nlon_alloc=%d\n", nlat, nlon, nlat_alloc, nlon_alloc);
+
+    // 20140721 AJL      if (wt_count_assoc < min_weight_sum_assoc) {
+    // 20220225 AJL      if (!reassociate_only && wt_count_assoc < min_weight_sum_assoc) {
+    if (wt_count_assoc < min_weight_sum_assoc) {
+        for (int n = 0; n < num_de_data; n++) {
+            TimedomainProcessingData* deData = data_list[n];
+            if (deData->is_associated == num_pass)
+                deData->is_associated = 0;
+        }
+        return (0);
+    }
+
+    // accepted
+
+    // plot search association weight count grid
+    //double min_plot = 0.90 * global_max_nassociated_P_lat_lon[num_hypocenters_associated] - 1.0;
+    double min_plot = 0.1 * global_max_nassociated_P_lat_lon[num_hypocenters_associated];
+    if (min_plot < 0.0)
+        min_plot = 0.0;
+    int PLOT_ALL_SAMPLED_GRID_NODES = 0; // DEBUG: shows all visited nodes
+    if (PLOT_ALL_SAMPLED_GRID_NODES)
+        min_plot = -0.5; // -1.0 flags unused weight count grid node
+    char outname[2 * STANDARD_STRLEN];
+    // plotting files
+    snprintf(outname, STANDARD_STRLEN, "%s/plot", outnameroot);
+    mkdir(outname, 0755);
+    snprintf(outname, STANDARD_STRLEN, "%s/plot/hypo.%d.grid.xy", outnameroot, num_pass - 1);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * hypocenterGridStream = fopen_counter(outname, "w");
+    if (hypocenterGridStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (0);
+    }
+    char hypocenterGrid_outname[1024];
+    strcpy(hypocenterGrid_outname, outname);
+    int i, index;
+    double sym_size;
+    for (i = 0; i < n_assoc_scatter_sample[num_hypocenters_associated]; i++) {
+        index = 4 * i;
+        double weight_count = assoc_scatter_sample[num_hypocenters_associated][index + 3];
+        if (weight_count > min_plot) { // -1.0 flags unused weight count grid node
+            if (PLOT_ALL_SAMPLED_GRID_NODES) {
+                sym_size = 0.1;
+            } else {
+                if (weight_count > global_max_nassociated_P_lat_lon[num_hypocenters_associated])
+                    weight_count = global_max_nassociated_P_lat_lon[num_hypocenters_associated];
+                //sym_size = 0.05 + 0.05 * (weight_count - min_plot) / (global_max_nassociated_P_lat_lon[num_hypocenters_associated] - min_plot);
+                //sym_size *= 2.0; // AJL 20100915
+                //sym_size = 0.025; // TEST/DEBUG
+                sym_size = 0.0125; // 20160916 AJL - GMT5
+            }
+            fprintf(hypocenterGridStream, "%f %f %f\n", assoc_scatter_sample[num_hypocenters_associated][index + 1], assoc_scatter_sample[num_hypocenters_associated][index], sym_size);
+        }
+    }
+    fclose_counter(hypocenterGridStream);
+
+
+#ifdef USE_JSON_OUTPUT
+    // GeoJSON 20211130
+    if (save_plotfiles_geojson) {
+        snprintf(outname, STANDARD_STRLEN, "%s.json", hypocenterGrid_outname);
+        int ncolumns = 2;
+        // char *columns[] = {GEOJSON_LAT, GEOJSON_LON, "sym_size"};    // ignore sym_size
+        char *columns[] = {GEOJSON_LAT, GEOJSON_LON};
+        int nproperties = 3;
+        char *properties[] = {"name", "event_index", "event_id"};
+        snprintf(tmp_str, STANDARD_STRLEN, "%d", num_hypocenters_associated);
+        sprintf(tmp_str_2, "%ld", hyp_assoc_loc[num_hypocenters_associated]->unique_id);
+        char *values[] = {"hypocenterGrid", tmp_str, tmp_str_2};
+        writeGeoJSONcopyOftable(hypocenterGrid_outname, ncolumns, columns, nproperties, properties, values, " ", GEOJSON_MultiPoint, outname);
+    }
+#endif
+
+    // accepted
+
+    return (1);
+
+}
+
+/***************************************************************************
+ * setReducedAssocLocSearchVolume:
+ *
+ * Set reduced search volume around specified hypocenter
+ ***************************************************************************/
+void setReducedAssocLocSearchVolume(HypocenterDesc *phypo, double *potime_hypo, double *pot_std_dev_hypo, double *plat_min_hypo, double *plat_max_hypo, double *plat_step_hypo,
+        double *plon_min_hypo, double *plon_max_hypo, double *plon_step_smallest_hypo,
+        double *pdepth_min_hypo, double *pdepth_max_hypo, double *pdepth_step_hypo) {
+
+    // initialize reference full search oct-tree if necessary
+    if (pOctTree == NULL) {
+        pOctTree = setUpOctTree(lat_min_full, lat_max_full, lat_step_full,
+                lon_min_full, lon_max_full, lon_step_smallest_full,
+                depth_min_full, depth_max_full, depth_step_full);
+    }
+
+    // get limits of full search oct-tree
+    Vect3D coords;
+    coords.x = phypo->lon;
+    coords.y = phypo->lat;
+    coords.z = phypo->depth;
+    printf("DEBUG: setReducedAssocLocSearchVolume: full: %f->%f %f->%f %f->%f\n", lat_min_full, lat_max_full, lon_min_full, lon_max_full, depth_min_full, depth_max_full);
+    printf("DEBUG: setReducedAssocLocSearchVolume: coords: %f %f %f\n", coords.y, coords.x, coords.z);
+    // check ranges
+    if (coords.y < lat_min_full) {
+        coords.y = lat_min_full;
+    }
+    if (coords.y >= lat_max_full) {
+        coords.y = lat_max_full;
+    }
+    int lon_wrapped = fabs(lon_max_full - lon_min_full - 360.0) < 0.001 ? 1 : 0;
+    if (coords.x < lon_min_full) {
+        if (!lon_wrapped) {
+            coords.x = lon_min_full;
+        } else {
+            coords.x += 360.0;
+        }
+    }
+    if (coords.x >= lon_max_full) {
+        if (!lon_wrapped) {
+            coords.x = lon_max_full;
+        } else {
+            coords.x -= 360.0;
+        }
+    }
+    if (coords.z < depth_min_full) {
+        coords.z = depth_min_full;
+    }
+    if (coords.z >= depth_max_full) {
+        coords.z = depth_max_full;
+    }
+    //
+    double adjusted_coords_x; // 20210519 AJL - (dummy) support for bug fix in octtree/octtree.c
+    OctNode* poct_node = getTreeNodeContaining(pOctTree, coords, &adjusted_coords_x);
+    printf(" -> %f %f %f, poct_node %ld\n", coords.y, coords.x, coords.z, (long) poct_node);
+    printf(" -> poct_node->center.x %f y %f z %f  ds.x %f y %f z %f\n",
+            poct_node->center.x, poct_node->center.y, poct_node->center.z, poct_node->ds.x, poct_node->ds.y, poct_node->ds.z);
+
+#define N_FULL_CELLS_HALF_WIDTH 1.5
+    *plat_min_hypo = poct_node->center.y - poct_node->ds.y * N_FULL_CELLS_HALF_WIDTH;
+    if (*plat_min_hypo < lat_min_full) {
+        *plat_min_hypo = lat_min_full;
+    }
+    *plat_max_hypo = poct_node->center.y + poct_node->ds.y * N_FULL_CELLS_HALF_WIDTH;
+    if (*plat_max_hypo > lat_max_full) {
+        *plat_max_hypo = lat_max_full;
+    }
+    *plat_step_hypo = poct_node->ds.y;
+
+    *plon_min_hypo = poct_node->center.x - poct_node->ds.x * N_FULL_CELLS_HALF_WIDTH;
+    if (!lon_wrapped && *plon_min_hypo < lon_min_full) {
+        *plon_min_hypo = lon_min_full;
+    }
+    *plon_max_hypo = poct_node->center.x + poct_node->ds.x * N_FULL_CELLS_HALF_WIDTH;
+    if (!lon_wrapped && *plon_max_hypo > lon_max_full) {
+        *plon_max_hypo = lon_max_full;
+    }
+    *plon_step_smallest_hypo = lon_step_smallest_full;
+
+#define N_FULL_CELLS_HALF_DEPTH 0.5
+    *pdepth_min_hypo = poct_node->center.z - poct_node->ds.z * N_FULL_CELLS_HALF_DEPTH;
+    if (*pdepth_min_hypo < depth_min_full) {
+        *pdepth_min_hypo = depth_min_full;
+        *pdepth_max_hypo = *pdepth_min_hypo + 2.0 * depth_step_full * N_FULL_CELLS_HALF_DEPTH;
+    } else {
+        *pdepth_max_hypo = phypo->depth + depth_step_full * N_FULL_CELLS_HALF_DEPTH;
+    }
+    *pdepth_max_hypo = poct_node->center.z + poct_node->ds.z * N_FULL_CELLS_HALF_DEPTH;
+    if (*pdepth_max_hypo > depth_max_full) {
+
+        *pdepth_max_hypo = depth_max_full;
+    }
+    *pdepth_step_hypo = depth_step_full;
+
+
+    /*
+     *plat_min_hypo = phypo->lat - lat_step_full * N_FULL_CELLS_HALF_WIDTH;
+        if (*plat_min_hypo < lat_min_full) {
+     *plat_min_hypo = lat_min_full;
+        }
+     *plat_max_hypo = phypo->lat + lat_step_full * N_FULL_CELLS_HALF_WIDTH;
+        if (*plat_max_hypo > lat_max_full) {
+     *plat_max_hypo = lat_max_full;
+        }
+     *plat_step_hypo = *plat_max_hypo - *plat_min_hypo;
+     *plat_step_hypo /= (2.0 * N_FULL_CELLS_HALF_WIDTH);
+
+        int lon_wrapped = fabs(lon_max_full - lon_min_full - 360.0) < 0.001 ? 1 : 0;
+     *plon_min_hypo = phypo->lon - lon_step_smallest_full * N_FULL_CELLS_HALF_WIDTH;
+        if (!lon_wrapped && *plon_min_hypo < lon_min_full) {
+     *plon_min_hypo = lon_min_full;
+        }
+     *plon_max_hypo = phypo->lon + lon_step_smallest_full * N_FULL_CELLS_HALF_WIDTH;
+        if (!lon_wrapped && *plon_max_hypo > lon_max_full) {
+     *plon_max_hypo = lon_max_full;
+        }
+     *plon_step_smallest_hypo = *plon_max_hypo - *plon_min_hypo;
+     *plon_step_smallest_hypo /= (2.0 * N_FULL_CELLS_HALF_WIDTH);
+
+    #define N_FULL_CELLS_HALF_DEPTH 0.5
+
+     *pdepth_min_hypo = phypo->depth - depth_step_full * N_FULL_CELLS_HALF_DEPTH;
+        if (*pdepth_min_hypo < depth_min_full) {
+     *pdepth_min_hypo = depth_min_full;
+     *pdepth_max_hypo = *pdepth_min_hypo + 2.0 * depth_step_full * N_FULL_CELLS_HALF_DEPTH;
+        } else {
+     *pdepth_max_hypo = phypo->depth + depth_step_full * N_FULL_CELLS_HALF_DEPTH;
+        }
+        if (*pdepth_max_hypo > depth_max_full) {
+     *pdepth_max_hypo = depth_max_full;
+        }
+     *pdepth_step_hypo = *pdepth_max_hypo - *pdepth_min_hypo;
+     *pdepth_step_hypo /= (2.0 * N_FULL_CELLS_HALF_DEPTH);
+     */
+
+
+    // set otime and otime range (in *pot_std_dev_hypo)
+    *potime_hypo = phypo->otime;
+    //*pot_std_dev_hypo = setRefOtimeDeviation(phypo, phypo); // same range as used for location.c->isSameEvent())
+    *pot_std_dev_hypo = (poct_node->ds.y * N_FULL_CELLS_HALF_WIDTH * DEG2KM) / get_velocity_model_property('P', -1.0, phypo->depth);
+    *pot_std_dev_hypo /= 4.0;
+
+
+    /*printf("DEBUG: setReducedAssocLocSearchVolume: otime: %f+/-%f [+/-%f], lat: %f %f %f [%f/%f], lon: %f %f %f [%f/%f], depth: %f %f %f [%f/%f]\n",
+     *potime_hypo, *pot_std_dev_hypo, phypo->ot_std_dev, *plat_min_hypo, phypo->lat, *plat_max_hypo, *plat_step_hypo, lat_step_full,
+     *plon_min_hypo, phypo->lon, *plon_max_hypo, *plon_step_smallest_hypo, lon_step_smallest_full,
+     *pdepth_min_hypo, phypo->depth, *pdepth_max_hypo, *pdepth_step_hypo, depth_step_full
+            );//*/
+
+}
+
+
+/***************************************************************************
+ * td_writeTimedomainProcessingReport:
+ *
+ * writes timedomain-processing report to gridDataStrem and csvStream
+ ***************************************************************************/
+
+static double time_of_last_report = -1.0;
+
+int td_writeTimedomainProcessingReport(char* outnameroot_archive, char* outnameroot,
+        time_t time_min, time_t time_max,
+        int only_check_for_new_event, // if = 1, use event persistence for all existing events; check for new event association,
+        //    if new event do full report, otherwise do nothing (use for real-time, not for running archive data)
+        int cut_at_time_max, // if = 1, remove late timedomain-processing data from list (use for running archive data, not for real-time)
+        int verbose, int report_interval, int sendMail, char *sendMailParams, char *agencyId, char *author
+        ) {
+
+    if (!use_event_persistence) {
+        if (only_check_for_new_event) {
+            printf("ERROR: Event persistence (USE_EVENT_PERSISTENCE) required to use only_check_for_new_event.\n");
+            return (-1); // event persistence required to use only_check_for_new_event
+        }
+    }
+
+
+    int nhyp;
+
+
+    // set global time_max
+    report_time_max = time_max;
+
+    // set approximate time of earliest real data
+    if (time_max < earliest_time)
+        earliest_time = time_max;
+
+    // remove late timedomain-processing data from list (use for running archive data, not for real-time)
+    if (cut_at_time_max) {
+        for (int n = num_de_data - 1; n >= 0; n--) {
+            TimedomainProcessingData* deData = data_list[n];
+            if (deData->t_time_t > time_max) {
+                removeTimedomainProcessingDataFromDataList(deData, &data_list, &num_de_data);
+                free_TimedomainProcessingData(deData);
+                //data_list[n] = NULL; // 20160802 AJL - memory bug fix?
+            }
+        }
+    }
+    //
+
+
+    // if not using aref level check to filter picks close in time, then check for use_for_location picks too soon after another use_for_location pick for same source_id
+    // 20130218 AJL - added
+    if (no_aref_level_check) {
+        int ndata0;
+        for (ndata0 = 0; ndata0 < num_de_data; ndata0++) {
+            TimedomainProcessingData* deData = data_list[ndata0];
+            deData->can_use_as_location_P = 1; // provisionally set as can be used as associated location P
+            int source_id = deData->source_id;
+            double time_dec_sec = (double) deData->t_time_t + deData->t_decsec;
+            // check other timedomain-processing data for this source_id
+            int ndata;
+            for (ndata = 0; ndata < ndata0; ndata++) { // data_list sorted in time, so can stop at ndata0
+                TimedomainProcessingData* deData_test = data_list[ndata];
+                if (deData_test->source_id != source_id || !deData_test->use_for_location)
+                    continue;
+                // check if other pick is within minimum window before this pick
+                double time_dec_sec_test = (double) deData_test->t_time_t + deData_test->t_decsec;
+                double diff = time_dec_sec - time_dec_sec_test;
+                if (diff < min_time_delay_between_picks_for_location) {
+                    deData->use_for_location = 0;
+                    deData->can_use_as_location_P = 0;
+                    break;
+                }
+            }
+        }
+    }
+
+
+    // update polarization analysis for timedomain-processing data from list
+    if (polarization_enable) {
+        for (int n = 0; n < num_de_data; n++) {
+            TimedomainProcessingData* deData = data_list[n];
+            //printf("DEBUG: doPolarizationAnalysis: test: %d %s_%s_%s_%s dt=%f stream=%d use=%d\n", n + 1, deData->network, deData->station, deData->location, deData->channel, deData->deltaTime, deData->pick_stream, deData->use_for_location);
+            if (!deData->use_for_location && (deData->use_for_location_twin_data == NULL || !deData->use_for_location_twin_data->use_for_location))
+                continue;
+            td_doPolarizationAnalysis(deData, n);
+        }
+    }
+    //
+
+
+
+
+    // determine time span if not specified
+    if (time_min < 0) {
+        for (int n = 0; n < num_de_data; n++) {
+            TimedomainProcessingData* deData = data_list[n];
+            double dsec;
+            time_t pick_time = get_time_t(deData, &dsec);
+            if (time_min < 0 || pick_time < time_min)
+                time_min = pick_time;
+            if (time_max < 0 || pick_time > time_max)
+                time_max = pick_time;
+        }
+    }
+    if (verbose > 2) {
+        printf("time_min: %s", asctime(gmtime(&time_min))); // use gmtime since times are already UTC
+        printf("time_max: %s", asctime(gmtime(&time_max))); // use gmtime since times are already UTC
+        printf("time_max-time_min: %d\n", (int) (time_max - time_min));
+    }
+
+    // set plot limits
+    time_t plot_time_min = time_min - 61;
+    //time_t plot_time_max = time_max + 121;
+    time_t plot_time_max = time_max; // for real-time plots, do not go into future!
+    if (verbose > 2) {
+        printf("plot_time_min: %s", asctime(gmtime(&plot_time_min))); // use gmtime since times are already UTC
+        printf("plot_time_max: %s", asctime(gmtime(&plot_time_max))); // use gmtime since times are already UTC
+        printf("plot_time_max-plot_time_min: %d\n", (int) (plot_time_max - plot_time_min));
+    }
+
+
+    int hyp_full_assoc_loc_start_index = 0;
+    if (use_event_persistence) {
+        if (associate_data) { // associating
+            // ============================================================================================================
+            // check for event persistence - keep previous location results for events with insufficient possible new defining picks
+            //
+            int nhyp_assoc;
+            // remove any not actively associated hypocenters from hyp_assoc_loc list
+            // 20151208 AJL - need to update here since events that were archived in last report (associated events with otime before analysis window)
+            //      are still in hyp_assoc_loc list but associated data was removed, cannot re-associated such events
+            for (nhyp_assoc = num_hypocenters_associated - 1; nhyp_assoc >= 0; nhyp_assoc--) {
+                if (hyp_assoc_loc[nhyp_assoc]->hyp_assoc_index < 0) { // not associated
+                    // remove hypo and pack list
+                    HypocenterDesc *temp = hyp_assoc_loc[nhyp_assoc]; // 20180113 AJL - bug fix
+                    for (nhyp = nhyp_assoc; nhyp < num_hypocenters_associated - 1; nhyp++) {
+                        hyp_assoc_loc[nhyp] = hyp_assoc_loc[nhyp + 1];
+                        // re-index data from to old new hypo index
+                        // 20180110 AJL - bug fix
+                        for (int n = 0; n < num_de_data; n++) {
+                            TimedomainProcessingData* deData = data_list[n];
+                            if (deData->is_associated == nhyp + 2) {
+                                deData->is_associated = nhyp + 1; // attach to re-indexed hypo
+                            }
+                        }
+                    }
+                    hyp_assoc_loc[num_hypocenters_associated - 1] = temp; // 20180113 AJL - bug fix
+                    num_hypocenters_associated--;
+                }
+            }
+            // clear array of persistent hypocenter indices
+            for (nhyp_assoc = 0; nhyp_assoc < num_hypocenters_associated; nhyp_assoc++) {
+                hyp_persistent[nhyp_assoc] = 0;
+            }
+            // set persistent events based on type of association location
+            if (only_check_for_new_event) {
+                // all existing hypocenters in analysis window flagged as persistent
+                for (nhyp_assoc = 0; nhyp_assoc < num_hypocenters_associated; nhyp_assoc++) {
+                    double otime = hyp_assoc_loc[nhyp_assoc]->otime;
+                    if ((time_t) otime <= time_min + report_interval) { // 20160913 AJL
+                        // otime is before analysis window, do not preserve event to force full reassociation before event is removed
+                        continue;
+                    }
+                    hyp_persistent[nhyp_assoc] = 1;
+                    hyp_assoc_loc[nhyp_assoc]->n_possible_assoc_P = -1;
+                    //printf("DEBUG: Mode USE_EVENT_PERSISTENCE+only_check_for_new_event -> ev:%d %s\n", nhyp_assoc, time2string(hyp_assoc_loc[nhyp_assoc]->otime, tmp_str));
+                }
+            } else {
+                // check each associated hypocenter for persistence
+                for (nhyp_assoc = 0; nhyp_assoc < num_hypocenters_associated; nhyp_assoc++) {
+
+                    double otime = hyp_assoc_loc[nhyp_assoc]->otime;
+
+                    // 20160910 AJL  if ((time_t) otime <= time_min) {
+                    if ((time_t) otime <= time_min + report_interval) { // 20160910 AJL
+                        // otime is before analysis window, do not preserve event to force full reassociation before event is removed
+                        continue;
+                    }
+
+                    // 20180319 AJL - added
+                    // reduce frac_poss_assoc linearly with time for times longer than specified cutoff
+                    double time_since_otime = difftime(time_max, otime);
+                    double time_cutoff = event_persistence_time_after_otime_cutoff;
+                    // 20180323 AJL   time_cutoff += data_latency_mean; // crude attempt to allow for data latency // 20180323 AJL - does not work, data_latency_mean can be very large. Perhaps replace with trimmed mean???
+                    double time_after_origin_factor =
+                            time_since_otime < time_cutoff ? 1.0
+                            : 1.0 - 0.8 * (time_since_otime - time_cutoff) / time_cutoff;
+                    if (time_after_origin_factor < 0.2) {
+                        time_after_origin_factor = 0.2;
+                    }
+                    //printf("DEBUG: Mode USE_EVENT_PERSISTENCE -> nhyp_assoc: %d seq_num: %d time_max: %ld otime %f time_since_otime %f time_after_origin_factor %f,  hyp_assoc_loc[nhyp_assoc]->nassoc_P %d * time_after_origin_factor = %f\n", nhyp_assoc, hyp_assoc_loc[nhyp_assoc]->loc_seq_num, time_max, otime, time_since_otime, time_after_origin_factor, hyp_assoc_loc[nhyp_assoc]->nassoc_P, hyp_assoc_loc[nhyp_assoc]->nassoc_P * time_after_origin_factor);
+
+                    if (hyp_assoc_loc[nhyp_assoc]->loc_seq_num < EVENT_PERSISTENCE_MIN_SEQ_NUM_DEFAULT) { // 20180326 AJL - added to prevent freezing of late, low seq_num events
+                        // too few definitive locations, do not preserve event
+                        continue;
+                    }
+
+                    if (hyp_assoc_loc[nhyp_assoc]->nassoc_P < event_persistence_min_num_defining_phases * time_after_origin_factor) {
+                        // too few defining phases, do not preserve event
+                        continue;
+                    }
+
+                    double lat = hyp_assoc_loc[nhyp_assoc]->lat;
+                    double lon = hyp_assoc_loc[nhyp_assoc]->lon;
+                    double depth = hyp_assoc_loc[nhyp_assoc]->depth;
+                    //printf("DEBUG: check for persistence: ev:%d %s\n", nhyp_assoc, time2string(otime, tmp_str));
+                    // find new picks that could be defining picks for this event
+                    int n_poss_assoc = 0;
+                    // 20180323 AJL  double wt_assoc_full = 0.0;
+                    int n_assoc_full = 0; // 20180323 AJL - changed wt_assoc_full to n_assoc_full
+                    for (int n = 0; n < num_de_data; n++) {
+                        TimedomainProcessingData* deData = data_list[n];
+                        // check if pick is skipped for location (location.c->skipData())
+                        if (skipData(deData, -1)) {
+                            continue;
+                        }
+                        // check if pick is already associated with full association location
+                        if ((deData->is_associated == nhyp_assoc + 1 && deData->is_full_assoc_loc == 1)) {
+                            // 20180323 AJL  wt_assoc_full += deData->loc_weight;
+                            n_assoc_full++;
+                            continue;
+                        }
+                        // check each phase type
+                        int phase_id;
+                        for (phase_id = 0; phase_id < get_num_ttime_phases(); phase_id++) {
+                            // skip if phase not counted in location
+                            if (!count_in_location(phase_id, 999.9, deData->use_for_location))
+                                continue;
+                            // check if phase is in phase type to use list, if list exists
+                            if (numPhaseTypesUse > 0) {
+                                if (!isPhaseTypeToUse(deData, phase_id, numPhaseTypesUse, phaseTypesUse, channelNamesUse, timeDelayUse,
+                                        data_list, n)) {
+                                    continue;
+                                }
+                            }
+                            // get travel-time from hypocenter to station for this phase
+                            double gcd = GCDistance(lat, lon, deData->lat, deData->lon);
+                            double time_test = get_ttime(phase_id, gcd, depth);
+                            if (time_test < 0.0) // station to hypocenter distance outside phase distance range
+                                continue;
+                            // check if phase arrival time minus travel-time is near event origin time
+                            double residual = (double) deData->t_time_t + deData->t_decsec - time_test - otime;
+                            /* DEBUG
+                            printf("DEBUG: unnassoc pick residual: ev:%d %s -> %s_%s_%s_%s %s %s %fs",
+                                    nhyp_assoc, time2string(otime, tmp_str),
+                                    deData->network, deData->station, deData->location, deData->channel,
+                                    timeDecSec2string((double) deData->t_time_t + deData->t_decsec, tmp_str_2, DEFAULT_TIME_FORMAT),
+                                    phase_name_for_id(phase_id), residual);
+                            // DEBUG */
+                            double tt_err = get_phase_ttime_error(phase_id);
+                            double tolerance = event_persistence_tt_err_fact * tt_err;
+                            if (fabs(residual) <= tolerance) {
+                                //printf(" <= %fs -> may assoc!\n", tolerance); // DEBUG
+                                n_poss_assoc++;
+                                break; // found one possible association, stop checking phases to prevent double counting of data
+                            } else {
+                                //printf(" > %fs\n", tolerance); // DEBUG
+                            }
+                        }
+                    }
+                    // get ratio of [n_poss_assoc = number possible defining phases not already used for full assoc/loc] to [wt_assoc_full = total weight of fully associated defining phases]
+                    //    NOTE: this ratio is conservative (will overestimate true ratio of weights, since number and not eventual weights used for possible associated phases)
+                    // 20180323 AJL  double frac_poss_assoc = (double) n_poss_assoc / wt_assoc_full;
+                    // get ratio of [n_poss_assoc = number possible defining phases not already used for full assoc/loc] to [n_assoc_full = total number of fully associated defining phases]
+                    double frac_poss_assoc = (double) n_poss_assoc / (double) n_assoc_full;
+                    // 20180319 AJL - added
+                    // reduce frac_poss_assoc linearly with time for times longer than specified cutoff
+                    frac_poss_assoc *= time_after_origin_factor;
+                    //printf("DEBUG: Mode USE_EVENT_PERSISTENCE -> ev:%d %s  n_poss_assoc: %d  n_assoc_full: %d frac_poss_assoc %f time_after_origin_factor %f\n", nhyp_assoc, time2string(otime, tmp_str), n_poss_assoc, n_assoc_full, frac_poss_assoc, time_after_origin_factor);
+                    // if ratio is less than cutoff, declare hypocenter as persistent, will be re-associated without full association/location
+                    if (frac_poss_assoc < event_persistence_frac_poss_assoc_cutoff) {
+                        hyp_persistent[nhyp_assoc] = 1;
+                    }
+                    hyp_assoc_loc[nhyp_assoc]->n_possible_assoc_P = n_poss_assoc;
+                }
+            }
+            // set persistent events
+            int last_saved_persistent = -1;
+            for (nhyp_assoc = 0; nhyp_assoc < num_hypocenters_associated; nhyp_assoc++) {
+                if (hyp_persistent[nhyp_assoc]) {
+                    last_saved_persistent++;
+                    if (last_saved_persistent != nhyp_assoc) {
+                        // re-index hypocenters
+                        HypocenterDesc *temp = hyp_assoc_loc[last_saved_persistent];
+                        hyp_assoc_loc[last_saved_persistent] = hyp_assoc_loc[nhyp_assoc]; // 20140717 AJL - shift pointers only
+                        hyp_assoc_loc[nhyp_assoc] = temp;
+                        // re-index data from to new persistent hypo index
+                        for (int n = 0; n < num_de_data; n++) {
+                            TimedomainProcessingData* deData = data_list[n];
+                            if (deData->is_associated == nhyp_assoc + 1) {
+                                deData->is_associated = last_saved_persistent + 1; // attach to preserved hypo
+                            } else if (deData->is_associated == last_saved_persistent + 1) {
+                                deData->is_associated = nhyp_assoc + 1;
+                            }
+                        }
+                    }
+                }
+            }
+            hyp_full_assoc_loc_start_index = last_saved_persistent + 1;
+            //printf("DEBUG: hyp_full_assoc_loc_start_index:%d\n", hyp_full_assoc_loc_start_index);
+        }
+        printf("INFO: Mode USE_EVENT_PERSISTENCE active!  hyp_full_assoc_loc_start_index=%d\n", hyp_full_assoc_loc_start_index);
+    }
+
+
+    // ============================================================================================================
+    // find sets of data with largest number of associations
+    //
+    int use_associated_data = 0;
+    int num_hypocenters_associated_previously = num_hypocenters_associated;
+#if 0
+    // Test only with miniseed_process!
+    printf("======\n======\n======\n======\n");
+    printf("WARNING: ======> Test \"relocate existing\", use only with miniseed_process\n");
+    printf("======\n======\n======\n======\n");
+    num_hypocenters_associated_previously = 0;
+    HypocenterDesc* phypo_test;
+#if 0
+    //  -> 1 n=83/72/39.4/0.479319 a=-1.912196 ot_sd=1.4 ot=2007.08.02-03:21:44.33 lat/lon=51.1/-180.0+/-12 depth=20+/-16 dist=4.0->89.1 gap=88.3/129.8 -> Andreanof Islands, Aleutian Is.
+    // 2007-08-02-mw67-andreanof-islands-aleutian-is_ZNE.1186024907
+    phypo_test = hyp_assoc_loc[num_hypocenters_associated_previously];
+    phypo_test->lat = 52;
+    phypo_test->lon = 180.0;
+    phypo_test->depth = 100;
+    phypo_test->unique_id = 1186024904370;
+    phypo_test->first_assoc_time = phypo_test->unique_id / 1000;
+    num_hypocenters_associated_previously++;
+#endif
+#if 1
+    //  -> 1 n=74/61/51.2/0.615973 a=-1.251785 ot_sd=2.0 ot=2016.09.01-16:37:59.98 lat/lon=-37.3/178.9+/-13 depth=10+/-20 dist=1.7->49.8 gap=94.6/120.7 -> Off E. Coast of N. Island, N.Z.
+    // 2016-09-01-mww71-off-e-coast-of-n-island-nz_ZNE.1472747877
+    phypo_test = hyp_assoc_loc[num_hypocenters_associated_previously];
+    phypo_test->lat = -37.25;
+    phypo_test->lon = 179.14;
+    phypo_test->depth = 17.0;
+    /*phypo_test->lat = -35.3;
+    phypo_test->lon = 176.9;
+    phypo_test->depth = 200.0;*/
+    phypo_test->unique_id = 1472747879746;
+    phypo_test->first_assoc_time = phypo_test->unique_id / 1000;
+    phypo_test->otime = phypo_test->unique_id / 1000.0;
+    phypo_test->errh = 19;
+    phypo_test->ot_std_dev = 1.9;
+    num_hypocenters_associated_previously++;
+#endif
+#if 1
+    //  -> 1 n=101/68/34.1/0.276551 a=-1.672663 ot_sd=2.0 ot=2011.03.11-05:46:21.79 lat/lon=38.1/142.7+/-15 depth=10+/-14 dist=2.8->154.4 gap=54.4/70.2 -> Near East Coast of Honshu, Japan
+    // Honshu_ZNE_2011.1299822381
+    phypo_test = hyp_assoc_loc[num_hypocenters_associated_previously];
+    phypo_test->lat = 38.07;
+    phypo_test->lon = 142.91;
+    phypo_test->depth = 10.0;
+    /*phypo_test->lat = 37.1;
+    phypo_test->lon = 143.7;
+    phypo_test->depth = 30.0;*/
+    phypo_test->unique_id = 1299822379229;
+    phypo_test->first_assoc_time = phypo_test->unique_id / 1000;
+    num_hypocenters_associated_previously++;
+
+#endif
+#endif
+    num_hypocenters_associated = 0;
+    /* 20160912 AJL  for (nhyp = hyp_full_assoc_loc_start_index; nhyp < MAX_NUM_HYPO; nhyp++) {
+        init_HypocenterDesc(hyp_assoc_loc[nhyp]);
+    }*/
+    if (associate_data) { // associate / locate
+        if (verbose > 0) {
+            printf("INFO: ======> Associate: %s, num_de_data=%d\n", outnameroot, num_de_data);
+        }
+        long associate_start_time_total = clock();
+        int associated;
+        double lat_min_hypo, lat_max_hypo, lat_step_hypo,
+                lon_min_hypo, lon_max_hypo, lon_step_smallest_hypo,
+                depth_min_hypo, depth_max_hypo, depth_step_hypo,
+                otime_hypo, ot_std_dev_hypo;
+        // === there are three cases for association: reassociate only (hypo preserved and fixed), relocate existing (search locally around hypo), full association location
+        // 20160912 AJL - added case of relocate existing (search locally around hypo) to avoid loosing previously associated events due to failed association in early pass
+        int num_pass = 0;
+        // === reassociate only (hypo preserved and fixed)
+        int reassociate_only = 1;
+        int is_local_search = 0;
+        while (num_pass < hyp_full_assoc_loc_start_index) {
+            num_pass++;
+            long associate_start_tim_event = clock();
+            associated = associate_locate_octtree(num_pass, outnameroot, hyp_assoc_loc, num_hypocenters_associated, channelParameters,
+                    reassociate_only, time_min, time_max, lat_min_full, lat_max_full, lat_step_full, lon_min_full, lon_max_full, lon_step_smallest_full,
+                    depth_min_full, depth_max_full, depth_step_full, is_local_search, verbose);
+            if (verbose > 0) {
+                printf("INFO: event reassociate only: time = %.2f\n", (double) (clock() - associate_start_tim_event) / CLOCKS_PER_SEC);
+                //printf("DEBUG: event reassociate only: num_pass %d  hypo addr: %ld\n", num_pass, (long int) hyp_assoc_loc[num_pass - 1]);
+            }
+            if (associated) {
+                num_hypocenters_associated++;
+                hyp_assoc_loc[num_pass - 1]->loc_type = LOC_TYPE_REASSOC_ONLY;
+            } else { // with reassociate_only, should always be associated, otherwise some error
+                printf("ERROR: event reassociate only: event not associated: this should not happen!\n");
+                num_pass--;
+                hyp_full_assoc_loc_start_index = num_pass;
+                break;
+            }
+        }
+        reassociate_only = 0;
+        // === relocate existing (search locally around hypo) // 20160912 AJL - added
+        is_local_search = 1;
+        int nhypo_test = num_pass;
+        static HypocenterDesc hypo_tmp;
+        while (nhypo_test < num_hypocenters_associated_previously) {
+            // if existing event time since otime less than cutoff and not enough defining phases, force full association location
+            if (hyp_assoc_loc[nhypo_test]->loc_seq_num >= 0) {
+                double time_since_otime = difftime(time_max, hyp_assoc_loc[nhypo_test]->otime);
+                //printf("DEBUG: relocate existing %d: time_since_otime %.1f, <? existing_assoc_delay_otime_min %.1f && nassoc_P %d < existing_assoc_min_num_defining_phases %d\n",
+                //        nhypo_test, time_since_otime, existing_assoc_delay_otime_min, hyp_assoc_loc[nhypo_test]->nassoc_P, existing_assoc_min_num_defining_phases);
+                if (time_since_otime < existing_assoc_delay_otime_min
+                        && hyp_assoc_loc[nhypo_test]->nassoc_P < existing_assoc_min_num_defining_phases) {
+                    // too few defining phases, do not relocate existing event
+                    nhypo_test++;
+                    continue;
+                }
+            }
+            num_pass++;
+            long associate_start_tim_event = clock();
+            hypo_tmp = *(hyp_assoc_loc[nhypo_test]); // used after assoc/loc to check if same event
+            // set reduced associate/locate search volume centered on existing hypo
+            setReducedAssocLocSearchVolume(hyp_assoc_loc[nhypo_test], &otime_hypo, &ot_std_dev_hypo, &lat_min_hypo, &lat_max_hypo, &lat_step_hypo,
+                    &lon_min_hypo, &lon_max_hypo, &lon_step_smallest_hypo, &depth_min_hypo, &depth_max_hypo, &depth_step_hypo);
+            long unique_id = hyp_assoc_loc[nhypo_test]->unique_id;
+            // preserve persistent fields
+            long first_assoc_time = hyp_assoc_loc[nhypo_test]->first_assoc_time;
+            int loc_seq_num = hyp_assoc_loc[nhypo_test]->loc_seq_num;
+            int loc_report_count = hyp_assoc_loc[nhypo_test]->loc_report_count;
+            int has_valid_magnitude = hyp_assoc_loc[nhypo_test]->has_valid_magnitude;
+            int alert_sent_count = hyp_assoc_loc[nhypo_test]->alert_sent_count;
+            int alert_sent_time = hyp_assoc_loc[nhypo_test]->alert_sent_time;
+            init_HypocenterDesc(hyp_assoc_loc[num_pass - 1]);
+            hyp_assoc_loc[num_pass - 1]->otime = otime_hypo;
+            hyp_assoc_loc[num_pass - 1]->ot_std_dev = ot_std_dev_hypo;
+            associated = associate_locate_octtree(num_pass, outnameroot, hyp_assoc_loc, num_hypocenters_associated, channelParameters,
+                    reassociate_only, time_min, time_max, lat_min_hypo, lat_max_hypo, lat_step_hypo, lon_min_hypo, lon_max_hypo, lon_step_smallest_hypo,
+                    depth_min_hypo, depth_max_hypo, depth_step_hypo, is_local_search, verbose);
+            if (verbose > 0) {
+                printf("INFO: existing event associate: time = %.2f\n", (double) (clock() - associate_start_tim_event) / CLOCKS_PER_SEC);
+                printf("DEBUG: existing event associate: num_pass %d  hypo addr: %ld\n", num_pass, (long int) hyp_assoc_loc[num_pass - 1]);
+            }
+            int is_same_event = 0;
+            if (associated) {
+                // check that same event has been relocated (may be new event near existing event)
+                hyp_assoc_loc[num_pass - 1]->unique_id = -1;
+                is_same_event = isSameEvent(&hypo_tmp, hyp_assoc_loc[num_pass - 1]);
+            }
+            if (is_same_event) {
+                num_hypocenters_associated++;
+                hyp_assoc_loc[num_pass - 1]->loc_type = LOC_TYPE_RELOC_EXISTING;
+                // preserve event unique id
+                hyp_assoc_loc[num_pass - 1]->unique_id = unique_id;
+                // preserve persistent fields
+                hyp_assoc_loc[num_pass - 1]->first_assoc_time = first_assoc_time;
+                hyp_assoc_loc[num_pass - 1]->loc_seq_num = loc_seq_num;
+                hyp_assoc_loc[num_pass - 1]->loc_report_count = loc_report_count;
+                hyp_assoc_loc[num_pass - 1]->has_valid_magnitude = has_valid_magnitude;
+                hyp_assoc_loc[num_pass - 1]->alert_sent_count = alert_sent_count;
+                hyp_assoc_loc[num_pass - 1]->alert_sent_time = alert_sent_time;
+            } else { // with relocate existing, should usually be associated, otherwise new event found, some instability or problem, just break and use full association location
+                num_pass--;
+                break;
+            }
+            nhypo_test++;
+        }
+        // === full association location
+        is_local_search = 0;
+        while (num_pass < MAX_NUM_HYPO) {
+            num_pass++;
+            long associate_start_tim_event = clock();
+            init_HypocenterDesc(hyp_assoc_loc[num_pass - 1]);
+            associated = associate_locate_octtree(num_pass, outnameroot, hyp_assoc_loc, num_hypocenters_associated, channelParameters,
+                    reassociate_only, time_min, time_max, lat_min_full, lat_max_full, lat_step_full, lon_min_full, lon_max_full, lon_step_smallest_full,
+                    depth_min_full, depth_max_full, depth_step_full, is_local_search, verbose);
+            if (verbose > 0) {
+                printf("INFO: event full associate: time = %.2f\n", (double) (clock() - associate_start_tim_event) / CLOCKS_PER_SEC);
+            }
+            if (associated) {
+                num_hypocenters_associated++;
+                hyp_assoc_loc[num_pass - 1]->loc_type = LOC_TYPE_FULL;
+            } else { // with reassociate only, non associated indicates no more successful associations, or error
+                break;
+            }
+        }
+        if (verbose > 0) {
+            printf("INFO: total associate time = %.2f\n", (double) (clock() - associate_start_time_total) / CLOCKS_PER_SEC);
+        }
+        if (num_hypocenters_associated > 0)
+            use_associated_data = 1;
+    } else { // no association
+        num_hypocenters_associated = 1; // TODO: test this!
+    }
+
+    // return if only_check_for_new_event and no new events associated
+    /*if (only_check_for_new_event) {
+        printf("DEBUG: Mode only_check_for_new_event -> nassoc:%d <=? ndxfull %d new? %d\n",
+                num_hypocenters_associated, hyp_full_assoc_loc_start_index, num_hypocenters_associated <= hyp_full_assoc_loc_start_index);
+    }*/
+    if (only_check_for_new_event && num_hypocenters_associated <= hyp_full_assoc_loc_start_index) {
+        // remove output files
+        int ireturn = nftw(outnameroot, remove_fn, 16, FTW_DEPTH);
+        if (ireturn) {
+            printf("ERROR: removing files: return value = %d, path = %s\n", ireturn, outnameroot);
+        }
+        return (0);
+    }
+
+
+    // check for duplicate events, remove event with fewer associated P phases
+    // 20110408 AJL - added to avoid processing of same event twice and possible loss of instance with greater associated P phases
+    if (1) {
+        for (int n = 0; n < num_de_data; n++) { // 20140722 AJL - bug fix
+            TimedomainProcessingData* deData = data_list[n];
+            deData->merged = 0;
+        }
+        int nhyp_assoc, nhyp_assoc_test;
+        int nhyp_preserve, nhyp_remove;
+        for (nhyp_assoc = num_hypocenters_associated - 1; nhyp_assoc > 0; nhyp_assoc--) {
+            for (nhyp_assoc_test = nhyp_assoc - 1; nhyp_assoc_test >= 0; nhyp_assoc_test--) {
+                // check if duplicate
+                if (isSameEvent(hyp_assoc_loc[nhyp_assoc], hyp_assoc_loc[nhyp_assoc_test])) {
+                    /* 20220921 AJL - bug fix: this logic allows very distant stations to define small events, rejecting nearby station readings
+                    // find hypo with most associated P phases
+                    if (hyp_assoc_loc[nhyp_assoc]->nassoc_P > hyp_assoc_loc[nhyp_assoc_test]->nassoc_P) {
+                        nhyp_preserve = nhyp_assoc;
+                        nhyp_remove = nhyp_assoc_test;
+                    } else {
+                        nhyp_preserve = nhyp_assoc_test;
+                        nhyp_remove = nhyp_assoc;
+                    }*/
+                    // find hypo with closest associated P phase  // 20220921 AJL - bug fix, keep events with nearest associated station
+                    if (hyp_assoc_loc[nhyp_assoc]->dist_min < hyp_assoc_loc[nhyp_assoc_test]->dist_min) {
+                        nhyp_preserve = nhyp_assoc;
+                        nhyp_remove = nhyp_assoc_test;
+                    } else {
+                        nhyp_preserve = nhyp_assoc_test;
+                        nhyp_remove = nhyp_assoc;
+                    }
+                    if (verbose > 0) {
+                        printf("   ---> Info: REMOVED DUPLICATE HYPOCENTER!  Associated pick data attached to preserved hypocenter.\n");
+                        printHypoDataString(hyp_assoc_loc[nhyp_remove], hypoDataString, 0, 0);
+                        printf("   ---> Removed:   %s\n", hypoDataString);
+                        printHypoDataString(hyp_assoc_loc[nhyp_preserve], hypoDataString, 0, 0);
+                        printf("   ---> Preserved: %s\n", hypoDataString);
+                    }
+                    // attach data from removed hypo to preserved hypo as zero weight associated data  // 20110411 AJL
+                    for (int n = 0; n < num_de_data; n++) {
+                        TimedomainProcessingData* deData = data_list[n];
+                        if (deData->is_associated == nhyp_remove + 1) {
+                            deData->is_associated = nhyp_preserve + 1; // attach to preserved hypo
+                            hyp_assoc_loc[nhyp_preserve]->nassoc++; // increment number associated for preserved hypo
+                            deData->merged = 1;
+                            // 20140626 AJL  deData->use_for_location = 0; // 20130218 AJL
+                            //deData->is_associated_grid_level = 0;
+                            deData->epicentral_distance = GCDistance(hyp_assoc_loc[nhyp_preserve]->lat, hyp_assoc_loc[nhyp_preserve]->lon, deData->lat, deData->lon);
+                            deData->epicentral_azimuth = GCAzimuth(hyp_assoc_loc[nhyp_preserve]->lat, hyp_assoc_loc[nhyp_preserve]->lon, deData->lat, deData->lon);
+                            deData->residual = (double) deData->t_time_t + deData->t_decsec
+                                    - (get_ttime(deData->phase_id, deData->epicentral_distance, hyp_assoc_loc[nhyp_preserve]->depth) + hyp_assoc_loc[nhyp_preserve]->otime);
+                            deData->dist_weight = 0.0;
+                            deData->polarization.weight = 0.0;
+                            deData->loc_weight = 0.0;
+                            deData->take_off_angle_inc = get_take_off_angle(deData->phase_id, deData->epicentral_distance, hyp_assoc_loc[nhyp_preserve]->depth);
+                            deData->take_off_angle_az = deData->epicentral_azimuth;
+                        }
+                        if (deData->is_associated > nhyp_remove + 1)
+                            deData->is_associated--;
+                    }
+                    // remove hypocenter from hypo list and shift any remaining hypocenters
+                    HypocenterDesc *temp = hyp_assoc_loc[nhyp_remove];
+                    for (nhyp = nhyp_remove; nhyp < num_hypocenters_associated - 1; nhyp++) {
+                        // 20111109 AJL hyp_assoc_loc[nhyp] = hyp_assoc_loc[nhyp + 1];
+                        hyp_assoc_loc[nhyp] = hyp_assoc_loc[nhyp + 1]; // 20111109 AJL - Bug fix        // 20140717 AJL - shift pointers only
+                        //(hyp_assoc_loc[nhyp]->hyp_assoc_index)--; // 20140716 AJL - reset later
+                    }
+                    hyp_assoc_loc[num_hypocenters_associated - 1] = temp;
+                    num_hypocenters_associated--;
+                    // restart loops
+                    nhyp_assoc = num_hypocenters_associated;
+                    break;
+                }
+            }
+        }
+    }
+
+
+    // 20211118 AJL - added
+    // forward calculation of ratio of nsta associated P to nsta available within P wavefront
+    // 20211118 AJL - added to enable checks for not enough Mwp magnitudes, for false/phantom large events, etc.
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        HypocenterDesc* phypo = hyp_assoc_loc[nhyp];
+        phypo->nStaAvailableFirstArrP = -1;
+        phypo->nStaAvailableFirstArrP_distMax = -1.0;
+        double time_since_origin = difftime(plot_time_max, (time_t) phypo->otime);
+        int phase_id_found = -1;
+        double dist_max = -1.0;
+        double time_test = time_since_origin;
+        while (phase_id_found < 0 && time_test > 0.0) {
+            dist_max = simple_distance(time_test, phypo->depth, "P", &phase_id_found);
+            time_test -= 5.0; // TODO: is 5 sec increment a good choice?
+        }
+        if (dist_max > 0.0) {
+            phypo->nStaAvailableFirstArrP = countStationsAvailable(phypo->lat, phypo->lon, dist_max, channelParameters);
+            phypo->nStaAvailableFirstArrP_distMax = dist_max;
+        }
+    }
+
+    // ============================================================================================================
+    // do report
+    //
+
+    // set internal timing information, time_since_last_report
+    // IMPORTANT! - time_since_last_report based on time_max, will only have 1 sec precision.  TODO: make sub-second precision?
+    double time_since_last_report;
+    if (time_of_last_report > 0.0) {
+        time_since_last_report = (double) time_max - time_of_last_report;
+    } else {
+        time_since_last_report = (double) report_interval; // backward compatibility and support for non real-time processing
+    }
+    time_of_last_report = (double) time_max;
+
+
+
+    // ============================================================================================================
+    // create plot in plot time range using 1-sec intervals, write asc file
+
+    double dsec;
+    // AJL20100118 - support independent results for each event
+
+    // allocate and initialize arrays and variables ===============================================================
+
+    //T50 level
+    int numWarningLevelTotal = 1 + (int) ((T50EX_LEVEL_MAX - T50EX_LEVEL_MIN) / T50EX_LEVEL_STEP);
+    char* t50ExArray = calloc(numWarningLevelTotal, sizeof (char));
+    int** t50ExHistogram = calloc(num_hypocenters_associated, sizeof (int*));
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        t50ExHistogram[nhyp] = calloc(numWarningLevelTotal, sizeof (int));
+        for (int m = 0; m < numWarningLevelTotal; m++)
+            t50ExHistogram[nhyp][m] = 0;
+    }
+    double ***t50ExStatisticsArray = calloc(num_hypocenters_associated, sizeof (double**));
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        t50ExStatisticsArray[nhyp] = calloc(3, sizeof (double*));
+        for (int m = 0; m < 3; m++) {
+            t50ExStatisticsArray[nhyp][m] = calloc(num_de_data, sizeof (double));
+        }
+    }
+    int *numT50ExLevel = calloc(num_hypocenters_associated, sizeof (int));
+    int *numT50ExLevelMax = calloc(num_hypocenters_associated, sizeof (int));
+    statistic_level* t50ExLevelStatistics = calloc(num_hypocenters_associated, sizeof (statistic_level));
+    char t50ExLevelString[num_hypocenters_associated][WARNING_LEVEL_STRING_LEN];
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        t50ExLevelStatistics[nhyp].centralValue = 0.0;
+        t50ExLevelStatistics[nhyp].upperBound = 0.0;
+        t50ExLevelStatistics[nhyp].lowerBound = 0.0;
+        t50ExLevelStatistics[nhyp].numLevel = 0;
+        strcpy(t50ExLevelString[nhyp], "NONE");
+    }
+    //tauC
+    int numTaucLevelTotal = 1 + (int) ((TAUC_LEVEL_MAX - TAUC_LEVEL_MIN) / TAUC_LEVEL_STEP);
+    char* taucArray = calloc(numTaucLevelTotal, sizeof (char));
+    int** taucHistogram = calloc(num_hypocenters_associated, sizeof (int*));
+    if (flag_do_tauc) {
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            taucHistogram[nhyp] = calloc(numTaucLevelTotal, sizeof (int));
+            for (int m = 0; m < numTaucLevelTotal; m++)
+                taucHistogram[nhyp][m] = 0;
+        }
+    }
+    double ***taucStatisticsArray = calloc(num_hypocenters_associated, sizeof (double**));
+    if (flag_do_tauc) {
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            taucStatisticsArray[nhyp] = calloc(3, sizeof (double*));
+            for (int m = 0; m < 3; m++) {
+                taucStatisticsArray[nhyp][m] = calloc(num_de_data, sizeof (double));
+            }
+        }
+    }
+    int *numTaucLevel = calloc(num_hypocenters_associated, sizeof (int));
+    int *numTaucLevelMax = calloc(num_hypocenters_associated, sizeof (int));
+    statistic_level* taucLevelStatistics = calloc(num_hypocenters_associated, sizeof (statistic_level));
+    char taucLevelString[num_hypocenters_associated][WARNING_LEVEL_STRING_LEN];
+    //if (flag_do_tauc) {
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        taucLevelStatistics[nhyp].centralValue = 0.0;
+        taucLevelStatistics[nhyp].upperBound = 0.0;
+        taucLevelStatistics[nhyp].lowerBound = 0.0;
+        taucLevelStatistics[nhyp].numLevel = 0;
+        strcpy(taucLevelString[nhyp], "NONE");
+    }
+    //}
+    // TdT50Ex
+    int *numTdT50ExLevel = calloc(num_hypocenters_associated, sizeof (int));
+    int *numTdT50ExLevelMax = calloc(num_hypocenters_associated, sizeof (int));
+    statistic_level* tdT50ExLevelStatistics = calloc(num_hypocenters_associated, sizeof (statistic_level));
+    char warningLevelString[num_hypocenters_associated][WARNING_LEVEL_STRING_LEN];
+    //if (flag_do_tauc) {
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        tdT50ExLevelStatistics[nhyp].centralValue = 0.0;
+        tdT50ExLevelStatistics[nhyp].upperBound = 0.0;
+        tdT50ExLevelStatistics[nhyp].lowerBound = 0.0;
+        tdT50ExLevelStatistics[nhyp].numLevel = 0;
+        strcpy(warningLevelString[nhyp], "NONE");
+    }
+    //}
+    //mwp
+    int numMwpLevelTotal = 1 + (int) ((MWP_LEVEL_MAX - MWP_LEVEL_MIN) / MWP_LEVEL_STEP);
+#ifdef USE_MWP_LEVEL_ARRAY
+    char* mwpArray = calloc(numMwpLevelTotal, sizeof (char));
+#endif
+    int** mwpHistogram = calloc(num_hypocenters_associated, sizeof (int*));
+    if (flag_do_mwp) {
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            mwpHistogram[nhyp] = calloc(numMwpLevelTotal, sizeof (int));
+            for (int m = 0; m < numMwpLevelTotal; m++)
+                mwpHistogram[nhyp][m] = 0;
+        }
+    }
+    double ***mwpStatisticsArray = calloc(num_hypocenters_associated, sizeof (double**));
+    if (flag_do_mwp) {
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            mwpStatisticsArray[nhyp] = calloc(3, sizeof (double*));
+            for (int m = 0; m < 3; m++) {
+                mwpStatisticsArray[nhyp][m] = calloc(num_de_data, sizeof (double));
+            }
+        }
+    }
+    int *numMwpLevel = calloc(num_hypocenters_associated, sizeof (int));
+    int *numMwpLevelMax = calloc(num_hypocenters_associated, sizeof (int));
+    statistic_level* mwpLevelStatistics = calloc(num_hypocenters_associated, sizeof (statistic_level));
+    char mwpLevelString[num_hypocenters_associated][WARNING_LEVEL_STRING_LEN];
+    //if (flag_do_mwp) {
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        mwpLevelStatistics[nhyp].centralValue = 0.0;
+        mwpLevelStatistics[nhyp].upperBound = 0.0;
+        mwpLevelStatistics[nhyp].lowerBound = 0.0;
+        mwpLevelStatistics[nhyp].numLevel = 0;
+        strcpy(mwpLevelString[nhyp], "NONE");
+    }
+    //}
+    // mb
+    int numMbLevelTotal = 1 + (int) ((MB_LEVEL_MAX - MB_LEVEL_MIN) / MB_LEVEL_STEP);
+    int** mbHistogram = calloc(num_hypocenters_associated, sizeof (int*));
+    if (flag_do_mb) {
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            mbHistogram[nhyp] = calloc(numMbLevelTotal, sizeof (int));
+            for (int m = 0; m < numMbLevelTotal; m++)
+                mbHistogram[nhyp][m] = 0;
+        }
+    }
+    double ***mbStatisticsArray = calloc(num_hypocenters_associated, sizeof (double**));
+    if (flag_do_mb) {
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            mbStatisticsArray[nhyp] = calloc(3, sizeof (double*));
+            for (int m = 0; m < 3; m++) {
+                mbStatisticsArray[nhyp][m] = calloc(num_de_data, sizeof (double));
+            }
+        }
+    }
+    int *numMbLevel = calloc(num_hypocenters_associated, sizeof (int));
+    int *numMbLevelMax = calloc(num_hypocenters_associated, sizeof (int));
+    statistic_level* mbLevelStatistics = calloc(num_hypocenters_associated, sizeof (statistic_level));
+    char mbLevelString[num_hypocenters_associated][WARNING_LEVEL_STRING_LEN];
+    //if (flag_do_mb) {
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        mbLevelStatistics[nhyp].centralValue = 0.0;
+        mbLevelStatistics[nhyp].upperBound = 0.0;
+        mbLevelStatistics[nhyp].lowerBound = 0.0;
+        mbLevelStatistics[nhyp].numLevel = 0;
+        strcpy(mbLevelString[nhyp], "NONE");
+    }
+    //}
+    // t0
+    int numT0LevelTotal = 1 + (int) ((T0_LEVEL_MAX - T0_LEVEL_MIN) / T0_LEVEL_STEP);
+    int** t0Histogram = calloc(num_hypocenters_associated, sizeof (int*));
+    if (flag_do_t0) {
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            t0Histogram[nhyp] = calloc(numT0LevelTotal, sizeof (int));
+            for (int m = 0; m < numT0LevelTotal; m++)
+                t0Histogram[nhyp][m] = 0;
+        }
+    }
+    double ***t0StatisticsArray = calloc(num_hypocenters_associated, sizeof (double**));
+    if (flag_do_t0) {
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            t0StatisticsArray[nhyp] = calloc(3, sizeof (double*));
+            for (int m = 0; m < 3; m++) {
+                t0StatisticsArray[nhyp][m] = calloc(num_de_data, sizeof (double));
+            }
+        }
+    }
+    int *numT0Level = calloc(num_hypocenters_associated, sizeof (int));
+    int *numT0LevelMax = calloc(num_hypocenters_associated, sizeof (int));
+    statistic_level* t0LevelStatistics = calloc(num_hypocenters_associated, sizeof (statistic_level));
+    char t0LevelString[num_hypocenters_associated][WARNING_LEVEL_STRING_LEN];
+    //if (flag_do_t0) {
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        t0LevelStatistics[nhyp].centralValue = 0.0;
+        t0LevelStatistics[nhyp].upperBound = 0.0;
+        t0LevelStatistics[nhyp].lowerBound = 0.0;
+        t0LevelStatistics[nhyp].numLevel = 0;
+        strcpy(t0LevelString[nhyp], "NONE");
+    }
+    //}
+    // mwpd
+    int numMwpdLevelTotal = 1 + (int) ((MWPD_LEVEL_MAX - MWPD_LEVEL_MIN) / MWPD_LEVEL_STEP);
+    int** mwpdHistogram = calloc(num_hypocenters_associated, sizeof (int*));
+    if (flag_do_mwpd) {
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            mwpdHistogram[nhyp] = calloc(numMwpdLevelTotal, sizeof (int));
+            for (int m = 0; m < numMwpdLevelTotal; m++)
+                mwpdHistogram[nhyp][m] = 0;
+        }
+    }
+    double ***mwpdStatisticsArray = calloc(num_hypocenters_associated, sizeof (double**));
+#ifdef USE_MWP_MO_POS_NEG
+    double ***mwpdMoPosNegStatisticsArray = calloc(num_hypocenters_associated, sizeof (double**));
+#endif
+    if (flag_do_mwpd) {
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            mwpdStatisticsArray[nhyp] = calloc(3, sizeof (double*));
+            for (int m = 0; m < 3; m++) {
+                mwpdStatisticsArray[nhyp][m] = calloc(num_de_data, sizeof (double));
+            }
+#ifdef USE_MWP_MO_POS_NEG
+            mwpdMoPosNegStatisticsArray[nhyp] = calloc(3, sizeof (double*));
+            for (int m = 0; m < 3; m++) {
+                mwpdMoPosNegStatisticsArray[nhyp][m] = calloc(num_de_data, sizeof (double));
+            }
+#endif
+        }
+    }
+    int *numMwpdLevel = calloc(num_hypocenters_associated, sizeof (int));
+    int *numMwpdLevelMax = calloc(num_hypocenters_associated, sizeof (int));
+    statistic_level* mwpdLevelStatistics = calloc(num_hypocenters_associated, sizeof (statistic_level));
+    char mwpdLevelString[num_hypocenters_associated][WARNING_LEVEL_STRING_LEN];
+#ifdef USE_MWP_MO_POS_NEG
+    int *numMwpdMoPosNegLevel = calloc(num_hypocenters_associated, sizeof (int));
+    int *numMwpdMoPosNegLevelMax = calloc(num_hypocenters_associated, sizeof (int));
+    statistic_level* mwpdMoPosNegLevelStatistics = calloc(num_hypocenters_associated, sizeof (statistic_level));
+#endif
+    //if (flag_do_mwpd) {
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        mwpdLevelStatistics[nhyp].centralValue = 0.0;
+        mwpdLevelStatistics[nhyp].upperBound = 0.0;
+        mwpdLevelStatistics[nhyp].lowerBound = 0.0;
+        mwpdLevelStatistics[nhyp].numLevel = 0;
+        strcpy(mwpdLevelString[nhyp], "NONE");
+    }
+#ifdef USE_MWP_MO_POS_NEG
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        mwpdMoPosNegLevelStatistics[nhyp].centralValue = 0.0;
+        mwpdMoPosNegLevelStatistics[nhyp].upperBound = 0.0;
+        mwpdMoPosNegLevelStatistics[nhyp].lowerBound = 0.0;
+        mwpdMoPosNegLevelStatistics[nhyp].numLevel = 0;
+    }
+#endif
+    //}
+
+
+
+    // ============================================================================================================
+    // open output files
+    //
+    // agency
+    //
+    snprintf(outname, STANDARD_STRLEN, "%s/agency_id.txt", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * agencyStream = fopen_counter(outname, "w");
+    if (agencyStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    fprintf(agencyStream, "%s\n", agencyId);
+    fclose_counter(agencyStream);
+    // program version
+    //
+    snprintf(outname, STANDARD_STRLEN, "%s/version.txt", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * versionStream = fopen_counter(outname, "w");
+    if (versionStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    fprintf(versionStream, "v%s (%s)\n", EARLY_EST_MONITOR_VERSION, EARLY_EST_MONITOR_VERSION_DATE);
+    fclose_counter(versionStream);
+    // temp directory
+    snprintf(outname, STANDARD_STRLEN, "%s", EE_TEMP_DIR);
+    mkdir(outname, 0755);
+    //
+    // event directory
+    snprintf(outname, STANDARD_STRLEN, "%s/events", outnameroot);
+    mkdir(outname, 0755);
+    //
+    // plotting files
+    snprintf(outname, STANDARD_STRLEN, "%s/plot", outnameroot);
+    mkdir(outname, 0755);
+    // GMT T50 grd data
+    snprintf(outname, STANDARD_STRLEN, "%s/plot/t50.grid.bin", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * t50ExGridDataStream = fopen_counter(outname, "w");
+    if (t50ExGridDataStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    // GMT style
+    snprintf(outname, STANDARD_STRLEN, "%s/plot/t50.grid.sta.code.txt", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * t50ExStaCodeGridStream = fopen_counter(outname, "w");
+    if (t50ExStaCodeGridStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    //
+    // tauc
+    FILE* taucGridDataStrem = NULL;
+    FILE* taucStaCodeGridStream = NULL;
+    if (flag_do_tauc) {
+        // GMT tauc grd data
+        snprintf(outname, STANDARD_STRLEN, "%s/plot/tauc.grid.bin", outnameroot);
+        if (verbose > 2)
+            printf("Opening output file: %s\n", outname);
+        taucGridDataStrem = fopen_counter(outname, "w");
+        if (taucGridDataStrem == NULL) {
+            snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+            perror(tmp_str);
+            return (-1);
+        }
+        // GMT style
+        snprintf(outname, STANDARD_STRLEN, "%s/plot/tauc.grid.sta.code.txt", outnameroot);
+        if (verbose > 2)
+            printf("Opening output file: %s\n", outname);
+        taucStaCodeGridStream = fopen_counter(outname, "w");
+        if (taucStaCodeGridStream == NULL) {
+            snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+            perror(tmp_str);
+            return (-1);
+        }
+    }
+    //
+    // mwp
+#ifdef USE_MWP_LEVEL_ARRAY
+    FILE* mwpGridDataStrem = NULL;
+    FILE* mwpStaCodeGridStream = NULL;
+    if (flag_do_mwp) {
+        // GMT mwp grd data
+        snprintf(outname, STANDARD_STRLEN, "%s/plot/mwp.grid.bin", outnameroot);
+        if (verbose > 2)
+            printf("Opening output file: %s\n", outname);
+        mwpGridDataStrem = fopen_counter(outname, "w");
+        if (mwpGridDataStrem == NULL) {
+            snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+            perror(tmp_str);
+            return (-1);
+        }
+        // GMT style
+        snprintf(outname, STANDARD_STRLEN, "%s/plot/mwp.grid.sta.code.txt", outnameroot);
+        if (verbose > 2)
+            printf("Opening output file: %s\n", outname);
+        mwpStaCodeGridStream = fopen_counter(outname, "w");
+        if (mwpStaCodeGridStream == NULL) {
+            snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+            perror(tmp_str);
+            return (-1);
+        }
+    }
+#endif
+    //
+    //
+    snprintf(outname, STANDARD_STRLEN, "%s/plot/pick.xy", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * pickStream = fopen_counter(outname, "w");
+    if (pickStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+
+    FILE * pickStreamAssoc[num_hypocenters_associated];
+    FILE * staAssociatedStream[num_hypocenters_associated];
+    char staAssociatedStream_name[num_hypocenters_associated][STANDARD_STRLEN];
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        //
+        snprintf(outname, STANDARD_STRLEN, "%s/plot/pick.assoc.%d.xy", outnameroot, nhyp);
+        if (verbose > 2)
+            printf("Opening output file: %s\n", outname);
+        pickStreamAssoc[nhyp] = fopen_counter(outname, "w");
+        if (pickStreamAssoc[nhyp] == NULL) {
+            snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+            perror(tmp_str);
+            return (-1);
+        }
+
+        // GMT style
+        snprintf(outname, STANDARD_STRLEN, "%s/plot/sta.associated.%d.xy", outnameroot, nhyp);
+        if (verbose > 2)
+            printf("Opening output file: %s\n", outname);
+        staAssociatedStream[nhyp] = fopen_counter(outname, "w");
+        if (staAssociatedStream[nhyp] == NULL) {
+            snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+            perror(tmp_str);
+            return (-1);
+        }
+        strcpy(staAssociatedStream_name[nhyp], outname);
+    }
+
+    FILE * t50ExCentralValueStream[num_hypocenters_associated];
+    FILE * t50ExUpperBoundStream[num_hypocenters_associated];
+    FILE * t50ExLowerBoundStream[num_hypocenters_associated];
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        // GMT style
+        snprintf(outname, STANDARD_STRLEN, "%s/plot/t50.value.%d.xy", outnameroot, nhyp);
+        if (verbose > 2)
+            printf("Opening output file: %s\n", outname);
+        t50ExCentralValueStream[nhyp] = fopen_counter(outname, "w");
+        if (t50ExCentralValueStream[nhyp] == NULL) {
+            snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+            perror(tmp_str);
+            return (-1);
+        }
+        fprintf(t50ExCentralValueStream[nhyp], ">\n");
+        // GMT style
+        snprintf(outname, STANDARD_STRLEN, "%s/plot/t50.upper.%d.xy", outnameroot, nhyp);
+        if (verbose > 2)
+            printf("Opening output file: %s\n", outname);
+        t50ExUpperBoundStream[nhyp] = fopen_counter(outname, "w");
+        if (t50ExUpperBoundStream[nhyp] == NULL) {
+            snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+            perror(tmp_str);
+            return (-1);
+        }
+        fprintf(t50ExUpperBoundStream[nhyp], ">\n");
+        // GMT style
+        snprintf(outname, STANDARD_STRLEN, "%s/plot/t50.lower.%d.xy", outnameroot, nhyp);
+        if (verbose > 2)
+            printf("Opening output file: %s\n", outname);
+        t50ExLowerBoundStream[nhyp] = fopen_counter(outname, "w");
+        if (t50ExLowerBoundStream[nhyp] == NULL) {
+            snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+            perror(tmp_str);
+            return (-1);
+        }
+        fprintf(t50ExLowerBoundStream[nhyp], ">\n");
+    }
+    FILE * taucCentralValueStream[num_hypocenters_associated];
+    FILE * taucUpperBoundStream[num_hypocenters_associated];
+    FILE * taucLowerBoundStream[num_hypocenters_associated];
+    FILE * tdT50ExCentralValueStream[num_hypocenters_associated];
+    FILE * tdT50ExUpperBoundStream[num_hypocenters_associated];
+    FILE * tdT50ExLowerBoundStream[num_hypocenters_associated];
+#ifdef USE_MWP_LEVEL_ARRAY
+    FILE * mwpCentralValueStream[num_hypocenters_associated];
+    FILE * mwpUpperBoundStream[num_hypocenters_associated];
+    FILE * mwpLowerBoundStream[num_hypocenters_associated];
+#endif
+    if (flag_do_tauc) {
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            // GMT style
+            snprintf(outname, STANDARD_STRLEN, "%s/plot/tauc.value.%d.xy", outnameroot, nhyp);
+            if (verbose > 2)
+                printf("Opening output file: %s\n", outname);
+            taucCentralValueStream[nhyp] = fopen_counter(outname, "w");
+            if (taucCentralValueStream[nhyp] == NULL) {
+                snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+                perror(tmp_str);
+                return (-1);
+            }
+            fprintf(taucCentralValueStream[nhyp], ">\n");
+            // GMT style
+            snprintf(outname, STANDARD_STRLEN, "%s/plot/tauc.upper.%d.xy", outnameroot, nhyp);
+            if (verbose > 2)
+                printf("Opening output file: %s\n", outname);
+            taucUpperBoundStream[nhyp] = fopen_counter(outname, "w");
+            if (taucUpperBoundStream[nhyp] == NULL) {
+                snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+                perror(tmp_str);
+                return (-1);
+            }
+            fprintf(taucUpperBoundStream[nhyp], ">\n");
+            // GMT style
+            snprintf(outname, STANDARD_STRLEN, "%s/plot/tauc.lower.%d.xy", outnameroot, nhyp);
+            if (verbose > 2)
+                printf("Opening output file: %s\n", outname);
+            taucLowerBoundStream[nhyp] = fopen_counter(outname, "w");
+            if (taucLowerBoundStream[nhyp] == NULL) {
+                snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+                perror(tmp_str);
+                return (-1);
+            }
+            fprintf(taucLowerBoundStream[nhyp], ">\n");
+        }
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            // GMT style
+            snprintf(outname, STANDARD_STRLEN, "%s/plot/alarm.value.%d.xy", outnameroot, nhyp);
+            if (verbose > 2)
+                printf("Opening output file: %s\n", outname);
+            tdT50ExCentralValueStream[nhyp] = fopen_counter(outname, "w");
+            if (tdT50ExCentralValueStream[nhyp] == NULL) {
+                snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+                perror(tmp_str);
+                return (-1);
+            }
+            fprintf(tdT50ExCentralValueStream[nhyp], ">\n");
+            // GMT style
+            snprintf(outname, STANDARD_STRLEN, "%s/plot/alarm.upper.%d.xy", outnameroot, nhyp);
+            if (verbose > 2)
+                printf("Opening output file: %s\n", outname);
+            tdT50ExUpperBoundStream[nhyp] = fopen_counter(outname, "w");
+            if (tdT50ExUpperBoundStream[nhyp] == NULL) {
+                snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+                perror(tmp_str);
+                return (-1);
+            }
+            fprintf(tdT50ExUpperBoundStream[nhyp], ">\n");
+            // GMT style
+            snprintf(outname, STANDARD_STRLEN, "%s/plot/alarm.lower.%d.xy", outnameroot, nhyp);
+            if (verbose > 2)
+                printf("Opening output file: %s\n", outname);
+            tdT50ExLowerBoundStream[nhyp] = fopen_counter(outname, "w");
+            if (tdT50ExLowerBoundStream[nhyp] == NULL) {
+                snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+                perror(tmp_str);
+                return (-1);
+            }
+            fprintf(tdT50ExLowerBoundStream[nhyp], ">\n");
+        }
+    }
+#ifdef USE_MWP_LEVEL_ARRAY
+    if (flag_do_mwp) {
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            // GMT style
+            snprintf(outname, STANDARD_STRLEN, "%s/plot/mwp.value.%d.xy", outnameroot, nhyp);
+            if (verbose > 2)
+                printf("Opening output file: %s\n", outname);
+            mwpCentralValueStream[nhyp] = fopen_counter(outname, "w");
+            if (mwpCentralValueStream[nhyp] == NULL) {
+                snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+                perror(tmp_str);
+                return (-1);
+            }
+            fprintf(mwpCentralValueStream[nhyp], ">\n");
+            // GMT style
+            snprintf(outname, STANDARD_STRLEN, "%s/plot/mwp.upper.%d.xy", outnameroot, nhyp);
+            if (verbose > 2)
+                printf("Opening output file: %s\n", outname);
+            mwpUpperBoundStream[nhyp] = fopen_counter(outname, "w");
+            if (mwpUpperBoundStream[nhyp] == NULL) {
+                snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+                perror(tmp_str);
+                return (-1);
+            }
+            fprintf(mwpUpperBoundStream[nhyp], ">\n");
+            // GMT style
+            snprintf(outname, STANDARD_STRLEN, "%s/plot/mwp.lower.%d.xy", outnameroot, nhyp);
+            if (verbose > 2)
+                printf("Opening output file: %s\n", outname);
+            mwpLowerBoundStream[nhyp] = fopen_counter(outname, "w");
+            if (mwpLowerBoundStream[nhyp] == NULL) {
+                snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+                perror(tmp_str);
+                return (-1);
+            }
+            fprintf(mwpLowerBoundStream[nhyp], ">\n");
+        }
+    }
+#endif
+    // GMT style
+    snprintf(outname, STANDARD_STRLEN, "%s/plot/t50.sta.red.xy", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * staT50RedStream = fopen_counter(outname, "w");
+    if (staT50RedStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    char staT50Red_name[STANDARD_STRLEN];
+    strcpy(staT50Red_name, outname);
+    // GMT style
+    snprintf(outname, STANDARD_STRLEN, "%s/plot/t50.sta.yellow.xy", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * staT50YellowStream = fopen_counter(outname, "w");
+    if (staT50YellowStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    char staT50Yellow_name[STANDARD_STRLEN];
+    strcpy(staT50Yellow_name, outname);
+    // GMT style
+    snprintf(outname, STANDARD_STRLEN, "%s/plot/t50.sta.green.xy", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * staT50GreenStream = fopen_counter(outname, "w");
+    if (staT50GreenStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    char staT50Green_name[STANDARD_STRLEN];
+    strcpy(staT50Green_name, outname);
+    // GMT style
+    snprintf(outname, STANDARD_STRLEN, "%s/plot/t50.sta.ltred.xy", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * staT50LtRedStream = fopen_counter(outname, "w");
+    if (staT50LtRedStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    char staT50LtRed_name[STANDARD_STRLEN];
+    strcpy(staT50LtRed_name, outname);
+    // GMT style
+    snprintf(outname, STANDARD_STRLEN, "%s/plot/t50.sta.ltyellow.xy", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * staT50LtYellowStream = fopen_counter(outname, "w");
+    if (staT50LtYellowStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    char staT50LtYellow_name[STANDARD_STRLEN];
+    strcpy(staT50LtYellow_name, outname);
+    // GMT style
+    snprintf(outname, STANDARD_STRLEN, "%s/plot/t50.sta.ltgreen.xy", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * staT50LtGreenStream = fopen_counter(outname, "w");
+    if (staT50LtGreenStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    char staT50LtGreen_name[STANDARD_STRLEN];
+    strcpy(staT50LtGreen_name, outname);
+    // GMT style
+    snprintf(outname, STANDARD_STRLEN, "%s/plot/tauc.sta.red.xy", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * staTaucRedStream = fopen_counter(outname, "w");
+    if (staTaucRedStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    char staTaucRed_name[STANDARD_STRLEN];
+    strcpy(staTaucRed_name, outname);
+    // GMT style
+    snprintf(outname, STANDARD_STRLEN, "%s/plot/tauc.sta.yellow.xy", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * staTaucYellowStream = fopen_counter(outname, "w");
+    if (staTaucYellowStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    char staTaucYellow_name[STANDARD_STRLEN];
+    strcpy(staTaucYellow_name, outname);
+    // GMT style
+    snprintf(outname, STANDARD_STRLEN, "%s/plot/tauc.sta.green.xy", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * staTaucGreenStream = fopen_counter(outname, "w");
+    if (staTaucGreenStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    char staTaucGreen_name[STANDARD_STRLEN];
+    strcpy(staTaucGreen_name, outname);
+    // GMT style
+    snprintf(outname, STANDARD_STRLEN, "%s/plot/tauc.sta.ltred.xy", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * staTaucLtRedStream = fopen_counter(outname, "w");
+    if (staTaucLtRedStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    char staTaucLtRed_name[STANDARD_STRLEN];
+    strcpy(staTaucLtRed_name, outname);
+    // GMT style
+    snprintf(outname, STANDARD_STRLEN, "%s/plot/tauc.sta.ltyellow.xy", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * staTaucLtYellowStream = fopen_counter(outname, "w");
+    if (staTaucLtYellowStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    char staTaucLtYellow_name[STANDARD_STRLEN];
+    strcpy(staTaucLtYellow_name, outname);
+    // GMT style
+    snprintf(outname, STANDARD_STRLEN, "%s/plot/tauc.sta.ltgreen.xy", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * staTaucLtGreenStream = fopen_counter(outname, "w");
+    if (staTaucLtGreenStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    char staTaucLtGreen_name[STANDARD_STRLEN];
+    strcpy(staTaucLtGreen_name, outname);
+
+
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        numT50ExLevelMax[nhyp] = 0;
+    }
+    //tauc
+    if (flag_do_tauc) {
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            numTaucLevelMax[nhyp] = 0;
+        }
+    }
+    //mwp
+    if (flag_do_mwp) {
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            numMwpLevelMax[nhyp] = 0;
+        }
+    }
+    //mb
+    if (flag_do_mb) {
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            numMbLevelMax[nhyp] = 0;
+        }
+    }
+    //t0
+    if (flag_do_t0) {
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            numT0LevelMax[nhyp] = 0;
+        }
+    }
+    //mwpd
+    if (flag_do_mwpd) {
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            numMwpdLevelMax[nhyp] = 0;
+        }
+#ifdef USE_MWP_MO_POS_NEG
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            numMwpdMoPosNegLevelMax[nhyp] = 0;
+        }
+#endif
+    }
+
+
+    // loop over all time steps in plot time, loop over all data, load level arrays, accumulate statistics ===============================================================
+
+    time_t curr_time = plot_time_min;
+    while (curr_time <= plot_time_max) {
+        //T50 Level
+        for (nhyp = 0; nhyp < numWarningLevelTotal; nhyp++)
+            t50ExArray[nhyp] = 0;
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            numT50ExLevel[nhyp] = 0;
+        }
+        //tauc
+        if (flag_do_tauc) {
+            for (nhyp = 0; nhyp < numTaucLevelTotal; nhyp++)
+                taucArray[nhyp] = 0;
+            for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+                numTaucLevel[nhyp] = 0;
+            }
+        }
+        //mwp
+        if (flag_do_mwp) {
+#ifdef USE_MWP_LEVEL_ARRAY
+            for (nhyp = 0; nhyp < numMwpLevelTotal; nhyp++)
+                mwpArray[nhyp] = 0;
+#endif
+            for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+                numMwpLevel[nhyp] = 0;
+            }
+        }
+        //mb
+        if (flag_do_mb) {
+            for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+                numMbLevel[nhyp] = 0;
+            }
+        }
+        //t0
+        if (flag_do_t0) {
+            for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+                numT0Level[nhyp] = 0;
+            }
+        }
+        //mwpd
+        if (flag_do_mwpd) {
+            for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+                numMwpdLevel[nhyp] = 0;
+            }
+#ifdef USE_MWP_MO_POS_NEG
+            for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+                numMwpdMoPosNegLevel[nhyp] = 0;
+            }
+#endif
+        }
+        // loop over data
+        int ndata;
+        for (ndata = 0; ndata < num_de_data; ndata++) {
+            TimedomainProcessingData* deData = data_list[ndata];
+            // skip if possible clip in data time span or if HF or BRB s/n ratio too low
+            // AJL 20100224
+            //if (deData->flag_clipped || deData->flag_snr_hf_too_low || deData->flag_a_ref_not_ok)
+            if (deData->flag_clipped || deData->flag_non_contiguous || (!USE_AREF_NOT_OK_BRB_PICKS_FOR_LOCATION && deData->flag_a_ref_not_ok
+                    // 20210929 AJL - Allow brb picks in prev coda (flag_a_ref_not_ok) if sn_brb OK. May avoid loosing correct BRB picks after early HF pick.
+                    && (!USE_AREF_NOT_OK_PICKS_FOR_LOCATION_IF_SNR_BRB_OK || !(deData->pick_stream == STREAM_RAW) || deData->flag_snr_brb_too_low)))
+                continue;
+            // skip if data not used for location and not associated
+            // AJL 20100630
+            if (!deData->use_for_location && !(use_associated_data && is_associated_phase(deData)))
+                continue;
+            // if time step includes data pick time, update calculated pick values
+            time_t pick_time = get_time_t(deData, &dsec);
+            if (pick_time >= curr_time && pick_time < curr_time + TIME_STEP) {
+                double dtime = difftime(curr_time, plot_time_max) / 60.0;
+                if (flag_do_mwpd) {
+                    deData->mwp->mag = MWP_INVALID;
+                }
+                if (flag_do_mb) {
+                    deData->mb->mag = MB_INVALID;
+                }
+                double depth = 0.0;
+                if (deData->is_associated)
+                    depth = hyp_assoc_loc[deData->is_associated - 1]->depth;
+                set_derived_values(deData, depth); // 20111222 TEST AJL - use S duration
+                if (use_associated_data && is_associated_phase(deData)) {
+                    fprintf(pickStreamAssoc[deData->is_associated - 1], ">\n%f %f\n%f %f\n", dtime, PICK_PLOT_LEVEL_MIN, dtime, PICK_PLOT_LEVEL_MAX);
+                    fprintf(staAssociatedStream[deData->is_associated - 1], "%f %f\n", deData->lat, deData->lon);
+                    //20110119 AJL if (is_associated_location_P(deData) && flag_do_mwp && deData->flag_complete_mwp) {
+                    // 20140808 AJL - exclude Pdiff  if (is_associated_location_P(deData) && flag_do_mwp) {
+                    if (is_associated_location_P(deData) && flag_do_mwp && is_P(deData->phase_id)) {
+                        calculate_Mwp_Mag(deData, hyp_assoc_loc[deData->is_associated - 1]->depth,
+                                use_mwp_distance_correction, use_amplitude_attenuation && use_magnitude_amp_atten_check);
+#ifdef USE_MWP_LEVEL_ARRAY
+                        // 20121119 AJL if (!deData->flag_snr_brb_too_low && is_unassociated_or_location_P(deData))
+                        if (!deData->flag_snr_brb_too_low && !deData->flag_snr_brb_int_too_low && is_unassociated_or_location_P(deData))
+                            fprintf(mwpStaCodeGridStream, "%f %f %s\n", difftime(pick_time, plot_time_max) / 60.0, deData->mwp->mag, deData->station);
+#endif
+                    }
+                    //20110119 AJL if (is_associated_location_P(deData) && flag_do_mb && deData->flag_complete_mb) {
+                    // 20140808 AJL - exclude Pdiff  if (is_associated_location_P(deData) && flag_do_mb) {
+                    if (is_associated_location_P(deData) && flag_do_mb && is_P(deData->phase_id)) {
+                        if (MB_MODE == MB_MODE_mB)
+                            calculate_mB_Mag(deData, hyp_assoc_loc[deData->is_associated - 1]->depth,
+                                use_mb_correction, use_amplitude_attenuation && use_magnitude_amp_atten_check);
+                        else
+                            calculate_mb_Mag(deData, hyp_assoc_loc[deData->is_associated - 1]->depth,
+                                use_amplitude_attenuation && use_magnitude_amp_atten_check); // 20110528 AJL
+                        //printf("DEBUG: %s S/N-BRB-BP: sn_brb_bp_pick %f, sn_brb_bp_signal %f, snr_brb_bp %f\n",
+                        //        deData->station, deData->sn_brb_bp_pick, deData->sn_brb_bp_signal,
+                        //        deData->sn_brb_bp_pick < FLT_MIN ? -1.0 : deData->sn_brb_bp_signal / deData->sn_brb_bp_pick);
+                    }
+                    // 20140808 AJL - exclude Pdiff  if (is_associated_location_P(deData) && flag_do_mwpd) {
+                    if (is_associated_location_P(deData) && flag_do_mwpd && is_P(deData->phase_id)) {
+                        calculate_Raw_Mwpd_Mag(deData, hyp_assoc_loc[deData->is_associated - 1]->depth,
+                                use_mwp_distance_correction, use_amplitude_attenuation && use_magnitude_amp_atten_check);
+                    }
+                }
+                if (!deData->flag_snr_hf_too_low && is_unassociated_or_location_P(deData)) {
+                    double wlevel = getT50Level(deData);
+                    //wlevel = T50EX_LEVEL_MIN + T50EX_LEVEL_STEP * (int) ((wlevel - T50EX_LEVEL_MIN) / T50EX_LEVEL_STEP);
+                    fprintf(t50ExStaCodeGridStream, "%f %f %s\n", difftime(pick_time, plot_time_max) / 60.0, wlevel, deData->station);
+                }
+                if (flag_do_tauc) {
+                    if (!deData->flag_snr_brb_too_low && is_unassociated_or_location_P(deData))
+                        fprintf(taucStaCodeGridStream, "%f %f %s\n", difftime(pick_time, plot_time_max) / 60.0, deData->tauc_peak, deData->station);
+                }
+                // 20130128 AJL - use flag_snr_brb_int_too_low to allow mwp, mwpd, etc., but do not use for ignore tests (e.g. ignore determined by flag_snr_brb_too_low)
+                //if (!deData->flag_snr_hf_too_low || !deData->flag_snr_brb_too_low || !deData->flag_snr_brb_int_too_low)
+                if (!deData->flag_snr_hf_too_low || !deData->flag_snr_brb_too_low)
+                    fprintf(pickStream, ">\n%f %f\n%f %f\n", dtime, PICK_PLOT_LEVEL_MIN, dtime, PICK_PLOT_LEVEL_MAX);
+            }
+            // skip if not completed
+            if (!deData->flag_complete_t50)
+                continue;
+            // include data discriminant levels in grid and level statistics
+            time_t plot_time = pick_time; // plot at pick time
+            // set plot length to specified window after OT or default length if this data has no associated hypocenter
+            double plot_time_end = plot_time + LEVEL_PLOT_WINDOW_LENGTH_DEFAULT;
+            if (use_associated_data && is_associated_location_P(deData))
+                plot_time_end = (time_t) hyp_assoc_loc[deData->is_associated - 1]->otime + LEVEL_PLOT_WINDOW_LENGTH_ASSOCIATED;
+            if (curr_time >= plot_time && curr_time <= plot_time_end) {
+                //T50 Level
+                deData->t50_used_for_stats = 0; // 20191111 AJL - added
+                double t50Level = getT50Level(deData);
+                int indexT50 = 0;
+                int associated_ok = use_associated_data && is_associated_location_P(deData)
+                        && deData->epicentral_distance > MIN_EPICENTRAL_DISTANCE_WARNING && deData->epicentral_distance < MAX_EPICENTRAL_DISTANCE_WARNING;
+                if (!deData->flag_snr_hf_too_low
+                        && (!associate_data || !deData->is_associated || associated_ok)) {
+                    if (t50Level >= T50EX_LEVEL_MAX - T50EX_LEVEL_STEP)
+                        indexT50 = numWarningLevelTotal - 1;
+                    else if (t50Level <= T50EX_LEVEL_MIN)
+                        indexT50 = 0;
+                    else
+                        indexT50 = (int) ((t50Level - T50EX_LEVEL_MIN) / T50EX_LEVEL_STEP);
+                    if (t50Level >= T50EX_RED_CUTOFF) {
+                        if (t50ExArray[indexT50] < 1)
+                            t50ExArray[indexT50] += T50EX_MODULO;
+                        if (t50ExArray[indexT50] < 127)
+                            t50ExArray[indexT50]++;
+                    } else if (t50Level >= T50EX_YELLOW_CUTOFF) {
+                        if (t50ExArray[indexT50] < T50EX_MODULO)
+                            t50ExArray[indexT50]++;
+                    } else {
+                        //printf("DEBUG: numWarningLevelTotal %d  indexT50 %d  t50Level %f  T50EX_LEVEL_MIN %f  T50EX_LEVEL_STEP %f\n",
+                        //        numWarningLevelTotal, indexT50, t50Level, T50EX_LEVEL_MIN, T50EX_LEVEL_STEP);
+                        if (t50ExArray[indexT50] > -128)
+                            t50ExArray[indexT50]--;
+                    }
+                    // add to T50 level statistics array - check associated and distance cutoff
+                    if (!associate_data || associated_ok) {
+                        deData->t50_used_for_stats = 1; // 20191111 AJL - added
+                        t50ExStatisticsArray[(deData->is_associated - 1)][0][numT50ExLevel[(deData->is_associated - 1)]] = t50Level;
+                        t50ExStatisticsArray[(deData->is_associated - 1)][1][numT50ExLevel[(deData->is_associated - 1)]] = deData->lat;
+                        t50ExStatisticsArray[(deData->is_associated - 1)][2][numT50ExLevel[(deData->is_associated - 1)]] = deData->lon;
+                        numT50ExLevel[(deData->is_associated - 1)]++;
+                        if (numT50ExLevel[(deData->is_associated - 1)] > numT50ExLevelMax[(deData->is_associated - 1)])
+                            numT50ExLevelMax[(deData->is_associated - 1)] = numT50ExLevel[(deData->is_associated - 1)];
+                    }
+                }
+                //tauc
+                deData->tauc_used_for_stats = 0; // 20191111 AJL - added
+                int indexTauc = 0;
+                associated_ok = use_associated_data && is_associated_location_P(deData)
+                        && deData->epicentral_distance > MIN_EPICENTRAL_DISTANCE_TAUC && deData->epicentral_distance < MAX_EPICENTRAL_DISTANCE_TAUC;
+                if (flag_do_tauc && deData->tauc_peak != TAUC_INVALID && !deData->flag_snr_brb_too_low
+                        && (!associate_data || !deData->is_associated || associated_ok)) {
+                    double taucLevel = deData->tauc_peak;
+                    if (taucLevel >= TAUC_LEVEL_MAX - TAUC_LEVEL_STEP)
+                        indexTauc = numTaucLevelTotal - 1;
+                    else if (taucLevel <= TAUC_LEVEL_MIN)
+                        indexTauc = 0;
+                    else
+                        indexTauc = (int) ((taucLevel - TAUC_LEVEL_MIN) / TAUC_LEVEL_STEP);
+                    if (taucLevel >= TAUC_RED_CUTOFF) {
+                        if (taucArray[indexTauc] < 1)
+                            taucArray[indexTauc] += T50EX_MODULO;
+                        if (taucArray[indexTauc] < 127)
+                            taucArray[indexTauc]++;
+                    } else if (taucLevel >= TAUC_YELLOW_CUTOFF) {
+                        if (taucArray[indexTauc] < T50EX_MODULO)
+                            taucArray[indexTauc]++;
+                    } else {
+                        if (taucArray[indexTauc] > -128)
+                            taucArray[indexTauc]--;
+                    }
+                    // add tauc to tauc level statistics array - check associated and distance cutoff
+                    if (!associate_data || associated_ok) {
+                        deData->tauc_used_for_stats = 1; // 20191111 AJL - added
+                        taucStatisticsArray[(deData->is_associated - 1)][0][numTaucLevel[(deData->is_associated - 1)]] = taucLevel;
+                        taucStatisticsArray[(deData->is_associated - 1)][1][numTaucLevel[(deData->is_associated - 1)]] = deData->lat;
+                        taucStatisticsArray[(deData->is_associated - 1)][2][numTaucLevel[(deData->is_associated - 1)]] = deData->lon;
+                        numTaucLevel[(deData->is_associated - 1)]++;
+                        if (numTaucLevel[(deData->is_associated - 1)] > numTaucLevelMax[(deData->is_associated - 1)])
+                            numTaucLevelMax[(deData->is_associated - 1)] = numTaucLevel[(deData->is_associated - 1)];
+                    }
+                }
+                //mwp
+                deData->mwp->used_for_stats = 0; // 20191111 AJL - added
+                int indexMwp = 0;
+                associated_ok = use_associated_data && is_associated_location_P(deData)
+                        && deData->epicentral_distance > MIN_EPICENTRAL_DISTANCE_MWP && deData->epicentral_distance < MAX_EPICENTRAL_DISTANCE_MWP;
+                // 20121119 AJL if (flag_do_mwp && deData->mwp->mag != MWP_INVALID && !deData->flag_snr_brb_too_low
+                if (flag_do_mwp && deData->mwp->mag != MWP_INVALID && !deData->flag_snr_brb_too_low && !deData->flag_snr_brb_int_too_low
+                        && (!associate_data || !deData->is_associated || associated_ok)) {
+                    double mwp_mag = deData->mwp->mag;
+                    if (mwp_mag >= MWP_LEVEL_MAX - MWP_LEVEL_STEP)
+                        indexMwp = numMwpLevelTotal - 1;
+                    else if (mwp_mag <= MWP_LEVEL_MIN)
+                        indexMwp = 0;
+                    else
+                        indexMwp = (int) ((mwp_mag - MWP_LEVEL_MIN) / MWP_LEVEL_STEP);
+#ifdef USE_MWP_LEVEL_ARRAY
+                    if (mwp_mag >= MWP_RED_CUTOFF) {
+                        if (mwpArray[indexMwp] < 1)
+                            mwpArray[indexMwp] += T50EX_MODULO;
+                        if (mwpArray[indexMwp] < 127)
+                            mwpArray[indexMwp]++;
+                    } else if (mwp_mag >= MWP_YELLOW_CUTOFF) {
+                        if (mwpArray[indexMwp] < T50EX_MODULO)
+                            mwpArray[indexMwp]++;
+                    } else {
+                        if (mwpArray[indexMwp] > -128)
+                            mwpArray[indexMwp]--;
+                    }
+#endif
+                    // add mwp to mwp level statistics array - check associated and distance cutoff
+                    if (!associate_data || associated_ok) {
+                        deData->mwp->used_for_stats = 1; // 20191111 AJL - added
+                        mwpStatisticsArray[(deData->is_associated - 1)][0][numMwpLevel[(deData->is_associated - 1)]] = mwp_mag;
+                        mwpStatisticsArray[(deData->is_associated - 1)][1][numMwpLevel[(deData->is_associated - 1)]] = deData->lat;
+                        mwpStatisticsArray[(deData->is_associated - 1)][2][numMwpLevel[(deData->is_associated - 1)]] = deData->lon;
+                        numMwpLevel[(deData->is_associated - 1)]++;
+                        if (numMwpLevel[(deData->is_associated - 1)] > numMwpLevelMax[(deData->is_associated - 1)])
+                            numMwpLevelMax[(deData->is_associated - 1)] = numMwpLevel[(deData->is_associated - 1)];
+                    }
+                }
+                // process parameters without results array and histograms and station colors
+                if (curr_time + TIME_STEP > plot_time_end || curr_time + TIME_STEP > plot_time_max) { // last time step for this deData
+                    // parameters without results array
+                    //mb
+                    deData->mb->used_for_stats = 0; // 20191111 AJL - added
+                    int indexMb = 0;
+                    associated_ok = use_associated_data && is_associated_location_P(deData)
+                            && deData->epicentral_distance > MIN_EPICENTRAL_DISTANCE_MB && deData->epicentral_distance < MAX_EPICENTRAL_DISTANCE_MB;
+                    if (flag_do_mb && deData->mb->mag != MB_INVALID && !deData->flag_snr_brb_bp_too_low
+                            && (!associate_data || !deData->is_associated || associated_ok)) {
+                        double mb_mag = deData->mb->mag;
+                        if (mb_mag >= MB_LEVEL_MAX - MB_LEVEL_STEP)
+                            indexMb = numMbLevelTotal - 1;
+                        else if (mb_mag <= MB_LEVEL_MIN)
+                            indexMb = 0;
+                        else
+                            indexMb = (int) ((mb_mag - MB_LEVEL_MIN) / MB_LEVEL_STEP);
+                        // add mb to mb level statistics array - check associated and distance cutoff
+                        if (!associate_data || associated_ok) {
+                            deData->mb->used_for_stats = 1; // 20191111 AJL - added
+                            mbStatisticsArray[(deData->is_associated - 1)][0][numMbLevel[(deData->is_associated - 1)]] = mb_mag;
+                            mbStatisticsArray[(deData->is_associated - 1)][1][numMbLevel[(deData->is_associated - 1)]] = deData->lat;
+                            mbStatisticsArray[(deData->is_associated - 1)][2][numMbLevel[(deData->is_associated - 1)]] = deData->lon;
+                            numMbLevel[(deData->is_associated - 1)]++;
+                            if (numMbLevel[(deData->is_associated - 1)] > numMbLevelMax[(deData->is_associated - 1)])
+                                numMbLevelMax[(deData->is_associated - 1)] = numMbLevel[(deData->is_associated - 1)];
+                        }
+                    }
+                    //t0
+                    deData->t0->used_for_stats = 0; // 20191111 AJL - added
+                    int indexT0 = 0;
+                    associated_ok = use_associated_data && is_associated_location_P(deData)
+                            && useT0Report(deData);
+                    if (flag_do_t0 && deData->t0->duration_raw != T0_INVALID && !deData->flag_snr_hf_too_low
+                            && (!associate_data || !deData->is_associated || associated_ok)) {
+                        //double t0_dur = deData->t0->duration_raw;
+                        //double depth = 0.0;
+                        //if (deData->is_associated)
+                        //    depth = hyp_assoc_loc[deData->is_associated - 1]->depth;
+                        //double t0_dur = calculate_corrected_duration(deData, depth); // 20111222 TEST AJL - use S duration
+                        double t0_dur = deData->t0->duration_plot;
+                        //if (t0_dur < 0.0)
+                        //    printf("ERROR: deData->t0->duration_plot not set: this should not happen!\n");
+                        if (t0_dur >= T0_LEVEL_MAX - T0_LEVEL_STEP)
+                            indexT0 = numT0LevelTotal - 1;
+                        else if (t0_dur <= T0_LEVEL_MIN)
+                            indexT0 = 0;
+                        else
+                            indexT0 = (int) ((t0_dur - T0_LEVEL_MIN) / T0_LEVEL_STEP);
+                        // add t0 to t0 level statistics array - check associated and distance cutoff
+                        if (!associate_data || associated_ok) {
+                            deData->t0->used_for_stats = 1; // 20191111 AJL - added
+                            t0StatisticsArray[(deData->is_associated - 1)][0][numT0Level[(deData->is_associated - 1)]] = t0_dur;
+                            t0StatisticsArray[(deData->is_associated - 1)][1][numT0Level[(deData->is_associated - 1)]] = deData->lat;
+                            t0StatisticsArray[(deData->is_associated - 1)][2][numT0Level[(deData->is_associated - 1)]] = deData->lon;
+                            numT0Level[(deData->is_associated - 1)]++;
+                            if (numT0Level[(deData->is_associated - 1)] > numT0LevelMax[(deData->is_associated - 1)])
+                                numT0LevelMax[(deData->is_associated - 1)] = numT0Level[(deData->is_associated - 1)];
+                        }
+                    }
+                    // histograms and station colors
+                    // tauc
+                    if (flag_do_tauc && deData->tauc_peak != TAUC_INVALID && !deData->flag_snr_brb_too_low) {
+                        int flag_active_tauc = !associate_data || (use_associated_data && is_associated_location_P(deData)
+                                && (deData->epicentral_distance > MIN_EPICENTRAL_DISTANCE_TAUC && deData->epicentral_distance < MAX_EPICENTRAL_DISTANCE_TAUC));
+                        if (flag_active_tauc) {
+                            (taucHistogram[(deData->is_associated - 1)][indexTauc])++;
+                        }
+                        int not_associated = !deData->is_associated || deData->is_associated == NUMBER_ASSOCIATE_IGNORE;
+                        if (curr_time + TIME_STEP > plot_time_max) { // last time step for this deData overlaps plot time max
+                            double taucLevel = deData->tauc_peak;
+                            if (taucLevel >= TAUC_RED_CUTOFF) {
+                                if (flag_active_tauc)
+                                    fprintf(staTaucRedStream, "%f %f\n", deData->lat, deData->lon);
+                                else if (not_associated)
+                                    fprintf(staTaucLtRedStream, "%f %f\n", deData->lat, deData->lon);
+                            } else if (taucLevel >= TAUC_YELLOW_CUTOFF) {
+                                if (flag_active_tauc)
+                                    fprintf(staTaucYellowStream, "%f %f\n", deData->lat, deData->lon);
+                                else if (not_associated)
+                                    fprintf(staTaucLtYellowStream, "%f %f\n", deData->lat, deData->lon);
+                            } else {
+                                if (flag_active_tauc)
+                                    fprintf(staTaucGreenStream, "%f %f\n", deData->lat, deData->lon);
+                                else if (not_associated)
+                                    fprintf(staTaucLtGreenStream, "%f %f\n", deData->lat, deData->lon);
+                            }
+                        }
+                    }
+                    // 20121119 AJL if (flag_do_mwp && deData->mwp->mag != MWP_INVALID && !deData->flag_snr_brb_too_low) {
+                    if (flag_do_mwp && deData->mwp->mag != MWP_INVALID && !deData->flag_snr_brb_too_low && !deData->flag_snr_brb_int_too_low) {
+                        int flag_active_mwp = !associate_data || (use_associated_data && is_associated_location_P(deData)
+                                && (deData->epicentral_distance > MIN_EPICENTRAL_DISTANCE_MWP && deData->epicentral_distance < MAX_EPICENTRAL_DISTANCE_MWP));
+                        if (flag_active_mwp) {
+                            (mwpHistogram[(deData->is_associated - 1)][indexMwp])++;
+                        }
+                    }
+                    if (flag_do_mb && deData->mb->mag != MB_INVALID && !deData->flag_snr_brb_bp_too_low) {
+                        int flag_active_mb = !associate_data || (use_associated_data && is_associated_location_P(deData)
+                                && (deData->epicentral_distance > MIN_EPICENTRAL_DISTANCE_MB && deData->epicentral_distance < MAX_EPICENTRAL_DISTANCE_MB));
+                        if (flag_active_mb) {
+                            (mbHistogram[(deData->is_associated - 1)][indexMb])++;
+                        }
+                    }
+                    if (flag_do_t0 && deData->t0->duration_raw != T0_INVALID && !deData->flag_snr_hf_too_low) {
+                        int flag_active_t0 = !associate_data || (use_associated_data && is_associated_location_P(deData)
+                                && useT0Report(deData));
+                        if (flag_active_t0) {
+                            (t0Histogram[(deData->is_associated - 1)][indexT0])++;
+                        }
+                    }
+                    if (!deData->flag_snr_hf_too_low) {
+                        int flag_active_t50Ex = !associate_data || (use_associated_data && is_associated_location_P(deData)
+                                && (deData->epicentral_distance > MIN_EPICENTRAL_DISTANCE_WARNING && deData->epicentral_distance < MAX_EPICENTRAL_DISTANCE_WARNING));
+                        if (flag_active_t50Ex) {
+                            (t50ExHistogram[(deData->is_associated - 1)][indexT50])++;
+                        }
+                        int not_associated = !deData->is_associated || deData->is_associated == NUMBER_ASSOCIATE_IGNORE;
+                        if (curr_time + TIME_STEP > plot_time_max) { // last time step for this deData overlaps plot time max
+                            if (t50Level >= T50EX_RED_CUTOFF) {
+                                if (flag_active_t50Ex)
+                                    fprintf(staT50RedStream, "%f %f\n", deData->lat, deData->lon);
+                                else if (not_associated)
+                                    fprintf(staT50LtRedStream, "%f %f\n", deData->lat, deData->lon);
+                            } else if (t50Level >= T50EX_YELLOW_CUTOFF) {
+                                if (flag_active_t50Ex)
+                                    fprintf(staT50YellowStream, "%f %f\n", deData->lat, deData->lon);
+                                else if (not_associated)
+                                    fprintf(staT50LtYellowStream, "%f %f\n", deData->lat, deData->lon);
+                            } else {
+                                if (flag_active_t50Ex)
+                                    fprintf(staT50GreenStream, "%f %f\n", deData->lat, deData->lon);
+                                else if (not_associated)
+                                    fprintf(staT50LtGreenStream, "%f %f\n", deData->lat, deData->lon);
+                            }
+                        }
+                    }
+
+                }
+            }
+        }
+        fwrite(t50ExArray, sizeof (char), numWarningLevelTotal, t50ExGridDataStream);
+        if (flag_do_tauc) {
+            fwrite(taucArray, sizeof (char), numTaucLevelTotal, taucGridDataStrem);
+        }
+#ifdef USE_MWP_LEVEL_ARRAY
+        if (flag_do_mwp) {
+            fwrite(mwpArray, sizeof (char), numMwpLevelTotal, mwpGridDataStrem);
+        }
+#endif
+
+
+        // loop over associated hypocenters, develop statistics ===============================================================
+
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+
+
+            //T50 Level
+            if (numT50ExLevel[nhyp] > 0) {
+                // evaluate and set level statistics
+                setStatistics("T50Ex", t50ExStatisticsArray[nhyp], numT50ExLevel[nhyp], &(t50ExLevelStatistics[nhyp]),
+                        0 && DEBUG && curr_time <= ((time_t) hyp_assoc_loc[nhyp]->otime + LEVEL_PLOT_WINDOW_LENGTH_ASSOCIATED)
+                        && (curr_time + TIME_STEP) > ((time_t) hyp_assoc_loc[nhyp]->otime + LEVEL_PLOT_WINDOW_LENGTH_ASSOCIATED));
+            }
+            //else {
+            //    t50ExLevelStatistics[n].centralValue = t50ExLevelStatistics[n].upperBound = t50ExLevelStatistics[n].lowerBound = 0.0;
+            //}
+            double t50ExCentralValueWrite = t50ExLevelStatistics[nhyp].centralValue > T50EX_LEVEL_MAX_PLOT ? T50EX_LEVEL_MAX_PLOT : t50ExLevelStatistics[nhyp].centralValue;
+            t50ExCentralValueWrite = t50ExCentralValueWrite < T50EX_LEVEL_MIN ? T50EX_LEVEL_MIN : t50ExCentralValueWrite;
+            //
+            double t50ExUpperBoundWrite = t50ExLevelStatistics[nhyp].upperBound > T50EX_LEVEL_MAX_PLOT ? T50EX_LEVEL_MAX_PLOT : t50ExLevelStatistics[nhyp].upperBound;
+            t50ExUpperBoundWrite = t50ExUpperBoundWrite < T50EX_LEVEL_MIN ? T50EX_LEVEL_MIN : t50ExUpperBoundWrite;
+            //
+            double t50ExLowerBoundWrite = t50ExLevelStatistics[nhyp].lowerBound > T50EX_LEVEL_MAX_PLOT ? T50EX_LEVEL_MAX_PLOT : t50ExLevelStatistics[nhyp].lowerBound;
+            t50ExLowerBoundWrite = t50ExLowerBoundWrite < T50EX_LEVEL_MIN ? T50EX_LEVEL_MIN : t50ExLowerBoundWrite;
+            // check for enough T50 levels to plot statistics
+            if (numT50ExLevel[nhyp] >= reportMinNumberValuesUse.t50Ex) {
+                fprintf(t50ExCentralValueStream[nhyp], "%f %f\n", difftime(curr_time, plot_time_max) / 60.0, t50ExCentralValueWrite);
+                fprintf(t50ExUpperBoundStream[nhyp], "%f %f\n", difftime(curr_time, plot_time_max) / 60.0, t50ExUpperBoundWrite);
+                fprintf(t50ExLowerBoundStream[nhyp], "%f %f\n", difftime(curr_time, plot_time_max) / 60.0, t50ExLowerBoundWrite);
+            } else {
+                fprintf(t50ExCentralValueStream[nhyp], ">\n");
+                fprintf(t50ExUpperBoundStream[nhyp], ">\n");
+                fprintf(t50ExLowerBoundStream[nhyp], ">\n");
+            }
+            setLevelString(numT50ExLevelMax[nhyp], &t50ExLevelStatistics[nhyp], t50ExLevelString[nhyp],
+                    reportMinNumberValuesUse.t50Ex, T50EX_RED_CUTOFF, T50EX_YELLOW_CUTOFF, -1.0, warning_colors_show);
+            //
+            //tauc
+            if (flag_do_tauc) {
+                if (numTaucLevel[nhyp] > 0) {
+                    // evaluate and set level statistics
+                    setStatistics("Tauc", taucStatisticsArray[nhyp], numTaucLevel[nhyp], &(taucLevelStatistics[nhyp]),
+                            0 && DEBUG && curr_time <= ((time_t) hyp_assoc_loc[nhyp]->otime + LEVEL_PLOT_WINDOW_LENGTH_ASSOCIATED)
+                            && (curr_time + TIME_STEP) > ((time_t) hyp_assoc_loc[nhyp]->otime + LEVEL_PLOT_WINDOW_LENGTH_ASSOCIATED));
+                }
+                //else {
+                //    taucLevelStatistics[n].centralValue = taucLevelStatistics[n].upperBound = taucLevelStatistics[n].lowerBound = 0.0;
+                //}
+                double taucCentralValueWrite = taucLevelStatistics[nhyp].centralValue > TAUC_LEVEL_MAX_PLOT ? TAUC_LEVEL_MAX_PLOT : taucLevelStatistics[nhyp].centralValue;
+                taucCentralValueWrite = taucCentralValueWrite < TAUC_LEVEL_MIN ? TAUC_LEVEL_MIN : taucCentralValueWrite;
+                //
+                double taucUpperBoundWrite = taucLevelStatistics[nhyp].upperBound > TAUC_LEVEL_MAX_PLOT ? TAUC_LEVEL_MAX_PLOT : taucLevelStatistics[nhyp].upperBound;
+                taucUpperBoundWrite = taucUpperBoundWrite < TAUC_LEVEL_MIN ? TAUC_LEVEL_MIN : taucUpperBoundWrite;
+                //
+                double taucLowerBoundWrite = taucLevelStatistics[nhyp].lowerBound > TAUC_LEVEL_MAX_PLOT ? TAUC_LEVEL_MAX_PLOT : taucLevelStatistics[nhyp].lowerBound;
+                taucLowerBoundWrite = taucLowerBoundWrite < TAUC_LEVEL_MIN ? TAUC_LEVEL_MIN : taucLowerBoundWrite;
+                // check for enough tauc levels to plot statistics
+                if (numTaucLevel[nhyp] >= reportMinNumberValuesUse.tauc) {
+                    fprintf(taucCentralValueStream[nhyp], "%f %f\n", difftime(curr_time, plot_time_max) / 60.0, taucCentralValueWrite);
+                    fprintf(taucUpperBoundStream[nhyp], "%f %f\n", difftime(curr_time, plot_time_max) / 60.0, taucUpperBoundWrite);
+                    fprintf(taucLowerBoundStream[nhyp], "%f %f\n", difftime(curr_time, plot_time_max) / 60.0, taucLowerBoundWrite);
+                } else {
+                    fprintf(taucCentralValueStream[nhyp], ">\n");
+                    fprintf(taucUpperBoundStream[nhyp], ">\n");
+                    fprintf(taucLowerBoundStream[nhyp], ">\n");
+                }
+                setLevelString(numTaucLevelMax[nhyp], &taucLevelStatistics[nhyp], taucLevelString[nhyp],
+                        reportMinNumberValuesUse.tauc, TAUC_RED_CUTOFF, TAUC_YELLOW_CUTOFF, -1.0, warning_colors_show);
+                //
+                // TdT50Ex level
+                // NOTE: number of alarm levels is lessor of number t50 or tauc levels, this value has no statistical meaning with regards to alarm level.
+                numTdT50ExLevel[nhyp] = IMIN(numT50ExLevel[nhyp], numTaucLevel[nhyp]);
+                numTdT50ExLevelMax[nhyp] = IMIN(numT50ExLevelMax[nhyp], numTaucLevelMax[nhyp]);
+                // TODO: Is it correct statistics to simply multiply central and bound values?
+                /*if (numTdT50ExLevel[nhyp] >= reportMinNumberValuesUse.MIN_NUMBER_VALUES_USE && numTaucLevel[nhyp] >= reportMinNumberValuesUse.MIN_NUMBER_VALUES_USE) {
+                    tdT50ExLevelStatistics[nhyp].centralValue = t50ExLevelStatistics[nhyp].centralValue * taucLevelStatistics[nhyp].centralValue;
+                    tdT50ExLevelStatistics[nhyp].lowerBound = t50ExLevelStatistics[nhyp].lowerBound * taucLevelStatistics[nhyp].lowerBound;
+                    tdT50ExLevelStatistics[nhyp].upperBound = t50ExLevelStatistics[nhyp].upperBound * taucLevelStatistics[nhyp].upperBound;
+                }*/
+                if (numTdT50ExLevel[nhyp] >= reportMinNumberValuesUse.tdT50Ex) {
+                    tdT50ExLevelStatistics[nhyp].centralValue = t50ExLevelStatistics[nhyp].centralValue * taucLevelStatistics[nhyp].centralValue;
+                    tdT50ExLevelStatistics[nhyp].lowerBound = tdT50ExLevelStatistics[nhyp].centralValue
+                            - stdDevProductNormalDist(t50ExLevelStatistics[nhyp].centralValue, t50ExLevelStatistics[nhyp].centralValue - t50ExLevelStatistics[nhyp].lowerBound,
+                            taucLevelStatistics[nhyp].centralValue, taucLevelStatistics[nhyp].centralValue - taucLevelStatistics[nhyp].lowerBound);
+                    tdT50ExLevelStatistics[nhyp].upperBound = tdT50ExLevelStatistics[nhyp].centralValue
+                            + stdDevProductNormalDist(t50ExLevelStatistics[nhyp].centralValue, t50ExLevelStatistics[nhyp].upperBound - t50ExLevelStatistics[nhyp].centralValue,
+                            taucLevelStatistics[nhyp].centralValue, taucLevelStatistics[nhyp].upperBound - taucLevelStatistics[nhyp].centralValue);
+                    tdT50ExLevelStatistics[nhyp].numLevel = numTdT50ExLevel[nhyp];
+                }
+                //
+                double tdT50ExCentralValueWrite = tdT50ExLevelStatistics[nhyp].centralValue > TDT50EX_LEVEL_MAX_PLOT ? TDT50EX_LEVEL_MAX_PLOT : tdT50ExLevelStatistics[nhyp].centralValue;
+                tdT50ExCentralValueWrite = tdT50ExCentralValueWrite < TDT50EX_LEVEL_MIN ? TDT50EX_LEVEL_MIN : tdT50ExCentralValueWrite;
+                //
+                double tdT50ExUpperBoundWrite = tdT50ExLevelStatistics[nhyp].upperBound > TDT50EX_LEVEL_MAX_PLOT ? TDT50EX_LEVEL_MAX_PLOT : tdT50ExLevelStatistics[nhyp].upperBound;
+                tdT50ExUpperBoundWrite = tdT50ExUpperBoundWrite < TDT50EX_LEVEL_MIN ? TDT50EX_LEVEL_MIN : tdT50ExUpperBoundWrite;
+                //
+                double tdT50ExLowerBoundWrite = tdT50ExLevelStatistics[nhyp].lowerBound > TDT50EX_LEVEL_MAX_PLOT ? TDT50EX_LEVEL_MAX_PLOT : tdT50ExLevelStatistics[nhyp].lowerBound;
+                tdT50ExLowerBoundWrite = tdT50ExLowerBoundWrite < TDT50EX_LEVEL_MIN ? TDT50EX_LEVEL_MIN : tdT50ExLowerBoundWrite;
+                // check for enough alarm levels to plot statistics
+                if (numTdT50ExLevel[nhyp] >= reportMinNumberValuesUse.tdT50Ex) {
+                    fprintf(tdT50ExCentralValueStream[nhyp], "%f %f\n", difftime(curr_time, plot_time_max) / 60.0, tdT50ExCentralValueWrite);
+                    fprintf(tdT50ExUpperBoundStream[nhyp], "%f %f\n", difftime(curr_time, plot_time_max) / 60.0, tdT50ExUpperBoundWrite);
+                    fprintf(tdT50ExLowerBoundStream[nhyp], "%f %f\n", difftime(curr_time, plot_time_max) / 60.0, tdT50ExLowerBoundWrite);
+                } else {
+                    fprintf(tdT50ExCentralValueStream[nhyp], ">\n");
+                    fprintf(tdT50ExUpperBoundStream[nhyp], ">\n");
+                    fprintf(tdT50ExLowerBoundStream[nhyp], ">\n");
+                }
+                setLevelString(numTdT50ExLevelMax[nhyp], &tdT50ExLevelStatistics[nhyp], warningLevelString[nhyp],
+                        reportMinNumberValuesUse.t50Ex, TDT50EX_RED_CUTOFF, TDT50EX_YELLOW_CUTOFF, -1.0, warning_colors_show);
+            }
+            //
+            if (flag_do_mwp) {
+                //
+                //mwp
+                // 20211118  TODO: check here if numMwpLevel / nStaAvailable exceeds cutoff
+                if (0) {
+                    numMwpLevel[nhyp] = 0;
+                }
+                if (numMwpLevel[nhyp] > 0) {
+                    // evaluate and set level statistics
+                    setStatistics("Mwp", mwpStatisticsArray[nhyp], numMwpLevel[nhyp], &(mwpLevelStatistics[nhyp]),
+                            0 && DEBUG && curr_time <= ((time_t) hyp_assoc_loc[nhyp]->otime + LEVEL_PLOT_WINDOW_LENGTH_ASSOCIATED)
+                            && (curr_time + TIME_STEP) > ((time_t) hyp_assoc_loc[nhyp]->otime + LEVEL_PLOT_WINDOW_LENGTH_ASSOCIATED));
+                }
+                //else {
+                //    mwpLevelStatistics[n].centralValue = mwpLevelStatistics[n].upperBound = mwpLevelStatistics[n].lowerBound = 0.0;
+                //}
+                double mwpCentralValueWrite = mwpLevelStatistics[nhyp].centralValue > MWP_LEVEL_MAX_PLOT ? MWP_LEVEL_MAX_PLOT : mwpLevelStatistics[nhyp].centralValue;
+                mwpCentralValueWrite = mwpCentralValueWrite < MWP_LEVEL_MIN ? MWP_LEVEL_MIN : mwpCentralValueWrite;
+                //
+                double mwpUpperBoundWrite = mwpLevelStatistics[nhyp].upperBound > MWP_LEVEL_MAX_PLOT ? MWP_LEVEL_MAX_PLOT : mwpLevelStatistics[nhyp].upperBound;
+                mwpUpperBoundWrite = mwpUpperBoundWrite < MWP_LEVEL_MIN ? MWP_LEVEL_MIN : mwpUpperBoundWrite;
+                //
+                double mwpLowerBoundWrite = mwpLevelStatistics[nhyp].lowerBound > MWP_LEVEL_MAX_PLOT ? MWP_LEVEL_MAX_PLOT : mwpLevelStatistics[nhyp].lowerBound;
+                mwpLowerBoundWrite = mwpLowerBoundWrite < MWP_LEVEL_MIN ? MWP_LEVEL_MIN : mwpLowerBoundWrite;
+#ifdef USE_MWP_LEVEL_ARRAY
+                // check for enough mwp levels to plot statistics
+                if (numMwpLevel[nhyp] >= reportMinNumberValuesUse.MIN_NUMBER_VALUES_USE) {
+                    fprintf(mwpCentralValueStream[nhyp], "%f %f\n", difftime(curr_time, plot_time_max) / 60.0, mwpCentralValueWrite);
+                    fprintf(mwpUpperBoundStream[nhyp], "%f %f\n", difftime(curr_time, plot_time_max) / 60.0, mwpUpperBoundWrite);
+                    fprintf(mwpLowerBoundStream[nhyp], "%f %f\n", difftime(curr_time, plot_time_max) / 60.0, mwpLowerBoundWrite);
+                } else {
+                    fprintf(mwpCentralValueStream[nhyp], ">\n");
+                    fprintf(mwpUpperBoundStream[nhyp], ">\n");
+                    fprintf(mwpLowerBoundStream[nhyp], ">\n");
+                }
+#endif
+                //
+                setLevelString(numMwpLevelMax[nhyp], &mwpLevelStatistics[nhyp], mwpLevelString[nhyp],
+                        reportMinNumberValuesUse.mwp, MWP_RED_CUTOFF, MWP_YELLOW_CUTOFF, MWP_INVALID, magnitude_colors_show);
+                //
+            }
+        }
+        curr_time += TIME_STEP;
+
+    }
+    //
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        fclose_counter(pickStreamAssoc[nhyp]);
+        fclose_counter(staAssociatedStream[nhyp]);
+#ifdef USE_JSON_OUTPUT
+        if (save_plotfiles_geojson) {
+            // GeoJSON 20211130
+            snprintf(outname, STANDARD_STRLEN, "%s.json", staAssociatedStream_name[nhyp]);
+            int ncolumns = 2;
+            char *columns[] = {GEOJSON_LAT, GEOJSON_LON};
+            int nproperties = 1;
+            char *properties[] = {"name"};
+            char *values[] = {"staAssociated"};
+            writeGeoJSONcopyOftable(staAssociatedStream_name[nhyp], ncolumns, columns, nproperties, properties, values, " ", GEOJSON_MultiPoint, outname);
+        }
+#endif
+    }
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        fclose_counter(t50ExCentralValueStream[nhyp]);
+        fclose_counter(t50ExUpperBoundStream[nhyp]);
+        fclose_counter(t50ExLowerBoundStream[nhyp]);
+    }
+    if (flag_do_tauc) {
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            fclose_counter(taucCentralValueStream[nhyp]);
+            fclose_counter(taucUpperBoundStream[nhyp]);
+            fclose_counter(taucLowerBoundStream[nhyp]);
+            fclose_counter(tdT50ExCentralValueStream[nhyp]);
+            fclose_counter(tdT50ExUpperBoundStream[nhyp]);
+            fclose_counter(tdT50ExLowerBoundStream[nhyp]);
+        }
+    }
+#ifdef USE_MWP_LEVEL_ARRAY
+    if (flag_do_mwp) {
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            fclose_counter(mwpCentralValueStream[nhyp]);
+            fclose_counter(mwpUpperBoundStream[nhyp]);
+            fclose_counter(mwpLowerBoundStream[nhyp]);
+        }
+    }
+#endif
+    fclose_counter(staT50RedStream);
+    fclose_counter(staT50YellowStream);
+    fclose_counter(staT50GreenStream);
+    fclose_counter(staT50LtRedStream);
+    fclose_counter(staT50LtYellowStream);
+    fclose_counter(staT50LtGreenStream);
+    fclose_counter(staTaucRedStream);
+    fclose_counter(staTaucYellowStream);
+    fclose_counter(staTaucGreenStream);
+    fclose_counter(staTaucLtRedStream);
+    fclose_counter(staTaucLtYellowStream);
+    fclose_counter(staTaucLtGreenStream);
+#ifdef USE_JSON_OUTPUT
+    if (save_plotfiles_geojson) {
+        // GeoJSON 20211130
+        snprintf(outname, STANDARD_STRLEN, "%s.json", staT50Red_name);
+        int ncolumns = 2;
+        char *columns[] = {GEOJSON_LAT, GEOJSON_LON};
+        int nproperties = 1;
+        char *properties[] = {"name"};
+        char *values[] = {"staT50Red"};
+        writeGeoJSONcopyOftable(staT50Red_name, ncolumns, columns, nproperties, properties, values, " ", GEOJSON_MultiPoint, outname);
+    }
+    if (save_plotfiles_geojson) {
+        // GeoJSON 20211130
+        snprintf(outname, STANDARD_STRLEN, "%s.json", staT50Yellow_name);
+        int ncolumns = 2;
+        char *columns[] = {GEOJSON_LAT, GEOJSON_LON};
+        int nproperties = 1;
+        char *properties[] = {"name"};
+        char *values[] = {"staT50Yellow"};
+        writeGeoJSONcopyOftable(staT50Yellow_name, ncolumns, columns, nproperties, properties, values, " ", GEOJSON_MultiPoint, outname);
+    }
+    if (save_plotfiles_geojson) {
+        // GeoJSON 20211130
+        snprintf(outname, STANDARD_STRLEN, "%s.json", staT50Green_name);
+        int ncolumns = 2;
+        char *columns[] = {GEOJSON_LAT, GEOJSON_LON};
+        int nproperties = 1;
+        char *properties[] = {"name"};
+        char *values[] = {"staT50Green"};
+        writeGeoJSONcopyOftable(staT50Green_name, ncolumns, columns, nproperties, properties, values, " ", GEOJSON_MultiPoint, outname);
+    }
+    if (save_plotfiles_geojson) {
+        // GeoJSON 20211130
+        snprintf(outname, STANDARD_STRLEN, "%s.json", staT50LtRed_name);
+        int ncolumns = 2;
+        char *columns[] = {GEOJSON_LAT, GEOJSON_LON};
+        int nproperties = 1;
+        char *properties[] = {"name"};
+        char *values[] = {"staT50LtRed"};
+        writeGeoJSONcopyOftable(staT50LtRed_name, ncolumns, columns, nproperties, properties, values, " ", GEOJSON_MultiPoint, outname);
+    }
+    if (save_plotfiles_geojson) {
+        // GeoJSON 20211130
+        snprintf(outname, STANDARD_STRLEN, "%s.json", staT50LtYellow_name);
+        int ncolumns = 2;
+        char *columns[] = {GEOJSON_LAT, GEOJSON_LON};
+        int nproperties = 1;
+        char *properties[] = {"name"};
+        char *values[] = {"staT50LtYellow"};
+        writeGeoJSONcopyOftable(staT50LtYellow_name, ncolumns, columns, nproperties, properties, values, " ", GEOJSON_MultiPoint, outname);
+    }
+    if (save_plotfiles_geojson) {
+        // GeoJSON 20211130
+        snprintf(outname, STANDARD_STRLEN, "%s.json", staT50LtGreen_name);
+        int ncolumns = 2;
+        char *columns[] = {GEOJSON_LAT, GEOJSON_LON};
+        int nproperties = 1;
+        char *properties[] = {"name"};
+        char *values[] = {"staT50LtGreen"};
+        writeGeoJSONcopyOftable(staT50LtGreen_name, ncolumns, columns, nproperties, properties, values, " ", GEOJSON_MultiPoint, outname);
+    }
+    if (save_plotfiles_geojson) {
+        // GeoJSON 20211130
+        snprintf(outname, STANDARD_STRLEN, "%s.json", staTaucRed_name);
+        int ncolumns = 2;
+        char *columns[] = {GEOJSON_LAT, GEOJSON_LON};
+        int nproperties = 1;
+        char *properties[] = {"name"};
+        char *values[] = {"staTaucRed"};
+        writeGeoJSONcopyOftable(staTaucRed_name, ncolumns, columns, nproperties, properties, values, " ", GEOJSON_MultiPoint, outname);
+    }
+    if (save_plotfiles_geojson) {
+        // GeoJSON 20211130
+        snprintf(outname, STANDARD_STRLEN, "%s.json", staTaucYellow_name);
+        int ncolumns = 2;
+        char *columns[] = {GEOJSON_LAT, GEOJSON_LON};
+        int nproperties = 1;
+        char *properties[] = {"name"};
+        char *values[] = {"staTaucYellow"};
+        writeGeoJSONcopyOftable(staTaucYellow_name, ncolumns, columns, nproperties, properties, values, " ", GEOJSON_MultiPoint, outname);
+    }
+    if (save_plotfiles_geojson) {
+        // GeoJSON 20211130
+        snprintf(outname, STANDARD_STRLEN, "%s.json", staTaucGreen_name);
+        int ncolumns = 2;
+        char *columns[] = {GEOJSON_LAT, GEOJSON_LON};
+        int nproperties = 1;
+        char *properties[] = {"name"};
+        char *values[] = {"staTaucGreen"};
+        writeGeoJSONcopyOftable(staTaucGreen_name, ncolumns, columns, nproperties, properties, values, " ", GEOJSON_MultiPoint, outname);
+    }
+    if (save_plotfiles_geojson) {
+        // GeoJSON 20211130
+        snprintf(outname, STANDARD_STRLEN, "%s.json", staTaucLtRed_name);
+        int ncolumns = 2;
+        char *columns[] = {GEOJSON_LAT, GEOJSON_LON};
+        int nproperties = 1;
+        char *properties[] = {"name"};
+        char *values[] = {"staTaucLtRed"};
+        writeGeoJSONcopyOftable(staTaucLtRed_name, ncolumns, columns, nproperties, properties, values, " ", GEOJSON_MultiPoint, outname);
+    }
+    if (save_plotfiles_geojson) {
+        // GeoJSON 20211130
+        snprintf(outname, STANDARD_STRLEN, "%s.json", staTaucLtYellow_name);
+        int ncolumns = 2;
+        char *columns[] = {GEOJSON_LAT, GEOJSON_LON};
+        int nproperties = 1;
+        char *properties[] = {"name"};
+        char *values[] = {"staTaucLtYellow"};
+        writeGeoJSONcopyOftable(staTaucLtYellow_name, ncolumns, columns, nproperties, properties, values, " ", GEOJSON_MultiPoint, outname);
+    }
+    if (save_plotfiles_geojson) {
+        // GeoJSON 20211130
+        snprintf(outname, STANDARD_STRLEN, "%s.json", staTaucLtGreen_name);
+        int ncolumns = 2;
+        char *columns[] = {GEOJSON_LAT, GEOJSON_LON};
+        int nproperties = 1;
+        char *properties[] = {"name"};
+        char *values[] = {"staTaucLtGreen"};
+        writeGeoJSONcopyOftable(staTaucLtGreen_name, ncolumns, columns, nproperties, properties, values, " ", GEOJSON_MultiPoint, outname);
+    }
+#endif
+
+
+
+    // loop over associated hypocenters, develop statistics ===============================================================
+
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+
+        //
+        if (flag_do_mb) {
+            //
+            //mb
+            if (numMbLevelMax[nhyp] > 0) {
+                // evaluate and set level statistics
+                setStatistics("Mb", mbStatisticsArray[nhyp], numMbLevelMax[nhyp], &(mbLevelStatistics[nhyp]),
+                        0 && DEBUG && curr_time <= ((time_t) hyp_assoc_loc[nhyp]->otime + LEVEL_PLOT_WINDOW_LENGTH_ASSOCIATED)
+                        && (curr_time + TIME_STEP) > ((time_t) hyp_assoc_loc[nhyp]->otime + LEVEL_PLOT_WINDOW_LENGTH_ASSOCIATED));
+            }
+            setLevelString(numMbLevelMax[nhyp], &mbLevelStatistics[nhyp], mbLevelString[nhyp],
+                    reportMinNumberValuesUse.mb, MB_RED_CUTOFF, MB_YELLOW_CUTOFF, MB_INVALID, magnitude_colors_show);
+        }
+        //
+        if (flag_do_t0) {
+            //
+            //t0
+            if (numT0LevelMax[nhyp] > 0) {
+                // evaluate and set level statistics
+                setStatistics("T0", t0StatisticsArray[nhyp], numT0LevelMax[nhyp], &(t0LevelStatistics[nhyp]),
+                        0 && DEBUG && curr_time <= ((time_t) hyp_assoc_loc[nhyp]->otime + LEVEL_PLOT_WINDOW_LENGTH_ASSOCIATED)
+                        && (curr_time + TIME_STEP) > ((time_t) hyp_assoc_loc[nhyp]->otime + LEVEL_PLOT_WINDOW_LENGTH_ASSOCIATED));
+            }
+            setLevelString(numT0LevelMax[nhyp], &t0LevelStatistics[nhyp], t0LevelString[nhyp],
+                    reportMinNumberValuesUse.t0, T0_RED_CUTOFF, T0_YELLOW_CUTOFF, T0_INVALID, warning_colors_show);
+            //
+        }
+        //
+
+        // do Mwpd processing - must  be done outside main loops above because depends on T0 statistics
+        if (flag_do_mwpd) {
+
+            // loop over data
+            int ndata;
+            for (ndata = 0; ndata < num_de_data; ndata++) {
+                // skip if not associated with this hypocenter
+                TimedomainProcessingData* deData = data_list[ndata];
+                if (deData->is_associated - 1 != nhyp)
+                    continue;
+                // skip if possible clip in data time span or if HF or BRB s/n ratio too low
+                // AJL 20100224
+                //if (deData->flag_clipped || deData->flag_snr_hf_too_low || deData->flag_a_ref_not_ok)
+                if (deData->flag_clipped || deData->flag_non_contiguous || (!USE_AREF_NOT_OK_BRB_PICKS_FOR_LOCATION && deData->flag_a_ref_not_ok
+                        // 20210929 AJL - Allow brb picks in prev coda (flag_a_ref_not_ok) if sn_brb OK. May avoid loosing correct BRB picks after early HF pick.
+                        && (!USE_AREF_NOT_OK_PICKS_FOR_LOCATION_IF_SNR_BRB_OK || !(deData->pick_stream == STREAM_RAW) || deData->flag_snr_brb_too_low)))
+                    continue;
+                // skip if data not used for location and not associated
+                // AJL 20100630
+                if (!deData->use_for_location && !(use_associated_data && is_associated_phase(deData)))
+                    continue;
+                // skip if not completed
+                if (!deData->flag_complete_t50)
+                    continue;
+                //mwpd
+                deData->mwpd->used_for_stats = 0; // 20191111 AJL - added
+                int indexMwpd = 0;
+                int associated_ok = use_associated_data && is_associated_location_P(deData);
+                if (flag_do_mwpd && deData->mwpd->raw_mag != MWPD_INVALID && !deData->flag_snr_brb_too_low && !deData->flag_snr_brb_int_too_low) {// 20120612 AJL - changed s/n check from brb vel to brb disp (brb int)
+                    if (!associate_data || !deData->is_associated || associated_ok) {
+                        // 20110316 AJL - added taucLevelStatistics, checks against reportMinNumberValuesUse.MIN_NUMBER_VALUES_USE
+                        // 20121218 AJL - bug fix
+                        /*double mwpd_corr_mag = calculate_corrected_Mwpd_Mag(deData->mwpd->raw_mag,
+                                t0LevelStatistics[nhyp].centralValue >= reportMinNumberValuesUse.MIN_NUMBER_VALUES_USE ? t0LevelStatistics[nhyp].centralValue : T0_INVALID,
+                                taucLevelStatistics[nhyp].centralValue >= reportMinNumberValuesUse.MIN_NUMBER_VALUES_USE ? taucLevelStatistics[nhyp].centralValue : T0_INVALID,
+                                hyp_assoc_loc[nhyp]->depth);*/
+                        double mwpd_corr_mag = calculate_corrected_Mwpd_Mag(deData->mwpd->raw_mag,
+                                t0LevelStatistics[nhyp].numLevel >= reportMinNumberValuesUse.t0 ? t0LevelStatistics[nhyp].centralValue : T0_INVALID,
+                                taucLevelStatistics[nhyp].numLevel >= reportMinNumberValuesUse.tauc ? taucLevelStatistics[nhyp].centralValue : TAUC_INVALID,
+                                hyp_assoc_loc[nhyp]->depth);
+                        deData->mwpd->corr_mag = mwpd_corr_mag;
+                        if (deData->epicentral_distance > MIN_EPICENTRAL_DISTANCE_MWPD && deData->epicentral_distance < MAX_EPICENTRAL_DISTANCE_MWPD
+                                && useT0Report(deData) // 20120416 AJL
+                                ) {
+                            if (mwpd_corr_mag >= MWPD_LEVEL_MAX - MWPD_LEVEL_STEP)
+                                indexMwpd = numMwpdLevelTotal - 1;
+                            else if (mwpd_corr_mag <= MWPD_LEVEL_MIN)
+                                indexMwpd = 0;
+                            else
+                                indexMwpd = (int) ((mwpd_corr_mag - MWPD_LEVEL_MIN) / MWPD_LEVEL_STEP);
+                            // add mwpd to mwpd level statistics array - check associated and distance cutoff
+                            if (!associate_data || associated_ok) {
+                                deData->mwpd->used_for_stats = 1; // 20191111 AJL - added
+                                mwpdStatisticsArray[(deData->is_associated - 1)][0][numMwpdLevel[(deData->is_associated - 1)]] = mwpd_corr_mag;
+                                // 20110322 AJL - TEST making Mwpd corr after averaging - seems to make no difference to result
+                                //mwpdStatisticsArray[(deData->is_associated - 1)][0][numMwpdLevel[(deData->is_associated - 1)]] = deData->mwpd->raw_mag;
+                                mwpdStatisticsArray[(deData->is_associated - 1)][1][numMwpdLevel[(deData->is_associated - 1)]] = deData->lat;
+                                mwpdStatisticsArray[(deData->is_associated - 1)][2][numMwpdLevel[(deData->is_associated - 1)]] = deData->lon;
+                                numMwpdLevel[(deData->is_associated - 1)]++;
+                                if (numMwpdLevel[(deData->is_associated - 1)] > numMwpdLevelMax[(deData->is_associated - 1)])
+                                    numMwpdLevelMax[(deData->is_associated - 1)] = numMwpdLevel[(deData->is_associated - 1)];
+#ifdef USE_MWP_MO_POS_NEG
+                                if (deData->mwpd->mo_pos_neg_ratio > 0.0) {
+                                    mwpdMoPosNegStatisticsArray[(deData->is_associated - 1)][0][numMwpdMoPosNegLevel[(deData->is_associated - 1)]] = deData->mwpd->mo_pos_neg_ratio;
+                                    mwpdMoPosNegStatisticsArray[(deData->is_associated - 1)][1][numMwpdMoPosNegLevel[(deData->is_associated - 1)]] = deData->lat;
+                                    mwpdMoPosNegStatisticsArray[(deData->is_associated - 1)][2][numMwpdMoPosNegLevel[(deData->is_associated - 1)]] = deData->lon;
+                                    numMwpdMoPosNegLevel[(deData->is_associated - 1)]++;
+                                    if (numMwpdMoPosNegLevel[(deData->is_associated - 1)] > numMwpdMoPosNegLevelMax[(deData->is_associated - 1)])
+                                        numMwpdMoPosNegLevelMax[(deData->is_associated - 1)] = numMwpdMoPosNegLevel[(deData->is_associated - 1)];
+                                }
+#endif
+                            }
+                            (mwpdHistogram[(deData->is_associated - 1)][indexMwpd])++;
+                        }
+                    }
+                    //int flag_active_mwpd = !associate_data || associated_ok;
+                    //if (flag_active_mwpd) {
+                    //    (mwpdHistogram[(deData->is_associated - 1)][indexMwpd])++;
+                    //}
+                }
+            }
+            //
+            //mwpd
+            if (numMwpdLevelMax[nhyp] > 0) {
+                // evaluate and set level statistics
+                setStatistics("Mwpd", mwpdStatisticsArray[nhyp], numMwpdLevelMax[nhyp], &(mwpdLevelStatistics[nhyp]),
+                        0 && DEBUG && curr_time <= ((time_t) hyp_assoc_loc[nhyp]->otime + LEVEL_PLOT_WINDOW_LENGTH_ASSOCIATED)
+                        && (curr_time + TIME_STEP) > ((time_t) hyp_assoc_loc[nhyp]->otime + LEVEL_PLOT_WINDOW_LENGTH_ASSOCIATED));
+                // 20110322 AJL - TEST making Mwpd corr after averaging - seems to make no difference to result
+                /*
+                mwpdLevelStatistics[nhyp].centralValue = calculate_corrected_Mwpd_Mag(mwpdLevelStatistics[nhyp].centralValue,
+                        t0LevelStatistics[nhyp].centralValue >= reportMinNumberValuesUse.MIN_NUMBER_VALUES_USE ? t0LevelStatistics[nhyp].centralValue : T0_INVALID,
+                        taucLevelStatistics[nhyp].centralValue >= reportMinNumberValuesUse.MIN_NUMBER_VALUES_USE ? taucLevelStatistics[nhyp].centralValue : T0_INVALID,
+                        hyp_assoc_loc[nhyp]->depth);
+                mwpdLevelStatistics[nhyp].lowerBound = calculate_corrected_Mwpd_Mag(mwpdLevelStatistics[nhyp].lowerBound,
+                        t0LevelStatistics[nhyp].centralValue >= reportMinNumberValuesUse.MIN_NUMBER_VALUES_USE ? t0LevelStatistics[nhyp].centralValue : T0_INVALID,
+                        taucLevelStatistics[nhyp].centralValue >= reportMinNumberValuesUse.MIN_NUMBER_VALUES_USE ? taucLevelStatistics[nhyp].centralValue : T0_INVALID,
+                        hyp_assoc_loc[nhyp]->depth);
+                mwpdLevelStatistics[nhyp].upperBound = calculate_corrected_Mwpd_Mag(mwpdLevelStatistics[nhyp].upperBound,
+                        t0LevelStatistics[nhyp].centralValue >= reportMinNumberValuesUse.MIN_NUMBER_VALUES_USE ? t0LevelStatistics[nhyp].centralValue : T0_INVALID,
+                        taucLevelStatistics[nhyp].centralValue >= reportMinNumberValuesUse.MIN_NUMBER_VALUES_USE ? taucLevelStatistics[nhyp].centralValue : T0_INVALID,
+                        hyp_assoc_loc[nhyp]->depth);*/
+
+            }
+            int nLevels = numMwpdLevelMax[nhyp];
+            // check if Mwpd below minimum value
+            if (mwpdLevelStatistics[nhyp].centralValue < MWPD_MIN_VALUE_USE)
+                nLevels = -1; // force grey color
+            setLevelString(nLevels, &mwpdLevelStatistics[nhyp], mwpdLevelString[nhyp],
+                    reportMinNumberValuesUse.mwpd, MWPD_RED_CUTOFF, MWPD_YELLOW_CUTOFF, MWPD_INVALID, magnitude_colors_show);
+            //
+#ifdef USE_MWP_MO_POS_NEG
+            if (numMwpdMoPosNegLevelMax[nhyp] > 0) {
+                // evaluate and set level statistics
+                setStatistics("MwpdMoPosNeg", mwpdMoPosNegStatisticsArray[nhyp], numMwpdMoPosNegLevelMax[nhyp], &(mwpdMoPosNegLevelStatistics[nhyp]),
+                        0 && DEBUG && curr_time <= ((time_t) hyp_assoc_loc[nhyp]->otime + LEVEL_PLOT_WINDOW_LENGTH_ASSOCIATED)
+                        && (curr_time + TIME_STEP) > ((time_t) hyp_assoc_loc[nhyp]->otime + LEVEL_PLOT_WINDOW_LENGTH_ASSOCIATED));
+            }
+#endif
+        }
+
+
+        // fill histograms
+
+        FILE * t50ExHistorgramStream[num_hypocenters_associated];
+        FILE * taucHistorgramStream[num_hypocenters_associated];
+        FILE * mwpHistorgramStream[num_hypocenters_associated];
+        FILE * mbHistorgramStream[num_hypocenters_associated];
+        FILE * t0HistorgramStream[num_hypocenters_associated];
+        FILE * mwpdHistorgramStream[num_hypocenters_associated];
+        // GMT style
+        snprintf(outname, STANDARD_STRLEN, "%s/plot/t50.%d.hist", outnameroot, nhyp);
+        if (verbose > 2)
+            printf("Opening output file: %s\n", outname);
+        t50ExHistorgramStream[nhyp] = fopen_counter(outname, "w");
+        if (t50ExHistorgramStream[nhyp] == NULL) {
+            snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+            perror(tmp_str);
+            return (-1);
+        }
+        if (flag_do_tauc) {
+            // histogram
+            snprintf(outname, STANDARD_STRLEN, "%s/plot/tauc.%d.hist", outnameroot, nhyp);
+            if (verbose > 2)
+                printf("Opening output file: %s\n", outname);
+            taucHistorgramStream[nhyp] = fopen_counter(outname, "w");
+            if (taucHistorgramStream[nhyp] == NULL) {
+                snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+                perror(tmp_str);
+                return (-1);
+            }
+        }
+        char mwpHistorgram_outname[1024];
+        if (flag_do_mwp) {
+            // histogram
+            snprintf(outname, STANDARD_STRLEN, "%s/plot/mwp.%d.hist", outnameroot, nhyp);
+            if (verbose > 2)
+                printf("Opening output file: %s\n", outname);
+            mwpHistorgramStream[nhyp] = fopen_counter(outname, "w");
+            if (mwpHistorgramStream[nhyp] == NULL) {
+                snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+                perror(tmp_str);
+                return (-1);
+            }
+            strcpy(mwpHistorgram_outname, outname);
+        }
+        if (flag_do_mb) {
+            // histogram
+            snprintf(outname, STANDARD_STRLEN, "%s/plot/mb.%d.hist", outnameroot, nhyp);
+            if (verbose > 2)
+                printf("Opening output file: %s\n", outname);
+            mbHistorgramStream[nhyp] = fopen_counter(outname, "w");
+            if (mbHistorgramStream[nhyp] == NULL) {
+                snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+                perror(tmp_str);
+                return (-1);
+            }
+        }
+        if (flag_do_t0) {
+            // histogram
+            snprintf(outname, STANDARD_STRLEN, "%s/plot/t0.%d.hist", outnameroot, nhyp);
+            if (verbose > 2)
+                printf("Opening output file: %s\n", outname);
+            t0HistorgramStream[nhyp] = fopen_counter(outname, "w");
+            if (t0HistorgramStream[nhyp] == NULL) {
+                snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+                perror(tmp_str);
+                return (-1);
+            }
+        }
+        if (flag_do_mwpd) {
+            // histogram
+            snprintf(outname, STANDARD_STRLEN, "%s/plot/mwpd.%d.hist", outnameroot, nhyp);
+            if (verbose > 2)
+                printf("Opening output file: %s\n", outname);
+            mwpdHistorgramStream[nhyp] = fopen_counter(outname, "w");
+            if (mwpdHistorgramStream[nhyp] == NULL) {
+                snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+                perror(tmp_str);
+                return (-1);
+            }
+        }
+
+        // histograms
+        double level = T50EX_LEVEL_MIN;
+        for (int m = 0; m < numWarningLevelTotal; m++) {
+            int num = t50ExHistogram[nhyp][m];
+            for (int m = 0; m < num; m++)
+                fprintf(t50ExHistorgramStream[nhyp], " %f\n", level + 0.001);
+            level += T50EX_LEVEL_STEP;
+        }
+        if (flag_do_tauc) {
+            level = TAUC_LEVEL_MIN;
+            for (int m = 0; m < numTaucLevelTotal; m++) {
+                int num = taucHistogram[nhyp][m];
+                for (int m = 0; m < num; m++)
+                    fprintf(taucHistorgramStream[nhyp], " %f\n", level + 0.001);
+                level += TAUC_LEVEL_STEP;
+            }
+        }
+        if (flag_do_mwp) {
+            level = MWP_LEVEL_MIN;
+            for (int m = 0; m < numMwpLevelTotal; m++) {
+                int num = mwpHistogram[nhyp][m];
+                for (int m = 0; m < num; m++)
+                    fprintf(mwpHistorgramStream[nhyp], " %f\n", level + 0.001);
+                level += MWP_LEVEL_STEP;
+            }
+        }
+        if (flag_do_mb) {
+            level = MB_LEVEL_MIN;
+            for (int m = 0; m < numMbLevelTotal; m++) {
+                int num = mbHistogram[nhyp][m];
+                for (int m = 0; m < num; m++)
+                    fprintf(mbHistorgramStream[nhyp], " %f\n", level + 0.001);
+                level += MB_LEVEL_STEP;
+            }
+        }
+        if (flag_do_t0) {
+            level = T0_LEVEL_MIN;
+            for (int m = 0; m < numT0LevelTotal; m++) {
+                int num = t0Histogram[nhyp][m];
+                for (int m = 0; m < num; m++)
+                    fprintf(t0HistorgramStream[nhyp], " %f\n", level + 0.001);
+                level += T0_LEVEL_STEP;
+            }
+        }
+        if (flag_do_mwpd) {
+            level = MWPD_LEVEL_MIN;
+            for (int m = 0; m < numMwpdLevelTotal; m++) {
+                int num = mwpdHistogram[nhyp][m];
+                for (int m = 0; m < num; m++)
+                    fprintf(mwpdHistorgramStream[nhyp], " %f\n", level + 0.001);
+                level += MWPD_LEVEL_STEP;
+            }
+        }
+        fclose_counter(t50ExHistorgramStream[nhyp]);
+        if (flag_do_tauc)
+            fclose_counter(taucHistorgramStream[nhyp]);
+        if (flag_do_mwp) {
+            fclose_counter(mwpHistorgramStream[nhyp]);
+#ifdef USE_JSON_OUTPUT
+            // GeoJSON 20211130
+            if (save_plotfiles_geojson) {
+                snprintf(outname, STANDARD_STRLEN, "%s.json", mwpHistorgram_outname);
+                int ncolumns = 1;
+                char *columns[] = {"values"};
+                int nproperties = 1;
+                char *properties[] = {"name"};
+                char *values[] = {"mwpHistorgram"};
+                writeJSONcopyOftable(mwpHistorgram_outname, ncolumns, columns, nproperties, properties, values, " ", outname);
+            }
+#endif
+        }
+        if (flag_do_mb)
+            fclose_counter(mbHistorgramStream[nhyp]);
+        if (flag_do_t0)
+            fclose_counter(t0HistorgramStream[nhyp]);
+        if (flag_do_mwpd)
+            fclose_counter(mwpdHistorgramStream[nhyp]);
+    }
+
+    // station latency and health
+    // 20141212 AJL - moved here from after line 5250: "// miscellaneous output ====" so health info is available for printHypoDataString())
+    snprintf(outname, STANDARD_STRLEN, "%s/sta.health.html", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * staHealthHtmlStream = fopen_counter(outname, "w");
+    if (staHealthHtmlStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    updateStaHealthInformation(outnameroot, staHealthHtmlStream, difftime(time_max, time_min), (double) report_interval, time_since_last_report, time_min, time_max);
+    fclose_counter(staHealthHtmlStream);
+
+    // manage and write hypocenter data ===============================================================
+    //
+    // update hypocenter list
+    // clear flags
+    for (nhyp = 0; nhyp < num_hypocenters; nhyp++) {
+        HypocenterDesc* phypo = hypo_list[nhyp];
+        phypo->hyp_assoc_index = -1; // not associated
+    }
+    // update list with currently associated hypocenter
+    int icheck_duplicates = 1;
+    int is_new_hypocenter = 0;
+    int have_new_hypocenter = 0;
+    int have_new_hypocenter_with_mag = 0;
+    int hypocenter_mail_sent = 0;
+    // 20110407 AJL - Bug fix, reverse loop order to favor first associated hypocenters for case where same event is associated twice
+    //for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+    for (nhyp = num_hypocenters_associated - 1; nhyp >= 0; nhyp--) {
+        HypocenterDesc* phypo = hyp_assoc_loc[nhyp];
+        // station health
+        phypo->nstaHasBeenActive = nstaHasBeenActive;
+        phypo->nstaIsActive = nstaIsActive;
+        // magnitude and discriminants
+        phypo->t50ExLevelStatistics = t50ExLevelStatistics[nhyp];
+        phypo->taucLevelStatistics = taucLevelStatistics[nhyp];
+        phypo->tdT50ExLevelStatistics = tdT50ExLevelStatistics[nhyp];
+        strcpy(phypo->warningLevelString, warningLevelString[nhyp]);
+        phypo->mwpLevelStatistics = mwpLevelStatistics[nhyp];
+        phypo->mbLevelStatistics = mbLevelStatistics[nhyp];
+        phypo->t0LevelStatistics = t0LevelStatistics[nhyp];
+        phypo->mwpdLevelStatistics = mwpdLevelStatistics[nhyp];
+#ifdef USE_MWP_MO_POS_NEG
+        phypo->mwpdMoPosNegLevelStatistics = mwpdMoPosNegLevelStatistics[nhyp];
+#endif
+        phypo->hyp_assoc_index = nhyp; //  hypo_list is ordered by time, but association index is by association sum weight (lower index -> more phases associated), if re-associated, arbitrary, otherwise
+        HypocenterDesc* phypocenter_desc_inserted = NULL;
+        if ((is_new_hypocenter = addHypocenterDescToHypoList(phypo, &hypo_list, &hypo_list_size, &num_hypocenters, icheck_duplicates,
+                &existing_hypo_desc, &phypocenter_desc_inserted))) { // hypocenter unique_id is set here
+            have_new_hypocenter++;
+            phypocenter_desc_inserted->loc_seq_num = 0; // 20160905 AJL - added
+            phypocenter_desc_inserted->loc_report_count = 0; // 20220923 AJL - added
+        } else {
+            if (phypocenter_desc_inserted->loc_type == LOC_TYPE_FULL || phypocenter_desc_inserted->loc_type == LOC_TYPE_RELOC_EXISTING) {
+                (phypocenter_desc_inserted->loc_seq_num)++; // 20160905 AJL - added
+            }
+            if (!only_check_for_new_event) {
+                (phypocenter_desc_inserted->loc_report_count)++; // 20220923 AJL - added
+            }
+        }
+        // copy inserted hypocenter into working hypocenter since may contain modified fields
+        *phypo = *phypocenter_desc_inserted;
+        if (!phypo->has_valid_magnitude) {
+            if (phypo->mbLevelStatistics.numLevel >= reportMinNumberValuesUse.mb || useMwpForReport(phypo, 0, 0) || useMwpdForReport(phypo, 0, 0)) {
+                have_new_hypocenter_with_mag++;
+                phypocenter_desc_inserted->has_valid_magnitude = phypo->has_valid_magnitude = 1;
+            }
+        }
+        // create event map html pages
+        create_map_html_page(outnameroot, phypo, time_min, time_max, MAP_LINK_MED_ZOOM);
+        if (MAP_LINK_BIG_ZOOM != MAP_LINK_MED_ZOOM) {
+            create_map_html_page(outnameroot, phypo, time_min, time_max, MAP_LINK_BIG_ZOOM);
+        }
+        // check for sending alert
+        if (sendMail) {
+            // pass phypocenter_desc_inserted here, since send_hypocenter_alert modifies fields in inserted hypocenter
+            hypocenter_mail_sent += send_hypocenter_alert(phypocenter_desc_inserted, is_new_hypocenter, &existing_hypo_desc, sendMailParams, outnameroot, agencyId, verbose);
+        }
+    }
+    // act on new hypocenters
+    //
+    // check for alarm notification
+    snprintf(outname, STANDARD_STRLEN, "%s/alarm_notification.txt", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * alarmNotificationStream = fopen_counter(outname, "w");
+    if (alarmNotificationStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+    }
+    int notification_level = 0;
+    if (alarmNotification && (have_new_hypocenter || have_new_hypocenter_with_mag || hypocenter_mail_sent)) {
+        fprintf(stdout, "%c%c%c", (char) 7, (char) 7, (char) 7);
+        if (hypocenter_mail_sent) { // mail sent, important event
+            fprintf(stdout, "%c", (char) 7);
+            notification_level = 3;
+        } else if (have_new_hypocenter_with_mag) {
+            notification_level = 2;
+        } else if (have_new_hypocenter) {
+            notification_level = 1;
+        }
+    }
+    if (alarmNotificationStream != NULL)
+        fprintf(alarmNotificationStream, "%d", notification_level);
+    fclose_counter(alarmNotificationStream);
+    //
+    FILE * hypocenterStream[num_hypocenters_associated];
+    char hypocenterStream_name[num_hypocenters_associated][STANDARD_STRLEN];
+    FILE * hypocenterOtimeStream[num_hypocenters_associated];
+    FILE * hypocenterPwaveFrontStream[num_hypocenters_associated];
+    char hypocenterPwaveFrontStream_name[num_hypocenters_associated][STANDARD_STRLEN];
+    FILE * hypocenterSwaveFrontStream[num_hypocenters_associated];
+    char hypocenterSwaveFrontStream_name[num_hypocenters_associated][STANDARD_STRLEN];
+    FILE * hypocenterDistLimitsStream[num_hypocenters_associated];
+    char hypocenterDistLimitsStream_name[num_hypocenters_associated][STANDARD_STRLEN];
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        // GMT style
+        snprintf(outname, STANDARD_STRLEN, "%s/plot/hypo.%d.xy", outnameroot, nhyp);
+        if (verbose > 2)
+            printf("Opening output file: %s\n", outname);
+        hypocenterStream[nhyp] = fopen_counter(outname, "w");
+        if (hypocenterStream[nhyp] == NULL) {
+            snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+            perror(tmp_str);
+            return (-1);
+        }
+        strcpy(hypocenterStream_name[nhyp], outname);
+        // GMT style
+        snprintf(outname, STANDARD_STRLEN, "%s/plot/hypo.%d.otime.dat", outnameroot, nhyp);
+        if (verbose > 2)
+            printf("Opening output file: %s\n", outname);
+        hypocenterOtimeStream[nhyp] = fopen_counter(outname, "w");
+        if (hypocenterOtimeStream[nhyp] == NULL) {
+            snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+            perror(tmp_str);
+            return (-1);
+        }
+        // GMT style
+        snprintf(outname, STANDARD_STRLEN, "%s/plot/hypo.%d.pwavefront.xy", outnameroot, nhyp);
+        if (verbose > 2)
+            printf("Opening output file: %s\n", outname);
+        hypocenterPwaveFrontStream[nhyp] = fopen_counter(outname, "w");
+        if (hypocenterPwaveFrontStream[nhyp] == NULL) {
+            snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+            perror(tmp_str);
+            return (-1);
+        }
+        strcpy(hypocenterPwaveFrontStream_name[nhyp], outname);
+        // GMT style
+        snprintf(outname, STANDARD_STRLEN, "%s/plot/hypo.%d.swavefront.xy", outnameroot, nhyp);
+        if (verbose > 2)
+            printf("Opening output file: %s\n", outname);
+        hypocenterSwaveFrontStream[nhyp] = fopen_counter(outname, "w");
+        if (hypocenterSwaveFrontStream[nhyp] == NULL) {
+            snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+            perror(tmp_str);
+            return (-1);
+        }
+        strcpy(hypocenterSwaveFrontStream_name[nhyp], outname);
+        // GMT style
+        snprintf(outname, STANDARD_STRLEN, "%s/plot/hypo.%d.dist_limits.xy", outnameroot, nhyp);
+        if (verbose > 2)
+            printf("Opening output file: %s\n", outname);
+        hypocenterDistLimitsStream[nhyp] = fopen_counter(outname, "w");
+        if (hypocenterDistLimitsStream[nhyp] == NULL) {
+            snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+            perror(tmp_str);
+            return (-1);
+        }
+        strcpy(hypocenterDistLimitsStream_name[nhyp], outname);
+    }
+    //
+    // hypocenter
+    FILE* hypocenterTextStream = NULL;
+    // 20211210 if (num_hypocenters_associated > 0) {
+    snprintf(outname, STANDARD_STRLEN, "%s/plot/hypo.txt", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    hypocenterTextStream = fopen_counter(outname, "w");
+    if (hypocenterTextStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    char hypocenterTextStream_name[STANDARD_STRLEN];
+    strcpy(hypocenterTextStream_name, outname);
+    //}
+    //
+    // 20160525 AJL - correction: added missing header for hypo csv files
+    snprintf(outname, STANDARD_STRLEN, "%s/hypos.csv.hdr", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * hypocentersCsvHeaderStream = fopen_counter(outname, "w");
+    if (hypocentersCsvHeaderStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    printHypoDataHeaderString(hypoDataString);
+    fprintf(hypocentersCsvHeaderStream, "%s\n", hypoDataString); // 20160525 AJL - correction: added missing header for hypo csv files
+    fclose_counter(hypocentersCsvHeaderStream);
+    //
+    snprintf(outname, STANDARD_STRLEN, "%s/hypos.csv", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * hypocentersCsvStream = fopen_counter(outname, "w");
+    if (hypocentersCsvStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    //
+    snprintf(outname, STANDARD_STRLEN, "%s/hypos_pretty.csv", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * hypocentersCsvPrettyStream = fopen_counter(outname, "w");
+    if (hypocentersCsvPrettyStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    // hypoMessageHtmlStream
+    char hypomessage_filename[] = "hypomessage.html";
+    snprintf(outname, STANDARD_STRLEN, "%s/%s", outnameroot, hypomessage_filename);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * hypoMessageHtmlStream = fopen_counter(outname, "w");
+    if (hypoMessageHtmlStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    fprintf(hypoMessageHtmlStream, "<html>\n<body style=\"font-family:sans-serif;font-size:small\">\n<table border=0 cellpadding=1 frame=box rules=rows width=100%%>\n<tbody>\n");
+    printHypoMessageHtmlHeaderString(hypoMessageHtmlString);
+    fprintf(hypoMessageHtmlStream, "%s\n", hypoMessageHtmlString);
+    //
+    for (nhyp = num_hypocenters - 1; nhyp >= 0; nhyp--) { // reverse time order, since may remove hypocenters from list, and to give most recent at top of file lists.
+        HypocenterDesc* phypo = hypo_list[nhyp];
+        if (phypo->hyp_assoc_index >= 0) { // associated
+
+            // hypo data csv string
+            printHypoDataString(phypo, hypoDataString, 1, 0);
+            fprintf(hypocentersCsvStream, "%s\n", hypoDataString);
+            printHypoDataString(phypo, hypoDataString, 0, 1);
+            fprintf(hypocentersCsvPrettyStream, "%s\n", hypoDataString);
+            //
+            printHypoMessageHtmlString(phypo, hypoMessageHtmlString, hypoBackgroundColor[phypo->hyp_assoc_index % hypoBackgroundColorModulo],
+                    "bgcolor=#BBBBBB", phypo->hyp_assoc_index + 1, phypo->unique_id);
+            fprintf(hypoMessageHtmlStream, "%s\n", hypoMessageHtmlString);
+            // misc hypo streams
+            fprintf(hypocenterStream[phypo->hyp_assoc_index], "%f %f\n", phypo->lat, phypo->lon);
+            fprintf(hypocenterTextStream, "%f %f %d\n", phypo->lat, phypo->lon, phypo->hyp_assoc_index + 1);
+            double dtime = difftime((time_t) phypo->otime, plot_time_max) / 60.0;
+            //fprintf(hypocenterOtimeStream[phypo->hyp_assoc_index], ">\n%f %f\n%f %f\n", dtime, PICK_PLOT_LEVEL_MIN, dtime, PICK_PLOT_LEVEL_MAX);
+            fprintf(hypocenterOtimeStream[phypo->hyp_assoc_index], "%f\n", dtime);
+
+            // generate P and S wave fronts
+            int p_phase_id = -1;
+            int s_phase_id = -1;
+            double time_since_origin = difftime(plot_time_max, (time_t) phypo->otime);
+            double p_wave_front_dist = simple_P_distance(time_since_origin, phypo->depth, &p_phase_id); // distance in degrees
+            double s_wave_front_dist = simple_S_distance(time_since_origin, phypo->depth, &s_phase_id); // distance in degrees
+            //printf("   --->    plot_time_max=%ld hyp.ot=%ld  diff=%.1f p_wave_front_dist: %s = %.1f s_wave_front_dist: %s = %.1f\n",
+            //        plot_time_max, (time_t) phypo->otime, time_since_origin,
+            //        phase_name_for_id(p_phase_id), p_wave_front_dist, phase_name_for_id(s_phase_id), s_wave_front_dist);
+            // P wavefront
+            if (p_wave_front_dist > 1.0 && p_wave_front_dist < get_dist_time_dist_max()) {
+                //double pfront_az_step = 1.0;  // 20110318 AJL
+                double pfront_az_step = 30.0 / p_wave_front_dist;
+                //printf("   --->    pfront_az_step=%.1f\n", pfront_az_step);
+                double pfront_az = 91.0; // 20110203 AJL - do not start at N or S, and avoid plotting at exactly 0, 90, 180, 270 - may cause problem in GMT ???
+                double pf_lat, pf_lon;
+                fprintf(hypocenterPwaveFrontStream[phypo->hyp_assoc_index], "> %s\n", phase_name_for_id(p_phase_id));
+                while (pfront_az < 91.0 + 360.0 + pfront_az_step + pfront_az_step / 2.0) {
+                    PointAtGCDistanceAzimuth(phypo->lat, phypo->lon, p_wave_front_dist, pfront_az, &pf_lat, &pf_lon);
+                    if (fabs(pf_lat) < 89.5) // 20110103 AJL - avoid potential problems with latitudes near poles
+                        fprintf(hypocenterPwaveFrontStream[phypo->hyp_assoc_index], "%f %f\n", pf_lat, pf_lon);
+                    pfront_az += pfront_az_step;
+                }
+            }
+            // S wavefront
+            if (s_wave_front_dist > 1.0 && s_wave_front_dist < get_dist_time_dist_max()) {
+                //double sfront_az_step = 1.0;  // 20110318 AJL
+                double sfront_az_step = 30.0 / s_wave_front_dist;
+                //printf("   --->    sfront_az_step=%.1f\n", sfront_az_step);
+                double sfront_az = 91.0; // 20110203 AJL - do not start at N or S, and avoid plotting at exactly 0, 90, 180, 270 - may cause problem in GMT ???
+                double sf_lat, sf_lon;
+                fprintf(hypocenterSwaveFrontStream[phypo->hyp_assoc_index], "> %s\n", phase_name_for_id(s_phase_id));
+                while (sfront_az < 91.0 + 360.0 + sfront_az_step + sfront_az_step / 2.0) {
+                    PointAtGCDistanceAzimuth(phypo->lat, phypo->lon, s_wave_front_dist, sfront_az, &sf_lat, &sf_lon);
+                    if (fabs(sf_lat) < 89.5) // 20110103 AJL - avoid potential problems with latitudes near poles
+                        fprintf(hypocenterSwaveFrontStream[phypo->hyp_assoc_index], "%f %f\n", sf_lat, sf_lon);
+                    sfront_az += sfront_az_step;
+                }
+            }
+
+            // calculate ratio of nsta associated P to nsta available within P wavefront
+            // 20140818 AJL - added to test check for false/phantom large events, this ratio should be large for large events
+            double ratioNasscP2NStaAvailable = -1.0;
+            if (phypo->nStaAvailableFirstArrP > 0) {
+                ratioNasscP2NStaAvailable = (double) phypo->nassoc_P / (double) phypo->nStaAvailableFirstArrP;
+            }
+            printf("INFO TEST: Pdist=%.1f, phase=%s, nassocP=%d, nStaAvailableFirstArrP=%d, ratio_nassocP_2_nStaAvailableFirstArrP=%.3f,\n",
+                    phypo->nStaAvailableFirstArrP_distMax, "P", phypo->nassoc_P, phypo->nStaAvailableFirstArrP, ratioNasscP2NStaAvailable);
+
+            // distance limits T50Ex, Td, Mwp
+            /*  2011222 replaced with 5 deg limit only, see below
+            for (int n = 0; n < 4; n++) {
+                double dl_dist;
+                char dl_name[64];
+                if (n == 0) {
+                    dl_dist = MIN_EPICENTRAL_DISTANCE_WARNING;
+                    sprintf(dl_name, "%d-T50-min", (int) (0.5 + MIN_EPICENTRAL_DISTANCE_WARNING));
+                } else if (n == 1) {
+                    dl_dist = MAX_EPICENTRAL_DISTANCE_WARNING;
+                    sprintf(dl_name, "%d-T50-Mwp-max", (int) (0.5 + MAX_EPICENTRAL_DISTANCE_WARNING)); // as long as MAX_EPICENTRAL_DISTANCE_WARNING == MAX_EPICENTRAL_DISTANCE_MWP
+                } else if (n == 2) {
+                    dl_dist = MIN_EPICENTRAL_DISTANCE_TAUC;
+                    sprintf(dl_name, "%d-Td-Mwp-min", (int) (0.5 + MIN_EPICENTRAL_DISTANCE_TAUC)); // as long as MIN_EPICENTRAL_DISTANCE_TAUC == MIN_EPICENTRAL_DISTANCE_MWP
+                } else if (n == 3) {
+                    dl_dist = MAX_EPICENTRAL_DISTANCE_TAUC;
+                    sprintf(dl_name, "%d-Td-max", (int) (0.5 + MAX_EPICENTRAL_DISTANCE_TAUC));
+                }
+                //double dl_az_step = 1.0;  // 20110318 AJL
+                double dl_az_step = 30.0 / dl_dist;
+                double dl_az = 91.0; // 20110203 AJL - do not start at N or S, and avoid plotting at exactly 0, 90, 180, 270 - may cause problem in GMT ???
+                double dl_lat, dl_lon;
+                fprintf(hypocenterDistLimitsStream[phypo->hyp_assoc_index], "> %s\n", dl_name);
+                while (dl_az < 91.0 + 360.0 + dl_az_step / 2.0) {
+                    PointAtGCDistanceAzimuth(phypo->lat, phypo->lon, dl_dist, dl_az, &dl_lat, &dl_lon);
+                    //if (dl_lon < -180.0)
+                    //    dl_lon += 360.0;
+                    //if (dl_lon > 180.0)
+                    //    dl_lon -= 360.0; // 20110103
+                    if (fabs(dl_lat) < 89.5) // 20110103 AJL - avoid potential problems with latitudes near poles
+                        fprintf(hypocenterDistLimitsStream[phypo->hyp_assoc_index], "%f %f\n", dl_lat, dl_lon);
+                    dl_az += dl_az_step;
+                }
+            }*/
+            // distance limit at 5 deg only
+            if (1) {
+                double dl_dist;
+                char dl_name[64];
+                dl_dist = 5.0;
+                sprintf(dl_name, "5deg");
+                //double dl_az_step = 1.0;  // 20110318 AJL
+                double dl_az_step = 30.0 / dl_dist;
+                double dl_az = 91.0; // 20110203 AJL - do not start at N or S, and avoid plotting at exactly 0, 90, 180, 270 - may cause problem in GMT ???
+                double dl_lat, dl_lon;
+                fprintf(hypocenterDistLimitsStream[phypo->hyp_assoc_index], "> %s\n", dl_name);
+                while (dl_az < 91.0 + 360.0 + dl_az_step / 2.0) {
+                    PointAtGCDistanceAzimuth(phypo->lat, phypo->lon, dl_dist, dl_az, &dl_lat, &dl_lon);
+                    /*if (dl_lon < -180.0)
+                        dl_lon += 360.0;
+                    if (dl_lon > 180.0)
+                        dl_lon -= 360.0;*/ // 20110103
+                    if (fabs(dl_lat) < 89.5) // 20110103 AJL - avoid potential problems with latitudes near poles
+                        fprintf(hypocenterDistLimitsStream[phypo->hyp_assoc_index], "%f %f\n", dl_lat, dl_lon);
+                    dl_az += dl_az_step;
+                }
+            }
+        }
+    }
+    //
+    fclose_counter(hypocentersCsvStream);
+    fclose_counter(hypocentersCsvPrettyStream);
+    fprintf(hypoMessageHtmlStream, "</tbody>\n</table>\n</body>\n</html>\n");
+    fclose_counter(hypoMessageHtmlStream);
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        fclose_counter(hypocenterStream[nhyp]);
+        fclose_counter(hypocenterOtimeStream[nhyp]);
+#ifdef USE_JSON_OUTPUT
+        if (save_plotfiles_geojson) {
+            // GeoJSON 20211130
+            snprintf(outname, STANDARD_STRLEN, "%s.json", hypocenterStream_name[nhyp]);
+            int ncolumns = 2;
+            char *columns[] = {GEOJSON_LAT, GEOJSON_LON};
+            int nproperties = 3;
+            char *properties[] = {"name", "event_index", "event_id"};
+            snprintf(tmp_str, STANDARD_STRLEN, "%d", nhyp);
+            sprintf(tmp_str_2, "%ld", hyp_assoc_loc[nhyp]->unique_id);
+            char *values[] = {"hypocenter", tmp_str, tmp_str_2};
+            writeGeoJSONcopyOftable(hypocenterStream_name[nhyp], ncolumns, columns, nproperties, properties, values, " ", GEOJSON_Point, outname);
+        }
+#endif
+
+        fclose_counter(hypocenterPwaveFrontStream[nhyp]);
+        fclose_counter(hypocenterSwaveFrontStream[nhyp]);
+        fclose_counter(hypocenterDistLimitsStream[nhyp]);
+#ifdef USE_JSON_OUTPUT
+        if (save_plotfiles_geojson) {
+            // GeoJSON 20211130
+            snprintf(outname, STANDARD_STRLEN, "%s.json", hypocenterPwaveFrontStream_name[nhyp]);
+            int ncolumns = 2;
+            char *columns[] = {GEOJSON_LAT, GEOJSON_LON};
+            int nproperties = 3;
+            char *properties[] = {"name", "event_index", "event_id"};
+            snprintf(tmp_str, STANDARD_STRLEN, "%d", nhyp);
+            sprintf(tmp_str_2, "%ld", hyp_assoc_loc[nhyp]->unique_id);
+            char *values[] = {"hypocenterPwaveFront", tmp_str, tmp_str_2};
+            writeGeoJSONcopyOftable(hypocenterPwaveFrontStream_name[nhyp], ncolumns, columns, nproperties, properties, values, " ", GEOJSON_LineString, outname);
+        }
+        if (save_plotfiles_geojson) {
+            // GeoJSON 20211130
+            snprintf(outname, STANDARD_STRLEN, "%s.json", hypocenterSwaveFrontStream_name[nhyp]);
+            int ncolumns = 2;
+            char *columns[] = {GEOJSON_LAT, GEOJSON_LON};
+            int nproperties = 3;
+            char *properties[] = {"name", "event_index", "event_id"};
+            snprintf(tmp_str, STANDARD_STRLEN, "%d", nhyp);
+            sprintf(tmp_str_2, "%ld", hyp_assoc_loc[nhyp]->unique_id);
+            char *values[] = {"hypocenterSwaveFront", tmp_str, tmp_str_2};
+            writeGeoJSONcopyOftable(hypocenterSwaveFrontStream_name[nhyp], ncolumns, columns, nproperties, properties, values, " ", GEOJSON_LineString, outname);
+        }
+        if (save_plotfiles_geojson) {
+            // GeoJSON 20211130
+            snprintf(outname, STANDARD_STRLEN, "%s.json", hypocenterDistLimitsStream_name[nhyp]);
+            int ncolumns = 2;
+            char *columns[] = {GEOJSON_LAT, GEOJSON_LON};
+            int nproperties = 3;
+            char *properties[] = {"name", "event_index", "event_id"};
+            snprintf(tmp_str, STANDARD_STRLEN, "%d", nhyp);
+            sprintf(tmp_str_2, "%ld", hyp_assoc_loc[nhyp]->unique_id);
+            char *values[] = {"hypocenterDistLimits", tmp_str, tmp_str_2};
+            writeGeoJSONcopyOftable(hypocenterDistLimitsStream_name[nhyp], ncolumns, columns, nproperties, properties, values, " ", GEOJSON_LineString, outname);
+        }
+#endif
+    }
+    // 20211210 if (num_hypocenters_associated > 0)
+    fclose_counter(hypocenterTextStream);
+#ifdef USE_JSON_OUTPUT
+    if (save_plotfiles_geojson) {
+        // GeoJSON 20211130
+        snprintf(outname, STANDARD_STRLEN, "%s.json", hypocenterTextStream_name);
+        int ncolumns = 3;
+        char *columns[] = {GEOJSON_LAT, GEOJSON_LON, "hyp_assoc_index"};
+        int nproperties = 1;
+        char *properties[] = {"name"};
+        char *values[] = {"hypocenterText"};
+        writeGeoJSONcopyOftable(hypocenterTextStream_name, ncolumns, columns, nproperties, properties, values, " ", GEOJSON_MultiPoint, outname);
+    }
+#endif
+
+
+    // loop over associated hypocenters, develop epicenter statistics ===============================================================
+    // 20150812 AJL - added
+
+    // open epicenter statistics information csv file
+    FILE * epicenterDiffCsvStream = NULL;
+    snprintf(outname, STANDARD_STRLEN, "%s/epicenter.diff.csv", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    epicenterDiffCsvStream = fopen_counter(outname, "w");
+    if (epicenterDiffCsvStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    fprintf(epicenterDiffCsvStream, "epicenter.diff");
+    fprintf(epicenterDiffCsvStream, " %lf", EPI_DIFF_CRITICAL_VALUE);
+    fprintf(epicenterDiffCsvStream, " %lf", difftime(plot_time_max, plot_time_min) / 60.0);
+    fprintf(epicenterDiffCsvStream, " %s", time2string(plot_time_min, tmp_str));
+    fprintf(epicenterDiffCsvStream, " %s", time2string(plot_time_max, tmp_str));
+    fprintf(epicenterDiffCsvStream, " %d", report_interval);
+    fprintf(epicenterDiffCsvStream, " %d", nstaIsActive);
+    fprintf(epicenterDiffCsvStream, " %d", nstaHasBeenActive);
+    fprintf(epicenterDiffCsvStream, " %d", num_hypocenters_associated);
+    fprintf(epicenterDiffCsvStream, "\n");
+    char epiDiffLevelString[num_hypocenters_associated][WARNING_LEVEL_STRING_LEN];
+
+    // hyp temp directories
+    static char hyp_dir_name[1024];
+    sprintf(hyp_dir_name, "%s/hyp", EE_TEMP_DIR); // where persistent hyp info is kept
+    mkdir(hyp_dir_name, 0755);
+    static char hyp_dir_scratch_name[1024];
+    sprintf(hyp_dir_scratch_name, "%s/hyp_scratch", EE_TEMP_DIR); // scratch/working dir for active hypos
+    mkdir(hyp_dir_scratch_name, 0755);
+    static char outname_tmp[2 * STANDARD_STRLEN];
+
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        HypocenterDesc* phypo = hyp_assoc_loc[nhyp];
+        //
+        // save current hypocenter
+        snprintf(outname, STANDARD_STRLEN, "%s/hypocenter.history.value.%ld.xy", hyp_dir_name, phypo->unique_id);
+        if (verbose > 2)
+            printf("Opening output file: %s\n", outname);
+        FILE * hypocenterHistoryStream = fopen_counter(outname, "a");
+        if (hypocenterHistoryStream == NULL) {
+            snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+            perror(tmp_str);
+            return (-1);
+        }
+        fprintf(hypocenterHistoryStream, "%ld %lf %lf %lf %lf %lf\n", plot_time_max,
+                phypo->lat, phypo->lon, phypo->errh, phypo->depth, phypo->otime);
+        fclose_counter(hypocenterHistoryStream);
+        // move hyp history file to hyp_tmp dir
+        sprintf(outname_tmp, "%s/hypocenter.history.value.%ld.xy", hyp_dir_scratch_name, phypo->unique_id);
+        rename(outname, outname_tmp);
+        //
+        // reconstruct epicenter diff relative to hypocenter history
+        // re-open hypocenter history file to read
+        hypocenterHistoryStream = fopen_counter(outname_tmp, "r");
+        if (hypocenterHistoryStream == NULL) {
+            snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname_tmp);
+            perror(tmp_str);
+            return (-1);
+        }
+        // open epicenter diff files
+        snprintf(outname, STANDARD_STRLEN, "%s/plot/epicenter.diff.value.%d.xy", outnameroot, nhyp);
+        if (verbose > 2)
+            printf("Opening output file: %s\n", outname);
+        FILE * epicenterDiffValueStream = fopen_counter(outname, "w");
+        if (epicenterDiffValueStream == NULL) {
+            snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+            perror(tmp_str);
+            return (-1);
+        }
+        snprintf(outname, STANDARD_STRLEN, "%s/plot/epicenter.diff.upper.%d.xy", outnameroot, nhyp);
+        if (verbose > 2)
+            printf("Opening output file: %s\n", outname);
+        FILE * epicenterDiffUpperStream = fopen_counter(outname, "w");
+        if (epicenterDiffUpperStream == NULL) {
+            snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+            perror(tmp_str);
+            return (-1);
+        }
+        snprintf(outname, STANDARD_STRLEN, "%s/plot/epicenter.diff.lower.%d.xy", outnameroot, nhyp);
+        if (verbose > 2)
+            printf("Opening output file: %s\n", outname);
+        FILE * epicenterDiffLowerStream = fopen_counter(outname, "w");
+        if (epicenterDiffLowerStream == NULL) {
+            snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+            perror(tmp_str);
+            return (-1);
+        }
+        fprintf(epicenterDiffValueStream, ">\n");
+        fprintf(epicenterDiffUpperStream, ">\n");
+        fprintf(epicenterDiffLowerStream, ">\n");
+        //int istat;
+        double histtime = 0.0, lat = 0.0, lon = 0.0, errh = 0.0, depth = 0.0, otime = 0.0, depicenter = 0.0;
+        while (1) {
+            if (fgets(tmp_str, STANDARD_STRLEN - 1, hypocenterHistoryStream) == NULL)
+                break;
+            //istat =
+            sscanf(tmp_str, "%lf %lf %lf %lf %lf %lf ", &histtime, &lat, &lon, &errh, &depth, &otime);
+            depicenter = DEG2KM * GCDistance(lat, lon, phypo->lat, phypo->lon);
+            fprintf(epicenterDiffValueStream, "%f %f\n", difftime(histtime, plot_time_max) / 60.0, depicenter);
+            fprintf(epicenterDiffUpperStream, "%f %f\n", difftime(histtime, plot_time_max) / 60.0, depicenter + errh);
+            fprintf(epicenterDiffLowerStream, "%f %f\n", difftime(histtime, plot_time_max) / 60.0, depicenter - errh);
+        }
+        fclose_counter(hypocenterHistoryStream);
+        fclose_counter(epicenterDiffValueStream);
+        fclose_counter(epicenterDiffUpperStream);
+        fclose_counter(epicenterDiffLowerStream);
+        //
+        // epicenter statistics information csv file
+        strcpy(epiDiffLevelString[nhyp], "NONE");
+        double level_plot_epi = depicenter < EPI_DIFF_LEVEL_MAX ? depicenter : EPI_DIFF_LEVEL_MAX;
+        level_plot_epi = level_plot_epi > EPI_DIFF_LEVEL_MIN ? level_plot_epi : EPI_DIFF_LEVEL_MIN;
+        double level_plot_epi_lower = depicenter - errh < EPI_DIFF_LEVEL_MAX ? depicenter - errh : EPI_DIFF_LEVEL_MAX;
+        level_plot_epi_lower = level_plot_epi_lower > EPI_DIFF_LEVEL_MIN ? level_plot_epi_lower : EPI_DIFF_LEVEL_MIN;
+        double level_plot_epi_upper = depicenter + errh < EPI_DIFF_LEVEL_MAX ? depicenter + errh : EPI_DIFF_LEVEL_MAX;
+        level_plot_epi_upper = level_plot_epi_upper > EPI_DIFF_LEVEL_MIN ? level_plot_epi_upper : EPI_DIFF_LEVEL_MIN;
+        fprintf(epicenterDiffCsvStream, " %.1f", level_plot_epi);
+        fprintf(epicenterDiffCsvStream, " %.1f", depicenter);
+        fprintf(epicenterDiffCsvStream, " %.1f", level_plot_epi_lower);
+        fprintf(epicenterDiffCsvStream, " %.1f", level_plot_epi_upper);
+        fprintf(epicenterDiffCsvStream, " %s", epiDiffLevelString[nhyp]);
+        fprintf(epicenterDiffCsvStream, " %d", phypo->nassoc_P);
+        fprintf(epicenterDiffCsvStream, "\n");
+    }
+    fclose_counter(epicenterDiffCsvStream);
+
+    // clean up old temp files
+    int ireturn = nftw(hyp_dir_name, remove_fn, 16, FTW_DEPTH);
+    if (ireturn) {
+        printf("ERROR: removing files: return value = %d, path = %s\n", ireturn, hyp_dir_name);
+    }
+    // move new temp files back to persistent temp dir
+    rename(hyp_dir_scratch_name, hyp_dir_name);
+
+
+
+    // loop over pick data, write output ===============================================================
+
+    //
+    snprintf(outname, STANDARD_STRLEN, "%s/pickdata_nlloc.txt", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * pickDataNLLStream = fopen_counter(outname, "w");
+    if (pickDataNLLStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    // pickMessageHtmlStream
+    snprintf(outname, STANDARD_STRLEN, "%s/pickmessage.html", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * pickMessageHtmlStream = fopen_counter(outname, "w");
+    if (pickMessageHtmlStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    fprintf(pickMessageHtmlStream, "<html>\n<body style=\"font-family:sans-serif;font-size:small\">\n<table border=0 cellpadding=1 frame=box rules=rows width=100%%>\n<tbody>\n");
+    fprintf(pickMessageHtmlStream, "<tr align=right bgcolor=\"#BBBBBB\">\n<th>&nbsp;n</th>");
+    if (associate_data) {
+        fprintf(pickMessageHtmlStream, "<th>&nbsp;evt</th><th>&nbsp;d&nbsp;<br>&nbsp;(deg)</th><th>&nbsp;az&nbsp;<br>&nbsp;(deg)</th>");
+    }
+    fprintf(pickMessageHtmlStream, "<th>&nbsp;channel</th><th>&nbsp;stream</th><th>&nbsp;loc</th><th>&nbsp;time<br>&nbsp;(UTC)</th><th>&nbsp;unc<br>&nbsp;(sec)</th><th>&nbsp;pol</th><th>&nbsp;_ty</th><th>&nbsp;_wt</th><th>&nbsp;toang<br>&nbsp;(deg)</th><th>&nbsp;paz<br>&nbsp;(deg)</th><th>&nbsp;_unc<br>&nbsp;(deg)</th><th>&nbsp;_calc<br>&nbsp;(deg)</th><th>&nbsp;_wt</th>");
+    if (associate_data) {
+        fprintf(pickMessageHtmlStream, "<th>&nbsp;phase</th><th>&nbsp;res&nbsp;<br>&nbsp;(sec)</th><th>&nbsp;tot_wt</th><th>&nbsp;dist_wt</th><th>&nbsp;st_q_wt</th>");
+    }
+    fprintf(pickMessageHtmlStream, "<th>&nbsp;T50</th><th>&nbsp;Aref</th><th>&nbsp;Aerr</th><th>&nbsp;T50Ex</th><th>&nbsp;Td&nbsp;<br>&nbsp;(sec)</th>");
+    fprintf(pickMessageHtmlStream, "<th>&nbsp;Avel</th><th>&nbsp;Adisp</th>");
+    fprintf(pickMessageHtmlStream, "<th>&nbsp;s/n_HF</th>");
+    fprintf(pickMessageHtmlStream, "<th>&nbsp;s/n_BRBV</th><th>&nbsp;s/n_BRBD</th><th>&nbsp;mb</th><th>&nbsp;Mwp</th><th>&nbsp;T0&nbsp;<br>&nbsp;(sec)</th><th>&nbsp;Mwpd</th><th>&nbsp;status</th>");
+    fprintf(pickMessageHtmlStream, "</tr>\n");
+    // picksCsvStream
+    snprintf(outname, STANDARD_STRLEN, "%s/picks.csv", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * picksCsvStream = fopen_counter(outname, "w");
+    if (picksCsvStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    if (associate_data) {
+        fprintf(picksCsvStream, "event_id n event dist az channel stream loc time unc pol pol_type pol_wt toang paz paz_unc paz_calc paz_wt ");
+        fprintf(picksCsvStream, "phase residual tot_wt dist_wt st_q_wt T50 Aref Aerr T50Ex Tdom ");
+        fprintf(picksCsvStream, "Avel Adisp ");
+        fprintf(picksCsvStream, "s/n_HF s/n_BRBV s/n_BRBD mb Mwp T0 Mwpd status sta_corr\n");
+    } else {
+        fprintf(picksCsvStream, "n channel stream time T50 Aref T50Ex Tdom Avel s/n_HF s/n_BRBV s/n_BRBD status sta_corr\n");
+    }
+    // write pick data to file
+    int ndata;
+    // NLL pick data in time order
+    for (ndata = 0; ndata < num_de_data; ndata++) {
+        TimedomainProcessingData* deData = data_list[ndata];
+        // 20171220 AJL  if (printIgnoredData || !ignoreData(deData)) {
+        if (deData->t_time_t >= time_min) { // 20130407 AJL - added to prevent writing of picks from interval time_min-report_interval->time_min.
+            if (deData->is_associated > 0) {
+                fprintf_NLLoc_TimedomainProcessingData(deData, pickDataNLLStream, 1, hyp_assoc_loc[deData->is_associated - 1]->depth);
+                fprintf(pickDataNLLStream, " %ld\n", hyp_assoc_loc[deData->is_associated - 1]->unique_id);
+            } else {
+                fprintf_NLLoc_TimedomainProcessingData(deData, pickDataNLLStream, 1, 0.0);
+                fprintf(pickDataNLLStream, " %d\n", -1);
+            }
+        }
+        // 20171220 AJL  }
+    }
+    // general pick data in reverse time order
+    static char rowBackgroundColor[64];
+    static char t50ExBackgroundColor[64];
+    static char taucBackgroundColor[64];
+    static char mbBackgroundColor[64];
+    static char mwpBackgroundColor[64];
+    static char t0BackgroundColor[64];
+    static char mwpdBackgroundColor[64];
+    int num_pick = 0;
+    int num_pick_assoc = 0;
+    int num_pick_not_completed = 0;
+    int num_pick_clipped = 0;
+    int num_pick_non_contiguous = 0;
+    int num_pick_sn_low = 0;
+    int num_pick_sn_brb_low = 0;
+    int num_pick_sn_brb_int_low = 0;
+    int num_pick_in_prev_coda = 0;
+    int num_pick_ok = 0;
+    int num_event = 0;
+    // 2010116 AJL for (ndata = 0; ndata < num_de_data; ndata++) {
+    for (ndata = num_de_data - 1; ndata >= 0; ndata--) { // reverse time order
+        num_pick++;
+        int pick_ok = 1;
+        TimedomainProcessingData* deData = data_list[ndata];
+        if (deData->flag_clipped) {
+            num_pick_clipped++;
+            pick_ok = 0;
+        }
+        if (deData->flag_non_contiguous) {
+            num_pick_non_contiguous++;
+            pick_ok = 0;
+        }
+        if (deData->flag_snr_hf_too_low) {
+            num_pick_sn_low++;
+        }
+        if (deData->flag_snr_brb_too_low) {
+            num_pick_sn_brb_low++;
+        }
+        if (deData->flag_snr_brb_int_too_low) {
+            num_pick_sn_brb_int_low++;
+        }
+        // 20130128 AJL - use flag_snr_brb_int_too_low to enable mwp, mwpd, etc., but do not use for ignore tests (e.g. ignore determined by flag_snr_brb_too_low)
+        //if (deData->flag_snr_hf_too_low && deData->flag_snr_brb_too_low && deData->flag_snr_brb_int_too_low) {
+        // 20131022 AJL - try using all picks for location, regardless of HF S/N
+        // 20150408 AJL  if (deData->flag_snr_hf_too_low && deData->flag_snr_brb_too_low && !(USE_SNR_HF_TOO_LOW_PICKS_FOR_LOCATION && deData->is_associated)) {
+        if (!USE_SNR_HF_TOO_LOW_PICKS_FOR_LOCATION && deData->flag_snr_hf_too_low && deData->flag_snr_brb_too_low) {
+            pick_ok = 0;
+        }
+        if (deData->flag_a_ref_not_ok) {
+            num_pick_in_prev_coda++;
+            if (!USE_AREF_NOT_OK_BRB_PICKS_FOR_LOCATION
+                    // 20210929 AJL - Allow brb picks in prev coda (flag_a_ref_not_ok) if sn_brb OK. May avoid loosing correct BRB picks after early HF pick.
+                    && (!USE_AREF_NOT_OK_PICKS_FOR_LOCATION_IF_SNR_BRB_OK || !(deData->pick_stream == STREAM_RAW) || deData->flag_snr_brb_too_low)) {
+                pick_ok = 0;
+            }
+        }
+        if (!deData->flag_complete_t50) {
+            num_pick_not_completed++;
+            pick_ok = 0;
+        }
+        num_pick_ok += pick_ok;
+        if (printIgnoredData || !ignoreData(deData)) {
+            double deLevel = -1.0;
+            char deLevelStr[64];
+            sprintf(deLevelStr, "-1");
+            double tauc_peak = TAUC_INVALID;
+            char tauc_peakStr[64];
+            sprintf(tauc_peakStr, "-1");
+            double mb_mag = MB_INVALID;
+            double mwp_mag = MWP_INVALID;
+            double t0_dur = T0_INVALID;
+            double mwpd_corr_mag = MWPD_INVALID;
+            // readable form
+            strcpy(rowBackgroundColor, "bgcolor=\"#FFFFFF\"");
+            strcpy(t50ExBackgroundColor, "bgcolor=\"#FFFFFF\"");
+            strcpy(taucBackgroundColor, "bgcolor=\"#FFFFFF\"");
+            strcpy(mbBackgroundColor, "bgcolor=\"#FFFFFF\"");
+            strcpy(mwpBackgroundColor, "bgcolor=\"#FFFFFF\"");
+            strcpy(t0BackgroundColor, "bgcolor=\"#FFFFFF\"");
+            strcpy(mwpdBackgroundColor, "bgcolor=\"#FFFFFF\"");
+            int ignored = 0;
+            if (ignoreData(deData)) {
+                ignored = 1;
+                strcpy(rowBackgroundColor, "bgcolor=\"#EEEEEE\"");
+                strcpy(t50ExBackgroundColor, "bgcolor=\"#EEEEEE\"");
+                strcpy(taucBackgroundColor, "bgcolor=\"#EEEEEE\"");
+                strcpy(mbBackgroundColor, "bgcolor=\"#EEEEEE\"");
+                strcpy(mwpBackgroundColor, "bgcolor=\"#EEEEEE\"");
+                strcpy(t0BackgroundColor, "bgcolor=\"#EEEEEE\"");
+                strcpy(mwpdBackgroundColor, "bgcolor=\"#EEEEEE\"");
+            } else if (!deData->flag_complete_t50) {
+                strcpy(rowBackgroundColor, "bgcolor=\"#CCCCCC\"");
+                strcpy(t50ExBackgroundColor, "bgcolor=\"#CCCCCC\"");
+                strcpy(taucBackgroundColor, "bgcolor=\"#CCCCCC\"");
+                strcpy(mbBackgroundColor, "bgcolor=\"#CCCCCC\"");
+                strcpy(mwpBackgroundColor, "bgcolor=\"#CCCCCC\"");
+                strcpy(t0BackgroundColor, "bgcolor=\"#CCCCCC\"");
+                strcpy(mwpdBackgroundColor, "bgcolor=\"#CCCCCC\"");
+            } else {
+                int not_associated = !deData->is_associated || deData->is_associated == NUMBER_ASSOCIATE_IGNORE;
+                deLevel = getT50Level(deData);
+                sprintf(deLevelStr, "%.2f", deLevel);
+                if (!deData->flag_snr_hf_too_low) {
+                    int associated_ok = !use_associated_data || not_associated || (is_associated_location_P(deData)
+                            && deData->epicentral_distance > MIN_EPICENTRAL_DISTANCE_WARNING && deData->epicentral_distance < MAX_EPICENTRAL_DISTANCE_WARNING);
+                    if (!associated_ok) {
+                        strcpy(t50ExBackgroundColor, "bgcolor=\"#CCCCCC\"");
+                    } else if (deLevel >= T50EX_RED_CUTOFF) {
+                        if (not_associated)
+                            strcpy(t50ExBackgroundColor, "bgcolor=\"#FFBBBB\"");
+                        else
+                            strcpy(t50ExBackgroundColor, "bgcolor=\"#FF5555\"");
+                    } else if (deLevel >= T50EX_YELLOW_CUTOFF) {
+                        if (not_associated)
+                            strcpy(t50ExBackgroundColor, "bgcolor=\"#FFFFCC\"");
+                        else
+                            strcpy(t50ExBackgroundColor, "bgcolor=\"#FFFF66\"");
+                    } else if (deLevel >= T50EX_LEVEL_MIN) {
+                        if (not_associated)
+                            strcpy(t50ExBackgroundColor, "bgcolor=\"#DDFFDD\"");
+                        else
+                            strcpy(t50ExBackgroundColor, "bgcolor=\"#77FF77\"");
+                    } else {
+                        strcpy(t50ExBackgroundColor, "bgcolor=\"#CCCCCC\"");
+                    }
+                } else {
+                    strcpy(t50ExBackgroundColor, "bgcolor=\"#EEEEEE\"");
+                }
+                if (flag_do_tauc && !deData->flag_snr_brb_too_low) {
+                    tauc_peak = deData->tauc_peak;
+                    sprintf(tauc_peakStr, "%.2f", tauc_peak);
+                    int associated_ok = !use_associated_data || not_associated || (is_associated_location_P(deData)
+                            && deData->epicentral_distance > MIN_EPICENTRAL_DISTANCE_TAUC && deData->epicentral_distance < MAX_EPICENTRAL_DISTANCE_TAUC);
+                    if (!associated_ok) {
+                        strcpy(taucBackgroundColor, "bgcolor=\"#CCCCCC\"");
+                    } else if (tauc_peak >= TAUC_RED_CUTOFF) {
+                        if (not_associated)
+                            strcpy(taucBackgroundColor, "bgcolor=\"#FFBBBB\"");
+                        else
+                            strcpy(taucBackgroundColor, "bgcolor=\"#FF5555\"");
+                    } else if (tauc_peak >= TAUC_YELLOW_CUTOFF) {
+                        if (not_associated)
+                            strcpy(taucBackgroundColor, "bgcolor=\"#FFFFCC\"");
+                        else
+                            strcpy(taucBackgroundColor, "bgcolor=\"#FFFF66\"");
+                    } else if (tauc_peak >= TAUC_LEVEL_MIN) {
+                        if (not_associated)
+                            strcpy(taucBackgroundColor, "bgcolor=\"#DDFFDD\"");
+                        else
+                            strcpy(taucBackgroundColor, "bgcolor=\"#77FF77\"");
+                    } else {
+                        strcpy(taucBackgroundColor, "bgcolor=\"#CCCCCC\"");
+                    }
+                } else {
+                    strcpy(taucBackgroundColor, "bgcolor=\"#EEEEEE\"");
+                }
+                if (flag_do_mb && !deData->flag_snr_brb_bp_too_low) {
+                    mb_mag = deData->mb->mag;
+                    int associated_ok = !use_associated_data || not_associated || (is_associated_location_P(deData)
+                            && deData->epicentral_distance > MIN_EPICENTRAL_DISTANCE_MB && deData->epicentral_distance < MAX_EPICENTRAL_DISTANCE_MB);
+                    if (!associated_ok) {
+                        strcpy(mbBackgroundColor, "bgcolor=\"#CCCCCC\"");
+                    } else if (mb_mag >= MB_RED_CUTOFF) {
+                        if (not_associated)
+                            strcpy(mbBackgroundColor, "bgcolor=\"#FFBBBB\"");
+                        else
+                            strcpy(mbBackgroundColor, "bgcolor=\"#FF5555\"");
+                    } else if (mb_mag >= MB_YELLOW_CUTOFF) {
+                        if (not_associated)
+                            strcpy(mbBackgroundColor, "bgcolor=\"#FFFFCC\"");
+                        else
+                            strcpy(mbBackgroundColor, "bgcolor=\"#FFFF66\"");
+                    } else if (mb_mag != MB_INVALID) {
+                        if (not_associated)
+                            strcpy(mbBackgroundColor, "bgcolor=\"#DDFFDD\"");
+                        else
+                            strcpy(mbBackgroundColor, "bgcolor=\"#77FF77\"");
+                    } else {
+                        strcpy(mbBackgroundColor, "bgcolor=\"#CCCCCC\"");
+                    }
+                } else {
+                    strcpy(mbBackgroundColor, "bgcolor=\"#EEEEEE\"");
+                }
+                // 20121119 AJL if (flag_do_mwp && !deData->flag_snr_brb_too_low) {
+                if (flag_do_mwp && !deData->flag_snr_brb_too_low && !deData->flag_snr_brb_int_too_low) {
+                    mwp_mag = deData->mwp->mag;
+                    int associated_ok = !use_associated_data || not_associated || (is_associated_location_P(deData)
+                            && deData->epicentral_distance > MIN_EPICENTRAL_DISTANCE_MWP && deData->epicentral_distance < MAX_EPICENTRAL_DISTANCE_MWP);
+                    if (!associated_ok) {
+                        strcpy(mwpBackgroundColor, "bgcolor=\"#CCCCCC\"");
+                    } else if (mwp_mag >= MWP_RED_CUTOFF) {
+                        if (not_associated)
+                            strcpy(mwpBackgroundColor, "bgcolor=\"#FFBBBB\"");
+                        else
+                            strcpy(mwpBackgroundColor, "bgcolor=\"#FF5555\"");
+                    } else if (mwp_mag >= MWP_YELLOW_CUTOFF) {
+                        if (not_associated)
+                            strcpy(mwpBackgroundColor, "bgcolor=\"#FFFFCC\"");
+                        else
+                            strcpy(mwpBackgroundColor, "bgcolor=\"#FFFF66\"");
+                    } else if (mwp_mag != MWP_INVALID) {
+                        if (not_associated)
+                            strcpy(mwpBackgroundColor, "bgcolor=\"#DDFFDD\"");
+                        else
+                            strcpy(mwpBackgroundColor, "bgcolor=\"#77FF77\"");
+                    } else {
+                        strcpy(mwpBackgroundColor, "bgcolor=\"#CCCCCC\"");
+                    }
+                } else {
+                    strcpy(mwpBackgroundColor, "bgcolor=\"#EEEEEE\"");
+                }
+                if (flag_do_t0 && !deData->flag_snr_hf_too_low) {
+                    //t0_dur = deData->t0->duration_raw;
+                    //double depth = 0.0;
+                    //if (deData->is_associated)
+                    //    depth = hyp_assoc_loc[deData->is_associated - 1]->depth;
+                    //t0_dur = calculate_corrected_duration(deData, depth); // 20111222 TEST AJL - use S duration
+                    t0_dur = deData->t0->duration_plot;
+                    //if (t0_dur < 0.0)
+                    //    printf("ERROR: deData->t0->duration_plot not set: this should not happen!\n");
+                    int associated_ok = !use_associated_data || not_associated || (is_associated_location_P(deData)
+                            && useT0Report(deData));
+                    if (!associated_ok) {
+                        strcpy(t0BackgroundColor, "bgcolor=\"#CCCCCC\"");
+                    } else if (t0_dur >= T0_RED_CUTOFF) {
+                        if (not_associated)
+                            strcpy(t0BackgroundColor, "bgcolor=\"#FFBBBB\"");
+                        else
+                            strcpy(t0BackgroundColor, "bgcolor=\"#FF5555\"");
+                    } else if (t0_dur >= T0_YELLOW_CUTOFF) {
+                        if (not_associated)
+                            strcpy(t0BackgroundColor, "bgcolor=\"#FFFFCC\"");
+                        else
+                            strcpy(t0BackgroundColor, "bgcolor=\"#FFFF66\"");
+                    } else if (t0_dur != T0_INVALID) {
+                        if (not_associated)
+                            strcpy(t0BackgroundColor, "bgcolor=\"#DDFFDD\"");
+                        else
+                            strcpy(t0BackgroundColor, "bgcolor=\"#77FF77\"");
+                    } else {
+                        strcpy(t0BackgroundColor, "bgcolor=\"#CCCCCC\"");
+                    }
+                } else {
+                    strcpy(t0BackgroundColor, "bgcolor=\"#EEEEEE\"");
+                }
+                // 20121119 AJL if (flag_do_mwpd && !deData->flag_snr_hf_too_low && !deData->flag_snr_brb_int_too_low) { // 20120612 AJL - changed s/n check from brb vel to brb disp (brb int)
+                if (flag_do_mwpd && !deData->flag_snr_brb_too_low && !deData->flag_snr_brb_int_too_low) {
+                    mwpd_corr_mag = deData->mwpd->corr_mag;
+                    int associated_ok = !use_associated_data || not_associated || (is_associated_location_P(deData)
+                            && deData->epicentral_distance > MIN_EPICENTRAL_DISTANCE_MWPD && deData->epicentral_distance < MAX_EPICENTRAL_DISTANCE_MWPD
+                            && useT0Report(deData) // 20120416 AJL
+                            );
+                    // 20130208 AJL  if (!associated_ok || mwpd_corr_mag < MWPD_MIN_VALUE_USE) {
+                    if (!associated_ok) {
+                        strcpy(mwpdBackgroundColor, "bgcolor=\"#CCCCCC\"");
+                    } else if (mwpd_corr_mag >= MWPD_RED_CUTOFF) {
+                        if (not_associated)
+                            strcpy(mwpdBackgroundColor, "bgcolor=\"#FFBBBB\"");
+                        else
+                            strcpy(mwpdBackgroundColor, "bgcolor=\"#FF5555\"");
+                    } else if (mwpd_corr_mag >= MWPD_YELLOW_CUTOFF) {
+                        if (not_associated)
+                            strcpy(mwpdBackgroundColor, "bgcolor=\"#FFFFCC\"");
+                        else
+                            strcpy(mwpdBackgroundColor, "bgcolor=\"#FFFF66\"");
+                    } else if (mwpd_corr_mag != MWPD_INVALID) {
+                        if (not_associated)
+                            strcpy(mwpdBackgroundColor, "bgcolor=\"#DDFFDD\"");
+                        else
+                            strcpy(mwpdBackgroundColor, "bgcolor=\"#77FF77\"");
+                    } else {
+                        strcpy(mwpdBackgroundColor, "bgcolor=\"#CCCCCC\"");
+                    }
+                } else {
+                    strcpy(mwpdBackgroundColor, "bgcolor=\"#EEEEEE\"");
+                }
+            }
+            if (associate_data) {
+                if (use_associated_data && is_associated_phase(deData)) {
+                    num_pick_assoc++;
+                    if (deData->is_associated > num_event)
+                        num_event = deData->is_associated;
+                    fprintf(pickMessageHtmlStream, "<tr align=right %s><td>%d</td>", hypoBackgroundColor[(deData->is_associated - 1) % hypoBackgroundColorModulo], ndata + 1);
+                    create_event_link(".", hyp_assoc_loc[deData->is_associated - 1]->unique_id, event_url_str, event_link_str,
+                            feregion(hyp_assoc_loc[deData->is_associated - 1]->lat, hyp_assoc_loc[deData->is_associated - 1]->lon,
+                            feregion_str, FEREGION_STR_SIZE));
+                    fprintf(pickMessageHtmlStream, "<td>%s%d</a></td><td>%.1f</td><td>%.0f</td>",
+                            event_link_str, deData->is_associated, deData->epicentral_distance, deData->epicentral_azimuth);
+                    fprintf(picksCsvStream, "%ld %d ", hyp_assoc_loc[deData->is_associated - 1]->unique_id, ndata + 1);
+                    fprintf(picksCsvStream, "%d %.2f %.1f ", deData->is_associated, deData->epicentral_distance, deData->epicentral_azimuth);
+                } else {
+                    fprintf(pickMessageHtmlStream, "<tr align=right %s><td>%d</td>", rowBackgroundColor, ndata + 1);
+                    fprintf(pickMessageHtmlStream, "<td></td><td></td><td></td>");
+                    fprintf(picksCsvStream, "-1 %d ", ndata + 1);
+                    fprintf(picksCsvStream, "-1 -1 -1 ");
+                }
+            }
+            // channel identification
+            char loc_chr = '-';
+            if (deData->use_for_location) {
+                if (deData->merged)
+                    loc_chr = 'M';
+                else
+                    loc_chr = 'L';
+            }
+            // pick near middle of plot window
+            int duration = 2 * (time_max - deData->t_time_t);
+            duration += 60; // try to make sure latest data is displayed
+            if (duration > 3600)
+                duration = 3600;
+            double start_time = (double) (deData->t_time_t) + deData->t_decsec - (double) duration / 2.0;
+            fprintf(pickMessageHtmlStream, "<td>%s</td><td>%s</td><td>%c</td>",
+                    create_channel_links(deData->network, deData->station, deData->location, deData->channel,
+                    deData->pick_stream, pick_stream_name(deData), deData->n_int_tseries, start_time, duration,
+                    tmp_str, tmp_str_2), tmp_str_2, loc_chr);
+            fprintf(picksCsvStream, "%s_%s_%s_%s %s %c ",
+                    deData->network, deData->station, deData->location, deData->channel, pick_stream_name(deData), loc_chr);
+            // set s/n ratios
+            double snr_hf = deData->a_ref < 0.0 || deData->sn_pick < FLT_MIN ? 0.0 : deData->a_ref / deData->sn_pick;
+            double snr_brb = deData->sn_brb_signal < 0.0 || deData->sn_brb_pick < FLT_MIN ? 0.0 : deData->sn_brb_signal / deData->sn_brb_pick;
+            double snr_brb_int = deData->sn_brb_int_signal < 0.0 || deData->sn_brb_int_pick < FLT_MIN ? 0.0 : deData->sn_brb_int_signal / deData->sn_brb_int_pick;
+            // pick time, error, polarity
+            timeDecSec2string((double) deData->t_time_t + deData->t_decsec, tmp_str, DEFAULT_TIME_FORMAT);
+            // 20121019 AJL - added pick polarityWeight
+            double fmquality = 0.0;
+            int fmpolarity = POLARITY_UNKNOWN;
+            char fmtype[32] = "Err";
+            setPolarity(deData, &fmquality, &fmpolarity, fmtype);
+            //
+            double grd_vel_peak_amp = GRD_MOT_INVALID;
+            double grd_disp_peak_amp = GRD_MOT_INVALID;
+            if (is_associated_location_P(deData) && flag_do_grd_vel && is_P(deData->phase_id)) {
+                // initialize and calculate brb hp ground motion peaks after pick
+                // 20140801 AJL - added
+                deData->grd_mot->peak_amp_vel = GRD_MOT_INVALID;
+                deData->grd_mot->peak_amp_disp = GRD_MOT_INVALID;
+                if (!deData->flag_snr_brb_too_low || !deData->flag_snr_brb_int_too_low) {
+                    calculate_init_P_grd_mot_amp(deData, snr_brb, snr_brb_int, 0, &fmquality, &fmpolarity, fmtype);
+                    if (!deData->flag_snr_brb_too_low) {
+                        grd_vel_peak_amp = deData->grd_mot->peak_amp_vel;
+                    }
+                    if (!deData->flag_snr_brb_int_too_low) {
+                        grd_disp_peak_amp = deData->grd_mot->peak_amp_disp;
+                    }
+                }
+            }
+            fprintf(pickMessageHtmlStream, "<td>%s</td><td>%.3f</td><td>%d</td><td>%s&nbsp;</td><td>%.2f</td><td>%.1f</td>",
+                    tmp_str, deData->pick_error, fmpolarity, fmtype, fmquality, deData->take_off_angle_inc);
+            fprintf(picksCsvStream, "%s %.3f %d %s %.2f %.1f ",
+                    tmp_str, deData->pick_error, fmpolarity, fmtype, fmquality, deData->take_off_angle_inc);
+            // waveform onset polarization azimuth (e.g. P polarization azimuth)
+            fprintf(pickMessageHtmlStream, "<td>%.0f</td><td>%.0f</td><td>%.0f</td>",
+                    deData->polarization.azimuth, deData->polarization.azimuth_unc, deData->polarization.azimuth_calc);
+            fprintf(picksCsvStream, "%.1f %.1f %.1f ",
+                    deData->polarization.azimuth, deData->polarization.azimuth_unc, deData->polarization.azimuth_calc);
+            // phase association
+            if (associate_data) {
+                if (use_associated_data && is_associated_phase(deData)) {
+                    if (deData->polarization.weight >= 0.0) {
+                        fprintf(pickMessageHtmlStream, "<td>&nbsp;%.2f</td>", deData->polarization.weight);
+                    } else {
+                        fprintf(pickMessageHtmlStream, "<td>-1</td>");
+                    }
+                    fprintf(pickMessageHtmlStream, "<td>%s</td>", deData->phase);
+                    fprintf(pickMessageHtmlStream, "<td>%.1f</td>", deData->residual);
+                    if (deData->loc_weight > 0.001) {
+                        fprintf(pickMessageHtmlStream, "<td>%.2f</td>", deData->loc_weight);
+                    } else {
+                        fprintf(pickMessageHtmlStream, "<td>0</td>");
+                    }
+                    fprintf(pickMessageHtmlStream, "<td>%.2f</td>", deData->dist_weight);
+                    fprintf(pickMessageHtmlStream, "<td>%.2f</td>", deData->station_quality_weight);
+                    fprintf(picksCsvStream, "%.2f %s %.2f %.3f %.3f %.3f ", deData->polarization.weight, deData->phase, deData->residual, deData->loc_weight, deData->dist_weight, deData->station_quality_weight);
+                } else {
+                    fprintf(pickMessageHtmlStream, "<td></td><td></td><td></td><td></td><td></td><td>%.2f</td>", deData->station_quality_weight);
+                    fprintf(picksCsvStream, "-1 -1 -1 -1 -1 %.3f ", deData->station_quality_weight);
+                }
+            }
+            double t50_a_ref_have_gain_flag = 1.0; // t50 and a_ref values are positive if not using amplitude attenuation
+            // 20140120 AJL - test of amplitude attenuation with distance
+            if (!(chan_resp[deData->source_id].have_gain && chan_resp[deData->source_id].responseType == DERIVATIVE_TYPE)) {
+                t50_a_ref_have_gain_flag = -1.0; // t50 and a_ref values are negative if not corrected for gain
+            }
+            fprintf(pickMessageHtmlStream, "<td>%.3g</td><td>%.3g</td>",
+                    deData->t50 * t50_a_ref_have_gain_flag, deData->a_ref * t50_a_ref_have_gain_flag);
+            if (deData->amplitude_error_ratio > 0.0
+                    && deData->amplitude_error_ratio >= AMPLITUDE_ATTENUATION_MIN_ERROR_RATIO
+                    && deData->amplitude_error_ratio <= AMPLITUDE_ATTENUATION_MAX_ERROR_RATIO) {
+                fprintf(pickMessageHtmlStream, "<td>%.3g</td>", deData->amplitude_error_ratio);
+            } else {
+                fprintf(pickMessageHtmlStream, "<td bgcolor=\"#EEEEEE\"><em>%.3g</em></td>", deData->amplitude_error_ratio);
+            }
+            fprintf(pickMessageHtmlStream, "<td %s>%s</td><td %s>%s</td>",
+                    t50ExBackgroundColor, deLevelStr, taucBackgroundColor, tauc_peakStr);
+            fprintf(pickMessageHtmlStream, "<td>%.3g</td><td>%.3g</td>",
+                    grd_vel_peak_amp, grd_disp_peak_amp);
+            fprintf(pickMessageHtmlStream, "<td>%.2f</td><td>%.2f</td><td>%.2f</td>",
+                    snr_hf, snr_brb, snr_brb_int);
+            if (mb_mag != MB_INVALID)
+                fprintf(pickMessageHtmlStream, "<td %s>%.1f</td>", mbBackgroundColor, mb_mag);
+            else
+                fprintf(pickMessageHtmlStream, "<td %s>-9</td>", mbBackgroundColor);
+            if (mwp_mag != MWP_INVALID)
+                fprintf(pickMessageHtmlStream, "<td %s>%.1f</td>", mwpBackgroundColor, mwp_mag);
+            else
+                fprintf(pickMessageHtmlStream, "<td %s>-9</td>", mwpBackgroundColor);
+            if (t0_dur != T0_INVALID)
+                fprintf(pickMessageHtmlStream, "<td %s>%.0f</td>", t0BackgroundColor, t0_dur);
+            else
+                fprintf(pickMessageHtmlStream, "<td %s>-9</td>", t0BackgroundColor);
+            if (mwpd_corr_mag != MWPD_INVALID)
+                fprintf(pickMessageHtmlStream, "<td %s>%.1f</td>", mwpdBackgroundColor, mwpd_corr_mag);
+            else
+                fprintf(pickMessageHtmlStream, "<td %s>-9</td>", mwpdBackgroundColor);
+            fprintf(picksCsvStream, "%.3g %.3g %.3g %.3f %.3f ",
+                    deData->t50 * t50_a_ref_have_gain_flag, deData->a_ref * t50_a_ref_have_gain_flag, deData->amplitude_error_ratio,
+                    deLevel, tauc_peak);
+            fprintf(picksCsvStream, "%.3g %.3g ",
+                    grd_vel_peak_amp, grd_disp_peak_amp);
+            fprintf(picksCsvStream, "%.3f %.3f %.3f %.3f %.3f %.3f %.3f ",
+                    deData->a_ref / deData->sn_pick, snr_brb, snr_brb_int, mb_mag, mwp_mag, t0_dur, mwpd_corr_mag);
+            fprintf(pickMessageHtmlStream, "<td>");
+            if (deData->flag_clipped) {
+                fprintf(pickMessageHtmlStream, "%sCLIPPED", ignored ? "Ignored:" : "Loc:");
+                fprintf(picksCsvStream, "%sCLIPPED", ignored ? "Ignored:" : "Loc:");
+            } else if (deData->flag_non_contiguous) {
+                fprintf(pickMessageHtmlStream, "%sNON_CONTIG", ignored ? "Ignored:" : "Loc:");
+                fprintf(picksCsvStream, "%sCLIPPED", ignored ? "Ignored:" : "Loc:");
+            } else if (deData->flag_a_ref_not_ok) {
+                fprintf(pickMessageHtmlStream, "%sin_prev_coda", ignored ? "Ignored:" : "Loc:");
+                fprintf(picksCsvStream, "%sin_prev_coda", ignored ? "Ignored:" : "Loc:");
+            } else if (!deData->flag_complete_t50) {
+                fprintf(pickMessageHtmlStream, "incomplete...");
+                fprintf(picksCsvStream, "incomplete");
+                // 20130128 AJL - use flag_snr_brb_int_too_low to allow mwp, mwpd, etc., but do not use for ignore tests (e.g. ignore determined by flag_snr_brb_too_low)
+                //} else if (deData->flag_snr_hf_too_low && deData->flag_snr_brb_too_low && deData->flag_snr_brb_int_too_low) {
+            } else if (deData->flag_snr_hf_too_low && deData->flag_snr_brb_too_low) {
+                fprintf(pickMessageHtmlStream, "%ss/n_HF_BRBV_low", ignored ? "Ignored:" : "Loc:");
+                fprintf(picksCsvStream, "%ss/n_HF_BRB_low", ignored ? "Ignored:" : "Loc:");
+            } else if (deData->flag_snr_hf_too_low) {
+                fprintf(pickMessageHtmlStream, "s/n_HF_low");
+                fprintf(picksCsvStream, "s/n_HF_low");
+            } else if (deData->flag_snr_brb_too_low) {
+                fprintf(pickMessageHtmlStream, "s/n_BRBV_low");
+                fprintf(picksCsvStream, "s/n_BRBV_low");
+            } else if (deData->flag_snr_brb_int_too_low) {
+                fprintf(pickMessageHtmlStream, "s/n_BRBD_low");
+                fprintf(picksCsvStream, "s/n_BRBD_low");
+            } else {
+                fprintf(pickMessageHtmlStream, "OK_HF_BRB");
+                fprintf(picksCsvStream, "OK_HF_BRB");
+            }
+            fprintf(pickMessageHtmlStream, "</td>");
+            fprintf(pickMessageHtmlStream, "</tr>\n");
+            // 20150716 AJL - add station correction to pick csv file
+            fprintf(picksCsvStream, " %.3f ", deData->sta_corr);
+            fprintf(picksCsvStream, "\n");
+        }
+    }
+    fclose_counter(pickDataNLLStream);
+    fprintf(pickMessageHtmlStream, "</tbody>\n</table>\n</body>\n</html>\n");
+    fclose_counter(pickMessageHtmlStream);
+    fclose_counter(picksCsvStream);
+
+    // write pick summary log
+    // pickMessageLogStream
+    snprintf(outname, STANDARD_STRLEN, "%s/picks.log", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * pickMessageLogStream = fopen_counter(outname, "w");
+    if (pickMessageLogStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    fprintf(pickMessageLogStream, "%ld %d %d %d %d %d %d %d %d %d %d %d\n",
+            plot_time_max, num_pick, num_pick_not_completed, num_pick_clipped, num_pick_non_contiguous, num_pick_sn_low, num_pick_sn_brb_low, num_pick_sn_brb_int_low,
+            num_pick_in_prev_coda, num_pick_ok, num_pick_assoc, num_event);
+    fclose_counter(pickMessageLogStream);
+
+
+    // miscellaneous output ===============================================================
+
+    // GMT style
+    char staHealthyStream_name[STANDARD_STRLEN];
+    snprintf(outname, STANDARD_STRLEN, "%s/plot/sta.healthy.xy", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * staHealthyStream = fopen_counter(outname, "w");
+    if (staHealthyStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    strcpy(staHealthyStream_name, outname);
+    // GMT style
+    char staRequestedStream_name[STANDARD_STRLEN];
+    snprintf(outname, STANDARD_STRLEN, "%s/plot/sta.requested.xy", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * staRequestedStream = fopen_counter(outname, "w");
+    if (staRequestedStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    strcpy(staRequestedStream_name, outname);
+    // GMT style
+    char staCodeStream_name[STANDARD_STRLEN];
+    snprintf(outname, STANDARD_STRLEN, "%s/plot/sta.code.txt", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * staCodeStream = fopen_counter(outname, "w");
+    if (staCodeStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    strcpy(staCodeStream_name, outname);
+    // write all recently active stations to sta streams
+    //int nstaIsActive = 0;
+    //int nstaHasBeenActive = 0;
+    for (int n = 0; n < num_sources_total; n++) {
+        if (channelParameters[n].have_coords && !channelParameters[n].inactive_duplicate && channelParameters[n].process_this_channel_orientation) {
+            fprintf(staCodeStream, "%f %f %s\n", channelParameters[n].lat, channelParameters[n].lon, channelParameters[n].station);
+            //nstaHasBeenActive++;
+            //if (channelParameters[n].data_latency < report_interval)
+            //    nstaIsActive++;
+            if ((channelParameters[n].data_latency < LATENCY_YELLOW_CUTOFF) && (channelParameters[n].qualityWeight > DATA_UNASSOC_WT_YELLOW_CUTOFF) && !(channelParameters[n].error)) {
+                fprintf(staHealthyStream, "%f %f\n", channelParameters[n].lat, channelParameters[n].lon);
+            } else {
+                fprintf(staRequestedStream, "%f %f\n", channelParameters[n].lat, channelParameters[n].lon);
+            }
+        }
+    }
+    //
+    fclose_counter(staHealthyStream);
+    fclose_counter(staRequestedStream);
+    fclose_counter(staCodeStream);
+#ifdef USE_JSON_OUTPUT
+    if (save_plotfiles_geojson) {
+        // GeoJSON 20211130
+        snprintf(outname, STANDARD_STRLEN, "%s.json", staHealthyStream_name);
+        int ncolumns = 2;
+        char *columns[] = {GEOJSON_LAT, GEOJSON_LON};
+        int nproperties = 1;
+        char *properties[] = {"name"};
+        char *values[] = {"staHealthy"};
+        writeGeoJSONcopyOftable(staHealthyStream_name, ncolumns, columns, nproperties, properties, values, " ", GEOJSON_MultiPoint, outname);
+    }
+    if (save_plotfiles_geojson) {
+        // GeoJSON 20211130
+        snprintf(outname, STANDARD_STRLEN, "%s.json", staRequestedStream_name);
+        int ncolumns = 2;
+        char *columns[] = {GEOJSON_LAT, GEOJSON_LON};
+        int nproperties = 1;
+        char *properties[] = {"name"};
+        char *values[] = {"staRequested"};
+        writeGeoJSONcopyOftable(staRequestedStream_name, ncolumns, columns, nproperties, properties, values, " ", GEOJSON_MultiPoint, outname);
+    }
+    if (save_plotfiles_geojson) {
+        // GeoJSON 20211130
+        snprintf(outname, STANDARD_STRLEN, "%s.json", staCodeStream_name);
+        int ncolumns = 2;
+        char *columns[] = {GEOJSON_LAT, GEOJSON_LON};
+        int nproperties = 1;
+        char *properties[] = {"name"};
+        char *values[] = {"staCode"};
+        writeGeoJSONcopyOftable(staCodeStream_name, ncolumns, columns, nproperties, properties, values, " ", GEOJSON_MultiPoint, outname);
+    }
+#endif
+
+
+    // write alarm csv data ===============================================================
+
+    double level_plot = 0.0;
+
+    // T50 Level
+    snprintf(outname, STANDARD_STRLEN, "%s/t50.csv", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * t50ExCsvStream = fopen_counter(outname, "w");
+    if (t50ExCsvStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    // t50 10.0
+    fprintf(t50ExCsvStream, "t50");
+    fprintf(t50ExCsvStream, " %lf", T50EX_CRITICAL_VALUE);
+    fprintf(t50ExCsvStream, " %lf", difftime(plot_time_max, plot_time_min) / 60.0);
+    fprintf(t50ExCsvStream, " %s", time2string(plot_time_min, tmp_str));
+    fprintf(t50ExCsvStream, " %s", time2string(plot_time_max, tmp_str));
+    fprintf(t50ExCsvStream, " %d", report_interval);
+    fprintf(t50ExCsvStream, " %d", nstaIsActive);
+    fprintf(t50ExCsvStream, " %d", nstaHasBeenActive);
+    fprintf(t50ExCsvStream, " %d", num_hypocenters_associated);
+    fprintf(t50ExCsvStream, "\n");
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        level_plot = t50ExLevelStatistics[nhyp].centralValue < T50EX_LEVEL_MAX ? t50ExLevelStatistics[nhyp].centralValue : T50EX_LEVEL_MAX;
+        level_plot = level_plot > T50EX_LEVEL_MIN ? level_plot : T50EX_LEVEL_MIN;
+        fprintf(t50ExCsvStream, " %.1f", level_plot);
+        fprintf(t50ExCsvStream, " %.1f", t50ExLevelStatistics[nhyp].centralValue);
+        fprintf(t50ExCsvStream, " %.1f", t50ExLevelStatistics[nhyp].lowerBound);
+        fprintf(t50ExCsvStream, " %.1f", t50ExLevelStatistics[nhyp].upperBound);
+        fprintf(t50ExCsvStream, " %s", t50ExLevelString[nhyp]);
+        fprintf(t50ExCsvStream, " %d", t50ExLevelStatistics[nhyp].numLevel);
+        fprintf(t50ExCsvStream, "\n");
+    }
+    fclose_counter(t50ExCsvStream);
+    //
+    FILE* taucCsvStream = NULL;
+    snprintf(outname, STANDARD_STRLEN, "%s/tauc.csv", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    taucCsvStream = fopen_counter(outname, "w");
+    if (taucCsvStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    // tauc 10.0
+    fprintf(taucCsvStream, "tauc");
+    fprintf(taucCsvStream, " %lf", TAUC_CRITICAL_VALUE);
+    fprintf(taucCsvStream, " %lf", difftime(plot_time_max, plot_time_min) / 60.0);
+    fprintf(taucCsvStream, " %s", time2string(plot_time_min, tmp_str));
+    fprintf(taucCsvStream, " %s", time2string(plot_time_max, tmp_str));
+    fprintf(taucCsvStream, " %d", report_interval);
+    fprintf(taucCsvStream, " %d", nstaIsActive);
+    fprintf(taucCsvStream, " %d", nstaHasBeenActive);
+    fprintf(taucCsvStream, " %d", num_hypocenters_associated);
+    fprintf(taucCsvStream, "\n");
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        level_plot = taucLevelStatistics[nhyp].centralValue < TAUC_LEVEL_MAX ? taucLevelStatistics[nhyp].centralValue : TAUC_LEVEL_MAX;
+        level_plot = level_plot > TAUC_LEVEL_MIN ? level_plot : TAUC_LEVEL_MIN;
+        fprintf(taucCsvStream, " %.1f", level_plot);
+        fprintf(taucCsvStream, " %.1f", taucLevelStatistics[nhyp].centralValue);
+        fprintf(taucCsvStream, " %.1f", taucLevelStatistics[nhyp].lowerBound);
+        fprintf(taucCsvStream, " %.1f", taucLevelStatistics[nhyp].upperBound);
+        fprintf(taucCsvStream, " %s", taucLevelString[nhyp]);
+        fprintf(taucCsvStream, " %d", taucLevelStatistics[nhyp].numLevel);
+        fprintf(taucCsvStream, "\n");
+    }
+    fclose_counter(taucCsvStream);
+    //
+    FILE* tdT50ExCsvStream = NULL;
+    // TdT50Ex
+    snprintf(outname, STANDARD_STRLEN, "%s/alarm.csv", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    tdT50ExCsvStream = fopen_counter(outname, "w");
+    if (tdT50ExCsvStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    // alarm 10.0
+    fprintf(tdT50ExCsvStream, "alarm");
+    fprintf(tdT50ExCsvStream, " %lf", TDT50EX_CRITICAL_VALUE);
+    fprintf(tdT50ExCsvStream, " %lf", difftime(plot_time_max, plot_time_min) / 60.0);
+    fprintf(tdT50ExCsvStream, " %s", time2string(plot_time_min, tmp_str));
+    fprintf(tdT50ExCsvStream, " %s", time2string(plot_time_max, tmp_str));
+    fprintf(tdT50ExCsvStream, " %d", report_interval);
+    fprintf(tdT50ExCsvStream, " %d", nstaIsActive);
+    fprintf(tdT50ExCsvStream, " %d", nstaHasBeenActive);
+    fprintf(tdT50ExCsvStream, " %d", num_hypocenters_associated);
+    fprintf(tdT50ExCsvStream, "\n");
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        level_plot = tdT50ExLevelStatistics[nhyp].centralValue < TDT50EX_LEVEL_MAX ? tdT50ExLevelStatistics[nhyp].centralValue : TDT50EX_LEVEL_MAX;
+        level_plot = level_plot > TDT50EX_LEVEL_MIN ? level_plot : TDT50EX_LEVEL_MIN;
+        fprintf(tdT50ExCsvStream, " %.1f", level_plot);
+        fprintf(tdT50ExCsvStream, " %.1f", tdT50ExLevelStatistics[nhyp].centralValue);
+        fprintf(tdT50ExCsvStream, " %.1f", tdT50ExLevelStatistics[nhyp].lowerBound);
+        fprintf(tdT50ExCsvStream, " %.1f", tdT50ExLevelStatistics[nhyp].upperBound);
+        fprintf(tdT50ExCsvStream, " %s", warningLevelString[nhyp]);
+        fprintf(tdT50ExCsvStream, " %d", tdT50ExLevelStatistics[nhyp].numLevel);
+        fprintf(tdT50ExCsvStream, "\n");
+    }
+    fclose_counter(tdT50ExCsvStream);
+    //
+    // mb
+    FILE* mbCsvStream = NULL;
+    snprintf(outname, STANDARD_STRLEN, "%s/mb.csv", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    mbCsvStream = fopen_counter(outname, "w");
+    if (mbCsvStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    // Mwp
+    FILE* mwpCsvStream = NULL;
+    snprintf(outname, STANDARD_STRLEN, "%s/mwp.csv", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    mwpCsvStream = fopen_counter(outname, "w");
+    if (mwpCsvStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    // Mwpd
+    FILE* mwpdCsvStream = NULL;
+    snprintf(outname, STANDARD_STRLEN, "%s/mwpd.csv", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    mwpdCsvStream = fopen_counter(outname, "w");
+    if (mwpdCsvStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    // mb 10.0
+    fprintf(mbCsvStream, "mb");
+    fprintf(mbCsvStream, " %lf", MB_CRITICAL_VALUE);
+    fprintf(mbCsvStream, " %lf", difftime(plot_time_max, plot_time_min) / 60.0);
+    fprintf(mbCsvStream, " %s", time2string(plot_time_min, tmp_str));
+    fprintf(mbCsvStream, " %s", time2string(plot_time_max, tmp_str));
+    fprintf(mbCsvStream, " %d", report_interval);
+    fprintf(mbCsvStream, " %d", nstaIsActive);
+    fprintf(mbCsvStream, " %d", nstaHasBeenActive);
+    fprintf(mbCsvStream, " %d", num_hypocenters_associated);
+    fprintf(mbCsvStream, "\n");
+    // mwpd 10.0
+    fprintf(mwpdCsvStream, "mwpd");
+    fprintf(mwpdCsvStream, " %lf", MWPD_CRITICAL_VALUE);
+    fprintf(mwpdCsvStream, " %lf", difftime(plot_time_max, plot_time_min) / 60.0);
+    fprintf(mwpdCsvStream, " %s", time2string(plot_time_min, tmp_str));
+    fprintf(mwpdCsvStream, " %s", time2string(plot_time_max, tmp_str));
+    fprintf(mwpdCsvStream, " %d", report_interval);
+    fprintf(mwpdCsvStream, " %d", nstaIsActive);
+    fprintf(mwpdCsvStream, " %d", nstaHasBeenActive);
+    fprintf(mwpdCsvStream, " %d", num_hypocenters_associated);
+    fprintf(mwpdCsvStream, "\n");
+    // mwp 10.0
+    fprintf(mwpCsvStream, "mwp");
+    fprintf(mwpCsvStream, " %lf", MWP_CRITICAL_VALUE);
+    fprintf(mwpCsvStream, " %lf", difftime(plot_time_max, plot_time_min) / 60.0);
+    fprintf(mwpCsvStream, " %s", time2string(plot_time_min, tmp_str));
+    fprintf(mwpCsvStream, " %s", time2string(plot_time_max, tmp_str));
+    fprintf(mwpCsvStream, " %d", report_interval);
+    fprintf(mwpCsvStream, " %d", nstaIsActive);
+    fprintf(mwpCsvStream, " %d", nstaHasBeenActive);
+    fprintf(mwpCsvStream, " %d", num_hypocenters_associated);
+    fprintf(mwpCsvStream, "\n");
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        // set preferred magnitude flags
+        // 20171114 AJL - added
+        char mb_preferred[2] = "";
+        char mwp_preferred[2] = "";
+        char mwpd_preferred[2] = "";
+        setPreferredMagnitudeFlags(hyp_assoc_loc[nhyp], mb_preferred, mwp_preferred, mwpd_preferred);
+        //printf("DEBUG: mb_preferred <%s>  mwp_preferred <%s>  mwpd_preferred <%s>\n", mb_preferred, mwp_preferred, mwpd_preferred);
+        // mb
+        level_plot = mbLevelStatistics[nhyp].centralValue < MB_LEVEL_MAX ? mbLevelStatistics[nhyp].centralValue : MB_LEVEL_MAX;
+        level_plot = level_plot > MB_LEVEL_MIN ? level_plot : MB_LEVEL_MIN;
+        fprintf(mbCsvStream, " %.1f", level_plot);
+        fprintf(mbCsvStream, " %.1f%s", mbLevelStatistics[nhyp].centralValue, mb_preferred);
+        fprintf(mbCsvStream, " %.1f", mbLevelStatistics[nhyp].lowerBound);
+        fprintf(mbCsvStream, " %.1f", mbLevelStatistics[nhyp].upperBound);
+        fprintf(mbCsvStream, " %s", mbLevelString[nhyp]);
+        fprintf(mbCsvStream, " %d", mbLevelStatistics[nhyp].numLevel);
+        fprintf(mbCsvStream, "\n");
+        // Mwp
+        level_plot = mwpLevelStatistics[nhyp].centralValue < MWP_LEVEL_MAX ? mwpLevelStatistics[nhyp].centralValue : MWP_LEVEL_MAX;
+        level_plot = level_plot > MWP_LEVEL_MIN ? level_plot : MWP_LEVEL_MIN;
+        fprintf(mwpCsvStream, " %.1f", level_plot);
+        fprintf(mwpCsvStream, " %.1f%s", mwpLevelStatistics[nhyp].centralValue, mwp_preferred);
+        fprintf(mwpCsvStream, " %.1f", mwpLevelStatistics[nhyp].lowerBound);
+        fprintf(mwpCsvStream, " %.1f", mwpLevelStatistics[nhyp].upperBound);
+        fprintf(mwpCsvStream, " %s", mwpLevelString[nhyp]);
+        fprintf(mwpCsvStream, " %d", mwpLevelStatistics[nhyp].numLevel);
+        fprintf(mwpCsvStream, "\n");
+        // Mwpd
+        level_plot = mwpdLevelStatistics[nhyp].centralValue < MWPD_LEVEL_MAX ? mwpdLevelStatistics[nhyp].centralValue : MWPD_LEVEL_MAX;
+        level_plot = level_plot > MWPD_LEVEL_MIN ? level_plot : MWPD_LEVEL_MIN;
+        fprintf(mwpdCsvStream, " %.1f", level_plot);
+        fprintf(mwpdCsvStream, " %.1f%s", mwpdLevelStatistics[nhyp].centralValue, mwpd_preferred);
+        fprintf(mwpdCsvStream, " %.1f", mwpdLevelStatistics[nhyp].lowerBound);
+        fprintf(mwpdCsvStream, " %.1f", mwpdLevelStatistics[nhyp].upperBound);
+        fprintf(mwpdCsvStream, " %s", mwpdLevelString[nhyp]);
+        fprintf(mwpdCsvStream, " %d", mwpdLevelStatistics[nhyp].numLevel);
+        fprintf(mwpdCsvStream, "\n");
+    }
+    fclose_counter(mbCsvStream);
+    fclose_counter(mwpCsvStream);
+    fclose_counter(mwpdCsvStream);
+    //
+    FILE* t0CsvStream = NULL;
+    snprintf(outname, STANDARD_STRLEN, "%s/t0.csv", outnameroot);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    t0CsvStream = fopen_counter(outname, "w");
+    if (t0CsvStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    // t0 10.0
+    fprintf(t0CsvStream, "t0");
+    fprintf(t0CsvStream, " %lf", T0_CRITICAL_VALUE);
+    fprintf(t0CsvStream, " %lf", difftime(plot_time_max, plot_time_min) / 60.0);
+    fprintf(t0CsvStream, " %s", time2string(plot_time_min, tmp_str));
+    fprintf(t0CsvStream, " %s", time2string(plot_time_max, tmp_str));
+    fprintf(t0CsvStream, " %d", report_interval);
+    fprintf(t0CsvStream, " %d", nstaIsActive);
+    fprintf(t0CsvStream, " %d", nstaHasBeenActive);
+    fprintf(t0CsvStream, " %d", num_hypocenters_associated);
+    fprintf(t0CsvStream, "\n");
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        level_plot = t0LevelStatistics[nhyp].centralValue < T0_LEVEL_MAX ? t0LevelStatistics[nhyp].centralValue : T0_LEVEL_MAX;
+        level_plot = level_plot > T0_LEVEL_MIN ? level_plot : T0_LEVEL_MIN;
+        fprintf(t0CsvStream, " %.1f", level_plot);
+        fprintf(t0CsvStream, " %.0f", t0LevelStatistics[nhyp].centralValue);
+        fprintf(t0CsvStream, " %.0f", t0LevelStatistics[nhyp].lowerBound);
+        fprintf(t0CsvStream, " %.0f", t0LevelStatistics[nhyp].upperBound);
+        fprintf(t0CsvStream, " %s", t0LevelString[nhyp]);
+        fprintf(t0CsvStream, " %d", t0LevelStatistics[nhyp].numLevel);
+        fprintf(t0CsvStream, "\n");
+    }
+    fclose_counter(t0CsvStream);
+
+
+    // perform update of waveform export for associated P ===============================================================
+
+    if (waveform_export_enable) {
+        // initialize waveform export flags for each hypo
+        static int waveform_exported[MAX_NUM_HYPO];
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            waveform_exported[nhyp] = 0;
+        }
+        // set waveform files root path
+        static char waveforms_root[STANDARD_STRLEN];
+        sprintf(waveforms_root, "%s/waveforms/", outnameroot_archive); // directory
+        mkdir(waveforms_root, 0755);
+        static char hdr_filename[STANDARD_STRLEN];
+        // update waveform export for all associated P data
+        //int i = 0;
+        //printf("TP %d\n", i++);
+        for (int n = num_de_data - 1; n >= 0; n--) {
+            //i = 1;
+            //printf("TP %d num_de_data=%d\n", i++, n);
+            TimedomainProcessingData* deData = data_list[n];
+            hptime_t start_time_written, end_time_written;
+            // 20140417 AJL - make selection less strict to include all first arrival or direct P phases which can be counted in location
+            //if (is_associated_location_P(deData) && is_count_in_location(deData->phase_id)) {
+            if (is_associated_phase(deData)
+                    && (is_first_arrival_P(deData->phase_id) || is_direct_P(deData->phase_id))
+                    && is_count_in_location(deData->phase_id)
+                    && deData->loc_weight > FLT_MIN // 20180130 AJL - Bug fix, added, prevent duplicate waveforms
+                    ) {
+                //printf("TP %d\n", i++);
+                // int waveform_export_memory_sliding_window_length;   // seconds
+                // int waveform_export_window_start_before_P;   // seconds
+                // int waveform_export_window_end_after_S;   // seconds
+                //printf("TP %d waveform_export_window_start_before_P=%ld, waveform_export_window_end_after_S=%ld\n", i++,
+                //waveform_export_window_start_before_P, waveform_export_window_end_after_S);
+                HypocenterDesc* phypo = hyp_assoc_loc[deData->is_associated - 1];
+                hptime_t origin_time = timeDecSec2hptime(phypo->otime);
+                double ttime_P = deData->ttime_P;
+                hptime_t start_time;
+                if (ttime_P != VALUE_NOT_SET) {
+                    start_time = origin_time + (ttime_P - waveform_export_window_start_before_P) * (double) HPTMODULUS;
+                } else { // 20170406 AJL - bug fix, to correctly support waveform export of PKP
+                    // P not available (deData may be PKP), use deData time as ref
+                    start_time = ((double) (deData->t_time_t) + deData->t_decsec - waveform_export_window_start_before_P) * (double) HPTMODULUS;
+                }
+                double ttime_S = deData->ttime_S;
+                hptime_t end_time;
+                if (ttime_S != VALUE_NOT_SET) {
+                    end_time = origin_time + (ttime_S + waveform_export_window_end_after_S) * (double) HPTMODULUS;
+                } else { // 20170406 AJL - bug fix, to correctly support waveform export of PKP
+                    // S not available (deData may be PKP), use deData time as ref
+                    end_time = ((double) (deData->t_time_t) + deData->t_decsec + waveform_export_window_end_after_S) * (double) HPTMODULUS;
+                }
+                //printf("TP %d ttime_P=%f, ttime_S=%f\n", i++, ttime_P, ttime_S);
+                //printf("TP %d start_time=%ld, origin_time=%ld, end_time=%ld\n", i++, start_time/HPTMODULUS, origin_time/HPTMODULUS, end_time/HPTMODULUS);
+                //printf("TP %d start_time-origin_time=%ld, end_time-origin_time=%ld\n", i++, (start_time-origin_time)/HPTMODULUS, (end_time - origin_time)/HPTMODULUS);
+                //printf("TP %d mslist_getStartTime=%ld, mslist_getEndTime=%ld\n", i++,
+                //mslist_getStartTime(waveform_export_miniseed_list[deData->source_id], num_waveform_export_miniseed_list[deData->source_id])/HPTMODULUS,
+                //mslist_getEndTime(waveform_export_miniseed_list[deData->source_id], num_waveform_export_miniseed_list[deData->source_id])/HPTMODULUS);
+
+                // 20160808 AJL - add support for 3-comp write
+                int source_id_write = deData->source_id;
+                ChannelParameters * chan_params = channelParameters + source_id_write;
+                for (int ncomp = 0; ncomp < 3; ncomp++) {
+                    ChannelParameters* chan_params_write = chan_params; // ncomp = 0
+                    if (ncomp > 0) { // check for other channel orientations
+                        if (chan_params->channel_set[ncomp - 1] >= 0) {
+                            source_id_write = chan_params->channel_set[ncomp - 1];
+                            chan_params_write = channelParameters + source_id_write;
+                        } else {
+                            continue;
+                        }
+                    }
+                    if (
+                            (
+                            deData->waveform_export[ncomp].start_time_written < 0 || // data not yet written
+                            (start_time < deData->waveform_export[ncomp].start_time_written // required start time earlier than start time of written data
+                            && deData->waveform_export[ncomp].start_time_written > // AND more data available at beginning (impossible with real-time SeedLink data)
+                            mslist_getStartTime(waveform_export_miniseed_list[source_id_write], num_waveform_export_miniseed_list[source_id_write]))
+                            )
+                            ||
+                            (
+                            deData->waveform_export[ncomp].end_time_written < 0 || // data not yet written
+                            (end_time > deData->waveform_export[ncomp].end_time_written // required end time later than end time of written data
+                            && deData->waveform_export[ncomp].end_time_written < // AND more data available at end
+                            mslist_getEndTime(waveform_export_miniseed_list[source_id_write], num_waveform_export_miniseed_list[source_id_write]))
+                            )
+                            ) {
+                        snprintf(outname, STANDARD_STRLEN, "%s/%ld/", waveforms_root, phypo->unique_id); // directory
+                        mkdir(outname, 0755);
+                        char* filename = deData->waveform_export[ncomp].filename;
+                        int iyear, ijday, ihour, imin;
+                        double sec;
+                        if (filename[0] == '\0' || deData->waveform_export[ncomp].hypo_unique_id != phypo->unique_id) {
+                            //hptime2dateTimeComponents(start_time_written, &iyear, &ijday, &ihour, &imin, &sec);
+                            //sprintf(filename, "%s%4.4d.%3.3d.%2.2d.%2.2d.%06.3f", outname, iyear, ijday, ihour, imin, sec);
+                            // path, pick time
+                            timeDecSec2string((double) deData->t_time_t + deData->t_decsec, tmp_str, PERIOD_DELIMTED_TIME_FORMAT);
+                            snprintf(filename, sizeof (deData->waveform_export[ncomp].filename), "%s%s", outname, tmp_str); // 20180131 AJL - added to support SeisGram2K waveform reading
+                            // stream
+                            strcat(filename, ".");
+                            strcat(filename, chan_params_write->network);
+                            strcat(filename, ".");
+                            strcat(filename, chan_params_write->station);
+                            strcat(filename, ".");
+                            strcat(filename, chan_params_write->location);
+                            strcat(filename, ".");
+                            strcat(filename, chan_params_write->channel);
+                            // file type extension
+                            strcat(filename, ".mseed");
+                        }
+                        //printf("TP %d filename=%s\n", i++, filename);
+                        int sampleLength = mslist_writeToFile(filename, start_time, end_time,
+                                waveform_export_miniseed_list[source_id_write], num_waveform_export_miniseed_list[source_id_write], verbose,
+                                &start_time_written, &end_time_written);
+                        //printf("DEBUG: mslist_writeToFile: nwritten %d: %s time:%ld->%ld twritten:%ld->%ld diff:%ld->%ld\n",
+                        //        nrecords_written, filename, start_time, end_time, start_time_written, end_time_written, start_time_written - start_time, end_time_written - end_time);
+                        deData->waveform_export[ncomp].start_time_written = start_time_written;
+                        deData->waveform_export[ncomp].end_time_written = end_time_written;
+                        deData->waveform_export[ncomp].hypo_unique_id = phypo->unique_id;
+                        waveform_exported[deData->is_associated - 1] = 1;
+                        // write waveform header file
+                        strcpy(hdr_filename, deData->waveform_export[ncomp].filename);
+                        strcat(hdr_filename, ".sg2k");
+                        snprintf(tmp_str, STANDARD_STRLEN, "%ld", phypo->unique_id);
+                        double comp_azimuth = chan_params_write->azimuth;
+                        // SAC / SG2K: inclination = Component incident angle (degrees from vertical up).   eg.    0, 90, 180
+                        // FDSN/SEED: dip = Dip of the instrument in degrees, down from horizontal          e.g. -90,  0,  90
+                        double comp_inclination = chan_params_write->dip + 90.0;
+                        double baz = GCAzimuth(chan_params_write->lat, chan_params_write->lon, phypo->lat, phypo->lon);
+                        char component[4];
+                        if (strlen(chan_params_write->channel) >= 3) {
+                            strcpy(component, chan_params_write->channel + 2);
+                        } else {
+                            strcpy(component, chan_params_write->channel);
+                        }
+                        char* loc;
+                        if (strcmp(chan_params_write->location, "--") == 0) {
+                            loc = NULL;
+                        } else {
+                            loc = chan_params_write->location;
+                        }
+                        // 20140123 AJL
+                        //double gain = chan_resp[source_id_write].have_gain ? chan_resp[source_id_write].gain : -1.0;
+                        double gain = chan_resp[source_id_write].have_gain && chan_resp[source_id_write].responseType == DERIVATIVE_TYPE
+                                ? chan_resp[source_id_write].gain : -1.0;
+                        //printf("DEBUG: %s_%s_%s have_gain=%d gain=%e->%e \n", chan_params_write->network, chan_params_write->station, chan_params_write->channel,
+                        //        chan_resp[source_id_write].have_gain, chan_resp[source_id_write].gain, gain);
+                        hptime2dateTimeComponents(start_time_written, &iyear, &ijday, &ihour, &imin, &sec);
+                        writeSG2Kheader(hdr_filename, tmp_str,
+                                iyear, ijday, ihour, imin, sec, 0.0,
+                                chan_params_write->network, chan_params_write->station,
+                                NULL, chan_params_write->channel, loc, chan_params_write->channel,
+                                comp_azimuth, comp_inclination,
+                                chan_params_write->lat, chan_params_write->lon,
+                                0.0, chan_params_write->elev / 1000.0, gain,
+                                sampleLength, 1.0 / chan_params_write->deltaTime, "counts", "sec",
+                                phypo->lat, phypo->lon, phypo->depth,
+                                timeDecSec2string(phypo->otime, tmp_str_2, COMMA_DELIMTED_TIME_FORMAT),
+                                -9.9, phypo->mbLevelStatistics.centralValue, phypo->mwpLevelStatistics.centralValue, -9.9, -9.9, phypo->mwpLevelStatistics.centralValue,
+                                deData->epicentral_distance, deData->epicentral_distance * DEG2KM, deData->epicentral_azimuth, baz,
+                                1
+                                );
+                    }
+                }
+            } else {
+                // not saving waveforms, delete any previously generated waveform files
+                for (int ncomp = 0; ncomp < 3; ncomp++) {
+                    if (deData->waveform_export[ncomp].filename[0] != '\0') {
+                        char* filename = deData->waveform_export[ncomp].filename;
+                        // delete waveform file
+                        printf("DEBUG: removing unneeded waveform file: %s\n", filename);
+                        if (remove(filename) < 0) {
+                            fprintf(stderr, "ERROR: removing unneeded waveform file: %s: %s\n", filename, strerror(errno));
+                        }
+                        // re-initialize waveform export
+                        deData->waveform_export[ncomp].filename[0] = '\0';
+                        deData->waveform_export[ncomp].start_time_written = -1;
+                        deData->waveform_export[ncomp].end_time_written = -1;
+                        deData->waveform_export[ncomp].hypo_unique_id = -1;
+                    }
+                }
+            }
+        }
+        // clean up old waveform data
+        if (remove_file_archive_directories(waveforms_root, waveform_export_file_archive_age_max) != 0) {
+            printf("ERROR: waveform export: while cleaning up old waveform data.\n");
+        }
+        // write hypocenter info and picks for each associated hypocenter for which waveforms were exported
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            if (waveform_exported[nhyp]) {
+                HypocenterDesc* phypo = hyp_assoc_loc[nhyp];
+                // hypocenter  csv strings
+                snprintf(outname, STANDARD_STRLEN, "%s/%ld/%s", waveforms_root, phypo->unique_id, "hypo.csv");
+                FILE * fpout = fopen_counter(outname, "w");
+                if (fpout == NULL) {
+                    snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+                    perror(tmp_str);
+                    continue;
+                }
+                printHypoDataHeaderString(hypoDataString);
+                fprintf(fpout, "%s\n", hypoDataString);
+                printHypoDataString(phypo, hypoDataString, 1, 0);
+                fprintf(fpout, "%s\n", hypoDataString);
+                fclose_counter(fpout);
+                snprintf(outname, STANDARD_STRLEN, "%s/%ld/%s", waveforms_root, phypo->unique_id, "hypo_pretty.csv");
+                fpout = fopen_counter(outname, "w");
+                if (fpout == NULL) {
+                    snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+                    perror(tmp_str);
+                    continue;
+                }
+                printHypoDataHeaderString(hypoDataString);
+                fprintf(fpout, "%s\n", hypoDataString);
+                printHypoDataString(phypo, hypoDataString, 0, 0);
+                fprintf(fpout, "%s\n", hypoDataString);
+                fclose_counter(fpout);
+                // picks
+                snprintf(outname, STANDARD_STRLEN, "%s/%ld/%s", waveforms_root, phypo->unique_id, "pickdata_nlloc.txt");
+                fpout = fopen_counter(outname, "w");
+                if (fpout == NULL) {
+                    snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+                    perror(tmp_str);
+                    continue;
+                }
+                for (int n = 0; n < num_de_data; n++) {
+                    TimedomainProcessingData* deData = data_list[n];
+                    if (deData->is_associated - 1 == nhyp) {
+                        fprintf_NLLoc_TimedomainProcessingData(deData, fpout, 0, phypo->depth);
+                        fprintf(fpout, " %ld\n", phypo->unique_id);
+                    }
+                }
+                fclose_counter(fpout);
+            }
+        }
+    }
+
+
+    // perform update of waveform export for all data if requested (file "export_waveforms_all" exists in working directory) ====================
+
+    if (waveform_export_enable) {
+
+        // if file "export_waveforms_all.flag" exists in working directory, then all waveforms for past hour will be exported
+
+        int export_flag = 0;
+        snprintf(outname, STANDARD_STRLEN, "%s", "export_waveforms_all");
+        int fdtest = open(outname, O_RDONLY);
+        if (fdtest > 0) {
+            // the file exists
+            export_flag = 1;
+            close(fdtest);
+        }
+        printf("Info: export_waveforms_all: flag_file_name:%s fdtest:%d export_flag:%d\n", outname, fdtest, export_flag);
+        remove(outname);
+
+        if (export_flag) {
+
+            // set waveform files root path
+            static char waveforms_root[STANDARD_STRLEN];
+            sprintf(waveforms_root, "%s/waveforms_all/", outnameroot_archive); // directory
+            mkdir(waveforms_root, 0755);
+            static char hdr_filename[STANDARD_STRLEN];
+            // waveform export for all data
+            //int i = 0;
+            //printf("TP %d\n", i++);
+            for (int n = num_de_data - 1; n >= 0; n--) {
+                TimedomainProcessingData* deData = data_list[n];
+                hptime_t start_time = time_min * (double) HPTMODULUS;
+                hptime_t end_time = time_max * (double) HPTMODULUS;
+                snprintf(outname, STANDARD_STRLEN, "%s/%ld/", waveforms_root, time_min); // directory
+                mkdir(outname, 0755);
+                strcat(outname, deData->network);
+                strcat(outname, ".");
+                strcat(outname, deData->station);
+                strcat(outname, ".");
+                strcat(outname, deData->location);
+                strcat(outname, ".");
+                strcat(outname, deData->channel);
+                strcat(outname, ".mseed");
+                hptime_t start_time_written, end_time_written;
+                int sampleLength = mslist_writeToFile(outname, start_time, end_time,
+                        waveform_export_miniseed_list[deData->source_id], num_waveform_export_miniseed_list[deData->source_id], verbose,
+                        &start_time_written, &end_time_written);
+                printf("Info: export_waveforms_all: mslist_writeToFile: nsamp_written %d: %s %s->%s time:%ld->%ld twritten:%ld->%ld diff:%ld->%ld\n",
+                        sampleLength, outname, asctime(gmtime(&time_min)), asctime(gmtime(&time_max)),
+                        (long) start_time, (long) end_time, (long) start_time_written, (long) end_time_written,
+                        (long) (start_time_written - start_time), (long) (end_time_written - end_time));
+                // write waveform header file
+                strcpy(hdr_filename, outname);
+                strcat(hdr_filename, ".sg2k");
+                snprintf(tmp_str, STANDARD_STRLEN, "%ld", time_min);
+                int iyear, ijday, ihour, imin;
+                double sec;
+                double comp_azimuth = -1.0;
+                double comp_inclination = -1.0;
+                char component[4];
+                if (strlen(deData->channel) >= 3) {
+                    strcpy(component, deData->channel + 2);
+                } else {
+                    strcpy(component, deData->channel);
+                }
+                char* loc;
+                if (strcmp(deData->location, "--") == 0) {
+                    loc = NULL;
+                } else {
+                    loc = deData->location;
+                }
+                // 20140123 AJL
+                //double gain = chan_resp[deData->source_id].have_gain ? chan_resp[deData->source_id].gain : -1.0;
+                double gain = chan_resp[deData->source_id].have_gain && chan_resp[deData->source_id].responseType == DERIVATIVE_TYPE
+                        ? chan_resp[deData->source_id].gain : -1.0;
+                //printf("DEBUG: %s_%s_%s have_gain=%d gain=%e->%e \n", deData->network, deData->station, deData->channel,
+                //        chan_resp[deData->source_id].have_gain, chan_resp[deData->source_id].gain, gain);
+                hptime2dateTimeComponents(start_time_written, &iyear, &ijday, &ihour, &imin, &sec);
+                writeSG2Kheader(hdr_filename, tmp_str,
+                        iyear, ijday, ihour, imin, sec, 0.0,
+                        deData->network, deData->station,
+                        NULL, deData->channel, loc, deData->channel,
+                        comp_azimuth, comp_inclination,
+                        channelParameters[deData->source_id].lat, channelParameters[deData->source_id].lon,
+                        0.0, channelParameters[deData->source_id].elev / 1000.0, gain,
+                        sampleLength, 1.0 / deData->deltaTime, "counts", "sec",
+                        DBL_INVALID, DBL_INVALID, DBL_INVALID,
+                        NULL,
+                        DBL_INVALID, DBL_INVALID, DBL_INVALID, DBL_INVALID, DBL_INVALID, DBL_INVALID,
+                        DBL_INVALID, DBL_INVALID, DBL_INVALID, DBL_INVALID,
+                        0
+                        );
+            }
+        }
+    }
+
+
+    // hypocenter management ===============================================================
+
+    // hypo list archive stream
+    snprintf(outname, STANDARD_STRLEN, "%s/hypolist.csv", outnameroot_archive);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * hypoListStream = fopen_counter(outname, "w");
+    if (hypoListStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    printHypoDataHeaderString(hypoDataString);
+    fprintf(hypoListStream, "%s\n", hypoDataString);
+    // hypo list archive stream html
+    snprintf(outname, STANDARD_STRLEN, "%s/hypolist.html", outnameroot_archive);
+    if (verbose > 2)
+        printf("Opening output file: %s\n", outname);
+    FILE * hypoListHtmlStream = fopen_counter(outname, "w");
+    if (hypoListHtmlStream == NULL) {
+        snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+        perror(tmp_str);
+        return (-1);
+    }
+    //double archive_days = (double) MAX_HYPO_ARCHIVE_WINDOW / (double) 3600 / (double) 24;
+    int archive_days = MAX_HYPO_ARCHIVE_WINDOW / 3600 / 24;
+    fprintf(hypoListHtmlStream, "<html>\n<head>\n<title>Latest Earthquakes - Past %d days - %s</title>\n", archive_days, EARLY_EST_MONITOR_NAME);
+    fprintf(hypoListHtmlStream, "<meta http-equiv=\"refresh\" content=\"30\">\n</head>\n<body style=\"font-family:sans-serif;font-size:small\">\n");
+    //fprintf(hypoListHtmlStream, "<table border=0 cellpadding=0 cellspacing=2 width=100%%>\n<tbody>\n");
+    fprintf(hypoListHtmlStream, "<table border=0 cellpadding=1 frame=box rules=rows width=100%%>\n<tbody>\n");
+    printHypoMessageHtmlHeaderString(hypoMessageHtmlString);
+    fprintf(hypoListHtmlStream, "%s\n", hypoMessageHtmlString);
+
+    // check for and process hypocenters with otime before archive or before analysis window
+    free_HypocenterDescList(&orphaned_hypo_list, &num_orphaned_hypocenters); // start with empty orphaned hypo list at each report cycle
+    int icheck_orphaned_duplicates = 0;
+    for (nhyp = num_hypocenters - 1; nhyp >= 0; nhyp--) { // reverse time order, since may remove hypocenters from list.
+        HypocenterDesc* phypo = hypo_list[nhyp];
+        //printf("process: hypo.ot %f\n", phypo->otime);
+        // check if hypocenter should be removed or placed in archive
+        if ((time_t) phypo->otime <= time_min - MAX_HYPO_ARCHIVE_WINDOW) {
+            // otime is before archive window, remove hypocenter
+            if (verbose > 0) {
+                printf("INFO: otime is before archive window, remove hypocenter: %s, phypo->otime %ld, time_min - MAX_HYPO_ARCHIVE_WINDOW %ld\n",
+                        timeDecSec2string(phypo->otime, tmp_str, DEFAULT_TIME_FORMAT), (time_t) phypo->otime, time_min - MAX_HYPO_ARCHIVE_WINDOW);
+            }
+            removeHypocenterDescFromHypoList(phypo, &hypo_list, &num_hypocenters);
+            // free phypo if not from hyp_assoc_loc array, which is freed later
+            int n;
+            for (n = 0; n < MAX_NUM_HYPO; n++) {
+                if (phypo == hyp_assoc_loc[n])
+                    break;
+            }
+            // 20220222 AJL - Bug fix  if (nhyp >= MAX_NUM_HYPO) // not found
+            if (n >= MAX_NUM_HYPO) // not found
+                free(phypo);
+            // 20160913 AJL - changed to remove if after analysis window + report_interval, to avoid conflicts if using only_check_for_new_event within next report_interval
+        } else if (phypo->hyp_assoc_index < 0 && (time_t) phypo->otime > time_min + report_interval) {
+            // event not associated and otime is in analysis window (orphan event?), remove hypocenter
+            if (verbose > 0) {
+                printf("INFO: Event not associated and otime is in analysis window (orphan event?), remove hypocenter: phypo->hyp_assoc_index %d, %s, phypo->otime %ld, time_mintime_min + report_interval %ld\n",
+                        phypo->hyp_assoc_index, timeDecSec2string(phypo->otime, tmp_str, DEFAULT_TIME_FORMAT), (time_t) phypo->otime, time_min + report_interval);
+            }
+            if (num_hypocenters_associated < MAX_NUM_HYPO) { // do not remove events if num_hypocenters_associated == MAX_NUM_HYPO, may be real event
+                if ((time_t) phypo->otime > earliest_time) { // try to avoid removing recent events on startup (BUGGY?)
+                    if (verbose > 0) {
+                        printf("INFO:                  : (time_t) phypo->otime %ld, earliest_time %ld\n", (time_t) phypo->otime, earliest_time);
+                    }
+                    removeHypocenterDescFromHypoList(phypo, &hypo_list, &num_hypocenters);
+                    // add event to orphan event list for reporting
+                    // 20221007 AJL - added to support reporting of orphaned (cancelled) events in monitor.xml
+                    //    https://gitlab.rm.ingv.it/early-est/early-est/-/issues/30
+                    HypocenterDesc* porphaned_hypocenter_desc_inserted = NULL;
+                    addHypocenterDescToHypoList(phypo, &orphaned_hypo_list, &orphaned_hypo_list_size, &num_orphaned_hypocenters,
+                            icheck_orphaned_duplicates, NULL, &porphaned_hypocenter_desc_inserted); // hypocenter unique_id is set here
+                    //printf("DEBUG: Event not associated and otime is in analysis window, added to orphaned_hypo_list: id %ld, phypo->hyp_assoc_index %d, %s, phypo->otime %ld, time_mintime_min + report_interval %ld\n",
+                            //phypo->unique_id, phypo->hyp_assoc_index, timeDecSec2string(phypo->otime, tmp_str, DEFAULT_TIME_FORMAT), (time_t) phypo->otime, time_min + report_interval);
+                    // free phypo if not from hyp_assoc_loc array, which is freed later
+                    int n;
+                    for (n = 0; n < MAX_NUM_HYPO; n++) {
+                        if (phypo == hyp_assoc_loc[n])
+                            break;
+                    }
+                    if (n >= MAX_NUM_HYPO) // not found
+                        free(phypo);
+                }
+            }
+            //} else if (phypo->hyp_assoc_index >= 0 && (time_t) phypo->otime <= time_min) {
+            // event associated and otime is before analysis window, archive hypocenter and remove associated data
+            // 20160910 AJL - changed to remove if before analysis window + report_interval, to avoid conflicts if using only_check_for_new_event within next report_interval
+        } else if (phypo->hyp_assoc_index >= 0 && (time_t) phypo->otime <= time_min + report_interval) {
+            if (verbose > 0) {
+                printf("INFO: Event associated and otime is before analysis window: phypo->hyp_assoc_index %d, %s, phypo->otime %ld, time_mintime_min + report_interval %ld\n",
+                        phypo->hyp_assoc_index, timeDecSec2string(phypo->otime, tmp_str, DEFAULT_TIME_FORMAT), (time_t) phypo->otime, time_min + report_interval);
+            }
+            // write hypo data csv string to hypo list persistent archive
+            // 20141211 AJL - added
+            // hypo list persistent archive stream (TODO: !!! ever growing file!)
+            snprintf(outname, STANDARD_STRLEN, "%s/hypolist_persistent.csv", outnameroot_archive);
+            if (verbose > 2)
+                printf("Opening output file: %s\n", outname);
+            FILE * hypoListPersistentStream = fopen_counter(outname, "a");
+            if (hypoListPersistentStream == NULL) {
+                snprintf(tmp_str, STANDARD_STRLEN, "ERROR: opening output file: %s", outname);
+                perror(tmp_str);
+                return (-1);
+            }
+            // write header if file empty
+            struct stat stbuf;
+            if ((fstat(fileno(hypoListPersistentStream), &stbuf) != 0) || (!S_ISREG(stbuf.st_mode))) {
+                snprintf(tmp_str, STANDARD_STRLEN, "ERROR: calling fstat() on output file: %s", outname);
+                perror(tmp_str);
+            } else {
+                if (stbuf.st_size < 1) {
+                    printHypoDataHeaderString(hypoDataString);
+                    fprintf(hypoListPersistentStream, "%s\n", hypoDataString);
+                }
+            }
+            printHypoDataString(phypo, hypoDataString, 1, 0);
+            fprintf(hypoListPersistentStream, "%s\n", hypoDataString);
+            fclose_counter(hypoListPersistentStream);
+            // remove deData for this hypocenter to avoid false/phantom locations from later phases
+            for (int n = num_de_data - 1; n >= 0; n--) {
+                TimedomainProcessingData* deData = data_list[n];
+                if (deData->is_associated && deData->is_associated == (phypo->hyp_assoc_index + 1)) {
+                    removeTimedomainProcessingDataFromDataList(deData, &data_list, &num_de_data);
+                    free_TimedomainProcessingData(deData);
+                    //data_list[n] = NULL; // 20160802 AJL - memory bug fix?
+                }
+            }
+            // flag event as not actively associated, will insure that event is not persistent or relocated at a later time
+            phypo->hyp_assoc_index = -1;
+        }
+    }
+    // write hypocenter archives
+    for (nhyp = num_hypocenters - 1; nhyp >= 0; nhyp--) { // reverse time order
+        HypocenterDesc* phypo = hypo_list[nhyp];
+        // write hypocenter to archive files
+        // hypo data csv string
+        printHypoDataString(phypo, hypoDataString, 1, 0);
+        fprintf(hypoListStream, "%s\n", hypoDataString);
+        //printf("DEBUG: =========> hypoDataString: %s\n", hypoDataString);
+        // hypo data html string
+        // set event background color based on Mwp
+        if (!useMwpForReport(phypo, 0, 0) // 20220419 AJL - bug fix
+                || !setEventBackgroundColorStringHtml(phypo->mwpLevelStatistics.numLevel, phypo->mwpLevelStatistics.centralValue, "bgcolor=",
+                eventBackgroundColorString, phypo->qualityIndicators.quality_code,
+                reportMinNumberValuesUse.mwp, MAG_MIN_HIGHLIGHT_CUTOFF, MAG_MAX_HIGHLIGHT_CUTOFF, MAG_HIGH_CUTOFF, LOC_QUALITY_ACCEPTABLE)) {
+            // Mwp invalid or not enough Mwp readings, try mb
+            setEventBackgroundColorStringHtml(phypo->mbLevelStatistics.numLevel, phypo->mbLevelStatistics.centralValue, "bgcolor=", eventBackgroundColorString,
+                    phypo->qualityIndicators.quality_code,
+                    reportMinNumberValuesUse.mb, MAG_MIN_HIGHLIGHT_CUTOFF, MAG_MAX_HIGHLIGHT_CUTOFF, MAG_HIGH_CUTOFF, LOC_QUALITY_ACCEPTABLE);
+        }
+        printHypoMessageHtmlString(phypo, hypoMessageHtmlString, eventBackgroundColorString, eventBackgroundColorString, phypo->unique_id, phypo->unique_id);
+        fprintf(hypoListHtmlStream, "%s\n", hypoMessageHtmlString);
+        //printf("DEBUG: =========> hypoMessageHtmlString: %s\n", hypoMessageHtmlString);
+    }
+    fclose_counter(hypoListStream);
+    fprintf(hypoListHtmlStream, "</tbody>\n</table>\n</body>\n</html>\n");
+    fclose_counter(hypoListHtmlStream);
+
+    // 20221012 AJL - this block moved from ~line 6773 above so that updated orphaned_hypo_list is available
+    // xml hypocenters messsage
+    sprintf(xmlWriterFileroot, "%s/monitor", outnameroot);
+    int iWriteAssociatedOnly = 1;
+    int iWriteArrivals = 1;
+    int iWriteUnAssociatedPicks = 1;
+    int iWriteJSONcopy = 1; // 20211103 AJL - added, TOTO: make program property
+    writeLocXML(xmlWriterFileroot, time_max, agencyId, author, hypo_list, num_hypocenters, data_list, num_de_data,
+            orphaned_hypo_list, num_orphaned_hypocenters,  // 20221007 AJL - added
+            iWriteAssociatedOnly, iWriteArrivals, iWriteUnAssociatedPicks, printIgnoredData, iWriteJSONcopy);
+
+    // write archive hypocenter xml      // 20180131 AJL - added to support SeisGram2K waveform reading
+    snprintf(xmlWriterFileroot, STANDARD_STRLEN, "%s/hypolist", outnameroot_archive);
+    iWriteAssociatedOnly = 0;
+    iWriteArrivals = 0;
+    iWriteUnAssociatedPicks = 0;
+    iWriteJSONcopy = 1; // 20211103 AJL - added, TOTO: make program property
+    writeLocXML(xmlWriterFileroot, time_max, agencyId, author, hypo_list, num_hypocenters, data_list, num_de_data,
+            orphaned_hypo_list, num_orphaned_hypocenters,  // 20221007 AJL - added
+            iWriteAssociatedOnly, iWriteArrivals, iWriteUnAssociatedPicks, printIgnoredData, iWriteJSONcopy);
+
+    // write active hypocenter sequence number xml
+    // 20180206 AJL - added
+    if (hypocenter_sequence_xml_enable) {
+        iWriteArrivals = hypocenter_sequence_xml_write_arrivals;
+        // set xml files root path
+        static char hypocenter_sequence_xml_root[STANDARD_STRLEN];
+        sprintf(hypocenter_sequence_xml_root, "%s/event_seq_xml/", outnameroot_archive); // directory
+        mkdir(hypocenter_sequence_xml_root, 0755);
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            HypocenterDesc* phypo = hyp_assoc_loc[nhyp];
+            if (phypo->loc_type == LOC_TYPE_FULL || phypo->loc_type == LOC_TYPE_RELOC_EXISTING) {
+                static char hypocenter_sequence_xml_event[2 * STANDARD_STRLEN];
+                sprintf(hypocenter_sequence_xml_event, "%s/%ld/", hypocenter_sequence_xml_root, phypo->unique_id); // directory
+                mkdir(hypocenter_sequence_xml_event, 0755);
+                snprintf(xmlWriterFileroot, STANDARD_STRLEN, "%s/loc_seq_%3.3d", hypocenter_sequence_xml_event, phypo->loc_seq_num);
+                writeLocXML(xmlWriterFileroot, time_max, agencyId, author, hyp_assoc_loc + nhyp, 1, data_list, num_de_data, NULL, -1,
+                        iWriteAssociatedOnly, iWriteArrivals, iWriteUnAssociatedPicks, printIgnoredData, iWriteJSONcopy);
+            }
+        }
+        // clean up old sequence number xml data
+        if (remove_file_archive_directories(hypocenter_sequence_xml_root, hypocenter_sequence_xml_file_archive_age_max) != 0) {
+            printf("ERROR: hypocenter sequence number xml: while cleaning up old waveform data.\n");
+        }
+    }
+
+
+
+
+
+
+    // hypocenter timedomain-processing data ===============================================================
+
+    // 20101115 AJL - Bug fix: moved this loop to here from beginning of function.
+    //    Before, data from active hypocenter could be removed since time_min is later next time function is entered; this can cause a second or changed location of same event.
+    // remove old timedomain-processing data from list
+    for (int n = num_de_data - 1; n >= 0; n--) {
+        TimedomainProcessingData* deData = data_list[n];
+        //if (deData->t_time_t < time_min) {
+        if (deData->t_time_t < time_min && !deData->is_associated) { // 20150507 AJL - leave associated data, should be removed when hypocenter archived
+            removeTimedomainProcessingDataFromDataList(deData, &data_list, &num_de_data);
+            free_TimedomainProcessingData(deData);
+            //data_list[n] = NULL; // 20160802 AJL - memory bug fix?
+        }
+    }
+
+
+
+    // clean up ===============================================================
+
+    free(t50ExLevelStatistics);
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+        for (int m = 0; m < 3; m++) {
+            free(t50ExStatisticsArray[nhyp][m]);
+        }
+        free(t50ExStatisticsArray[nhyp]);
+    }
+    free(t50ExStatisticsArray);
+    free(numT50ExLevel);
+    free(numT50ExLevelMax);
+    free(t50ExArray);
+    for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++)
+        free(t50ExHistogram[nhyp]);
+    free(t50ExHistogram);
+    fclose_counter(pickStream);
+    fclose_counter(t50ExGridDataStream);
+    fclose_counter(t50ExStaCodeGridStream);
+    //
+    if (flag_do_tauc) {
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++)
+            free(taucHistogram[nhyp]);
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            for (int m = 0; m < 3; m++) {
+                free(taucStatisticsArray[nhyp][m]);
+            }
+            free(taucStatisticsArray[nhyp]);
+        }
+        fclose_counter(taucGridDataStrem);
+        fclose_counter(taucStaCodeGridStream);
+    }
+    free(taucLevelStatistics);
+    free(taucArray);
+    free(taucHistogram);
+    free(taucStatisticsArray);
+    free(numTaucLevel);
+    free(numTaucLevelMax);
+    free(tdT50ExLevelStatistics);
+    free(numTdT50ExLevel);
+    free(numTdT50ExLevelMax);
+    //
+    if (flag_do_mwp) {
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            free(mwpHistogram[nhyp]);
+            for (int m = 0; m < 3; m++) {
+                free(mwpStatisticsArray[nhyp][m]);
+            }
+            free(mwpStatisticsArray[nhyp]);
+        }
+#ifdef USE_MWP_LEVEL_ARRAY
+        fclose_counter(mwpGridDataStrem);
+        fclose_counter(mwpStaCodeGridStream);
+#endif
+    }
+    free(mwpLevelStatistics);
+#ifdef USE_MWP_LEVEL_ARRAY
+    free(mwpArray);
+#endif
+    free(mwpHistogram);
+    free(mwpStatisticsArray);
+    free(numMwpLevel);
+    free(numMwpLevelMax);
+    //
+    if (flag_do_mb) {
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            free(mbHistogram[nhyp]);
+            for (int m = 0; m < 3; m++) {
+                free(mbStatisticsArray[nhyp][m]);
+            }
+            free(mbStatisticsArray[nhyp]);
+        }
+    }
+    free(mbLevelStatistics);
+    free(mbHistogram);
+    free(mbStatisticsArray);
+    free(numMbLevel);
+    free(numMbLevelMax);
+    //
+    if (flag_do_t0) {
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            free(t0Histogram[nhyp]);
+            for (int m = 0; m < 3; m++) {
+                free(t0StatisticsArray[nhyp][m]);
+            }
+            free(t0StatisticsArray[nhyp]);
+        }
+    }
+    free(t0LevelStatistics);
+    free(t0Histogram);
+    free(t0StatisticsArray);
+    free(numT0Level);
+    free(numT0LevelMax);
+    //
+    if (flag_do_mwpd) {
+        for (nhyp = 0; nhyp < num_hypocenters_associated; nhyp++) {
+            free(mwpdHistogram[nhyp]);
+            for (int m = 0; m < 3; m++) {
+                free(mwpdStatisticsArray[nhyp][m]);
+            }
+            free(mwpdStatisticsArray[nhyp]);
+#ifdef USE_MWP_MO_POS_NEG
+            for (int m = 0; m < 3; m++) {
+                free(mwpdMoPosNegStatisticsArray[nhyp][m]);
+            }
+            free(mwpdMoPosNegStatisticsArray[nhyp]);
+#endif
+        }
+    }
+    free(mwpdLevelStatistics);
+    free(mwpdHistogram);
+    free(mwpdStatisticsArray);
+    free(numMwpdLevel);
+    free(numMwpdLevelMax);
+#ifdef USE_MWP_MO_POS_NEG
+    free(mwpdMoPosNegLevelStatistics);
+    free(mwpdMoPosNegStatisticsArray);
+    free(numMwpdMoPosNegLevel);
+    free(numMwpdMoPosNegLevelMax);
+#endif
+
+    // info messages
+    printf("Info: td_writeTimedomainProcessingReport(): maximum number files opened: %d\n", max_n_open_files);
+
+    return (num_hypocenters_associated);
+
+
+}
+
+/** get preferred magnitude type
+ */
+int getPreferredMagnitude(HypocenterDesc* phypo) {
+
+    // 20180129 AJL - added
+    // 20211119 AJL - modified to use useM*ForReport() functions
+
+    if (useMwpdForReport(phypo, 0, 0) && phypo->mwpdLevelStatistics.centralValue >= reportPreferredMinValue.mwpd) {
+        return (MAG_MWPD_PREFERRED);
+    }
+
+    if (useMwpForReport(phypo, 0, 0) && phypo->mwpLevelStatistics.centralValue >= reportPreferredMinValue.mwp) {
+        return (MAG_MWP_PREFERRED);
+    }
+
+    if (phypo->mbLevelStatistics.numLevel >= reportMinNumberValuesUse.mb && phypo->mbLevelStatistics.centralValue >= reportPreferredMinValue.mb) {
+        return (MAG_MB_PREFERRED);
+    }
+
+    return (MAG_NONE_PREFERRED);
+
+}
+
+/** check if number of Mag values exceed thresholds for using event Mag
+ *
+ * 20211119 AJL - added
+ */
+int useMagForReport(char *magType, int reportMinNumberValuesUse, int numLevel, double centralValue, int nStaAvailableFirstArrP,
+        int MIN_NUM_MAG_TO_ACCEPT_UNCONDITIONAL_ON_RATIO,
+        double MIN_MAG_TO_APPLY_RATIO_NUM_MAG_TO_NUM_STA_AVAILABLE, double MAX_MAG_TO_APPLY_RATIO_NUM_MAG_TO_NUM_STA_AVAILABLE,
+        double MIN_RATIO_NUM_MAG_TO_NUM_STA_AVAILABLE, int only_check_minimum_number_of_values, int verbose) {
+
+    // check minimum number of values required
+    if (numLevel < reportMinNumberValuesUse) {
+        if (verbose) printf("DEBUG: useMagForReport: %s: NO: numLevel %d < reportMinNumberValuesUse %d\n", magType, numLevel, reportMinNumberValuesUse);
+        return (0);
+    }
+    if (only_check_minimum_number_of_values) {
+        return (1);
+    }
+
+    // check ratio of num Mag to number stations available
+    if (numLevel >= MIN_NUM_MAG_TO_ACCEPT_UNCONDITIONAL_ON_RATIO) // sufficient number Mag readings, do not check ratio
+    {
+        if (verbose) printf("DEBUG: useMagForReport: %s: YES: numLevel %d >= MIN_NUM_MAG_TO_ACCEPT_UNCONDITIONAL_ON_RATIO %d\n",
+                magType, numLevel, MIN_NUM_MAG_TO_ACCEPT_UNCONDITIONAL_ON_RATIO);
+        return (1);
+    }
+
+    // check mag is greater than minimum
+    if (centralValue < MIN_MAG_TO_APPLY_RATIO_NUM_MAG_TO_NUM_STA_AVAILABLE) // Mag too low, do not check ratio
+    {
+        if (verbose) printf("DEBUG: useMagForReport: %s: NO centralValue %f < MIN_MAG_TO_APPLY_RATIO_NUM_MAG_TO_NUM_STA_AVAILABLE %f\n",
+                magType, centralValue, MIN_MAG_TO_APPLY_RATIO_NUM_MAG_TO_NUM_STA_AVAILABLE);
+        return (0);
+    }
+
+    // check ratio
+    if (nStaAvailableFirstArrP > 0) {
+        double minRatioUse = MIN_RATIO_NUM_MAG_TO_NUM_STA_AVAILABLE; // for large Mag
+        if (centralValue < MAX_MAG_TO_APPLY_RATIO_NUM_MAG_TO_NUM_STA_AVAILABLE) { // intermediate Mag, use linear ramp ratio
+            minRatioUse = MIN_RATIO_NUM_MAG_TO_NUM_STA_AVAILABLE * (centralValue - MIN_MAG_TO_APPLY_RATIO_NUM_MAG_TO_NUM_STA_AVAILABLE)
+                    / (MAX_MAG_TO_APPLY_RATIO_NUM_MAG_TO_NUM_STA_AVAILABLE - MIN_MAG_TO_APPLY_RATIO_NUM_MAG_TO_NUM_STA_AVAILABLE);
+        }
+        double ratioNMag2NStaAvailable = (double) numLevel / (double) nStaAvailableFirstArrP;
+        if (ratioNMag2NStaAvailable < minRatioUse) {
+            if (verbose) printf("DEBUG: useMagForReport: %s: NO: ratioNMag2NStaAvailable %f < minRatioUse %f, MIN_RATIO_NUM_MAG_TO_NUM_STA_AVAILABLE %f\n",
+                    magType, ratioNMag2NStaAvailable, minRatioUse, MIN_RATIO_NUM_MAG_TO_NUM_STA_AVAILABLE);
+            return (0);
+        }
+        if (verbose) printf("DEBUG: useMagForReport: %s: YES: ratioNMag2NStaAvailable %f >= minRatioUse %f, MIN_RATIO_NUM_MAG_TO_NUM_STA_AVAILABLE %f\n",
+                magType, ratioNMag2NStaAvailable, minRatioUse, MIN_RATIO_NUM_MAG_TO_NUM_STA_AVAILABLE);
+    } else {
+        if (verbose) printf("DEBUG: ERROR: useMagForReport: %s: nStaAvailableFirstArrP <= 0, this should not happen!\n", magType);
+    }
+
+    return (1);
+
+}
+
+/** check if number of Mwp values exceed thresholds for using event Mwp
+ *
+ * 20211119 AJL - added
+ */
+int useMwpForReport(HypocenterDesc* phypo, int only_check_minimum_number_of_values, int verbose) {
+
+    return (useMagForReport("Mwp", reportMinNumberValuesUse.mwp, phypo->mwpLevelStatistics.numLevel, phypo->mwpLevelStatistics.centralValue, phypo->nStaAvailableFirstArrP,
+            MIN_NUM_MWP_TO_ACCEPT_UNCONDITIONAL_ON_RATIO,
+            MIN_MWP_TO_APPLY_RATIO_NUM_MWP_TO_NUM_STA_AVAILABLE, MAX_MWP_TO_APPLY_RATIO_NUM_MWP_TO_NUM_STA_AVAILABLE,
+            MIN_RATIO_NUM_MWP_TO_NUM_STA_AVAILABLE, only_check_minimum_number_of_values, verbose));
+
+}
+
+/** check if number of Mwpd values exceed thresholds for using event Mwpd
+ *
+ * 20211119 AJL - added
+ */
+int useMwpdForReport(HypocenterDesc* phypo, int only_check_minimum_number_of_values, int verbose) {
+
+    // Mwpd is conditional on Mwp
+    if (!useMwpForReport(phypo, only_check_minimum_number_of_values, verbose)) {
+        return (0);
+    }
+
+    return (useMagForReport("Mwpd", reportMinNumberValuesUse.mwpd, phypo->mwpdLevelStatistics.numLevel, phypo->mwpdLevelStatistics.centralValue, phypo->nStaAvailableFirstArrP,
+            MIN_NUM_MWPD_TO_ACCEPT_UNCONDITIONAL_ON_RATIO,
+            MIN_MWPD_TO_APPLY_RATIO_NUM_MWPD_TO_NUM_STA_AVAILABLE, MAX_MWPD_TO_APPLY_RATIO_NUM_MWPD_TO_NUM_STA_AVAILABLE,
+            MIN_RATIO_NUM_MWPD_TO_NUM_STA_AVAILABLE, only_check_minimum_number_of_values, verbose)
+            // Mwpd also requires Mwp above MIN_MWP_FOR_VALID_MWPD
+            // && phypo->mwpLevelStatistics.centralValue >= MIN_MWP_FOR_VALID_MWPD
+            );
+
+}

@@ -1,0 +1,9 @@
+
+
+
+cd ~/temp
+rm -rf picker
+svn checkout svn://svn.isti.com/earthworm/trunk/src/seismic_processing/pick_FP/picker picker
+rm picker/Makefile
+cp -p picker/* ~/soft/picker
+

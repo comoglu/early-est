@@ -1,0 +1,686 @@
+#!/bin/bash
+
+SECONDS=0
+#echo "DEBUG: plot_warning_report_GMT4.gmt: dt=${SECONDS}: TP 0"
+
+# gmt_shell_functions
+# These functions can be used from any sh/bash script by specifying
+# . gmt_shell_functions.sh
+# in your script.  See our script template gmt_script.sh for usage.
+export GMT_TMPDIR=`mktemp -d ${TMPDIR:-/tmp}/gmt.warning_report.XXXXXX`
+
+SAVE_DIR=$1
+#echo "SAVE_DIR ${SAVE_DIR}"
+
+ROOT_OUT_PATH=$2
+#echo "ROOT_OUT_PATH ${ROOT_OUT_PATH}"
+
+INSTANCE_PATH_NAME=$3
+#echo "INSTANCE_PATH_NAME ${INSTANCE_PATH_NAME}"
+
+INSTANCE_NAME=$4
+#echo "INSTANCE_NAME ${INSTANCE_NAME}"
+
+JX=$5
+
+PLOT_MAP_MECHANISM_TYPE=$6
+# sets mechanism type to plot on map, hash or fmamp, see also plot_event_info_GMT4.gmt, plot_warning_map_GMT4.gmt, processEvents.py
+
+MONITOR_ELAPSED_TIME=$7
+
+#echo "Usage:"
+#echo "$0 <output directory> <event directory> <event name> <JX value>"
+#echo "Try JX = 0.4 for 1-hour window"
+
+
+mkdir -p ${SAVE_DIR}
+
+#PS_NAME=${EVENT_SAVE_DIR}/${EVENT_DATE_TIME}_${INSTANCE_NAME}_Monitor.ps
+ROOT_NAME=${SAVE_DIR}/${INSTANCE_NAME}_Monitor
+PS_NAME=${ROOT_NAME}.ps
+#PS_NAME_MAP=${ROOT_NAME}_map.ps
+
+# GMT version specific settings
+GMT --version 2> ${GMT_TMPDIR}/_temp_.txt
+{
+read -a tokens 
+} < ${GMT_TMPDIR}/_temp_.txt
+export GMT_VERSION=${tokens[2]}
+#echo "GMT --version:" ${GMT_VERSION}
+export M_SYNTAX=-m
+if [ ${GMT_VERSION%.*} =  4.4 ]; then
+export M_SYNTAX=-M
+fi
+
+# the following is needed to insure that gs produces correctly oriented A4 landscape output in png
+#gmtset CHAR_ENCODING ISOLatin1+
+#gmtset PAGE_ORIENTATION portrait  PAPER_MEDIA Custom_960x540
+# 20120214 AJL - set paper size to avoid scrollbars in full-screen in Firefox on 1920 x 1080 screen
+gmtset PAGE_ORIENTATION portrait  PAPER_MEDIA Custom_970x540
+gmtset PAGE_COLOR 223
+gmtset BASEMAP_TYPE plain
+gmtset ANNOT_FONT_PRIMARY 1  LABEL_FONT 1
+gmtset ANNOT_FONT_SIZE_PRIMARY 7  LABEL_FONT_SIZE 8
+gmtset ANNOT_OFFSET_PRIMARY 0.1 LABEL_OFFSET -0.09c
+gmtset TICK_LENGTH 0.05c
+gmtset PSIMAGE_FORMAT hex
+gmtset X_ORIGIN 0.5c  Y_ORIGIN 0.5c
+gmtset FRAME_PEN 2.0
+
+
+declare -a HYPO_COLOR
+HYPO_COLOR[0]=31/31/191
+HYPO_COLOR[1]=159/31/159
+HYPO_COLOR[2]=31/127/0
+HYPO_COLOR[3]=159/95/0
+HYPO_COLOR[4]=31/31/191
+HYPO_COLOR[5]=159/31/159
+HYPO_COLOR[6]=31/127/0
+HYPO_COLOR[7]=159/95/0
+HYPO_COLOR[8]=31/31/191
+HYPO_COLOR[9]=159/31/159
+HYPO_COLOR[10]=31/127/0
+HYPO_COLOR[11]=159/95/0
+HYPO_COLOR[12]=31/31/191
+HYPO_COLOR[13]=159/31/159
+HYPO_COLOR[14]=31/127/0
+HYPO_COLOR[15]=159/95/0
+HYPO_COLOR[16]=31/31/191
+HYPO_COLOR[17]=159/31/159
+HYPO_COLOR[18]=31/127/0
+HYPO_COLOR[19]=159/95/0
+
+# assumes maximum of 20 hypocenters (see timedomain_processing_report.h: #define MAX_NUM_HYPO)
+
+
+# highlight color for preferred magnitide
+PREFERRED_MAG_BOX_COLOR=191/0/0
+#GMT5 PREFERRED_MAG_TEXT_EMPHASIS="-W0.7,${PREFERRED_MAG_BOX_COLOR}"
+PREFERRED_MAG_TEXT_EMPHASIS="-Wo2,${PREFERRED_MAG_BOX_COLOR}"
+
+
+# data time stamp
+Y_TXT=0.28
+NOW_DATE=$(date -u "+%Y.%m.%d %H:%M:%S UTC")
+pstext -R0/1/0/1 -JX1 -N -K << END > ${PS_NAME}
+-0.3 ${Y_TXT} 6 0 0 BL  Plot: ${NOW_DATE}
+END
+# program version
+Y_TXT=0.0
+{
+read VERSION_TEXT
+} < ${INSTANCE_PATH_NAME}/version.txt
+pstext -R0/1/0/1 -JX1 -N -O -K << END >> ${PS_NAME}
+-0.3 ${Y_TXT} 6 0 0 BL  EE: ${VERSION_TEXT} ${MONITOR_ELAPSED_TIME}
+END
+# agency
+Y_TXT=-0.28
+{
+read AGENCY_TEXT
+} < ${INSTANCE_PATH_NAME}/agency_id.txt
+pstext -R0/1/0/1 -JX1 -N -O -K << END >> ${PS_NAME}
+-0.3 ${Y_TXT} 6 0 0 BL  Agency: ${AGENCY_TEXT}
+END
+
+
+
+# parameters
+RUN_NAME="t50"
+#TITLE="@;darkblue;EA@;;@#rthquake@# @;darkblue;R@;;@#apid@# @;darkblue;L@;;@#ocation@# @#s@#@;darkblue;Y@;;@#stem@# @#with@# @;darkgreen;ES@;;@#timation@# @#of@# @;darkgreen;T@;;@#sunamigenesis@#"
+TITLE="@;darkblue;EA@;;rthquake @;darkblue;R@;;apid @;darkblue;L@;;ocation s@;darkblue;Y@;;stem with @;darkgreen;ES@;;timation of @;darkgreen;T@;;sunamigenesis"
+
+X_POS=0.15
+#Y_POS=5.5
+Y_POS=5.8
+
+# title text
+# x,  y,  size,  angle, fontno,  justify,  text
+pstext -R0/1/0/1 -JX1 -X${X_POS} -Y${Y_POS} -N -O -K << END >> ${PS_NAME}
+19.6 8.805 10.5 0 1 LT  ${TITLE}
+END
+#
+# program icon
+psimage early-est_395x96.png -Gt254/255/252 -C16.70/8.97/TL -W2.5 -O -K >> ${PS_NAME}
+
+#echo "DEBUG: plot_warning_report_GMT4.gmt: dt=${SECONDS}: TP 1"
+
+# hypocenter list
+#1 15 2.0 4.4 2006.07.17-08:19:23 -9.0 107.0 0-50 1.7 13.4 23.0 RED
+declare -a header_line=(ID n seq N_ASSOC pha @~D@~min@~"\260"@~ GAP1 GAP2 ATTEN @~s@~ot origin-time-UTC lat@~"\260"@~ lon@~"\260"@~ errH depth errZ  Q T50Ex [n]  Td [n] TdT50 . mb [n] Mwp [n] To [n] Mwpd [n])
+declare -a txtpos=(        0  40       0  65                 75    0    0     0      65             285            95           100   50    75   50 45    85  30  70  30    85  22  70  30  70  30  185 30 -130  30)
+# 20171014 AJL - modified to place Mwpd before To     declare -a txtpos=(        0  40       0  65                 75    0    0     0      65             285            95           100   50    75   50 45    85  30  70  30    85 45  65  30  65  30  80  30 65  30)
+declare -i N_POS=0
+declare -i XPOS=1678
+declare -i YPOS=810
+declare -i Y_LINE=35
+pstext -R0/10000/0/10000 -JX100 -G191/0/0 -N -O -K << END >> ${PS_NAME}
+${XPOS}.0 ${YPOS}.0 8 0 1 LB Currently displayed events:      (Automatic solutions - may be incorrect!)
+END
+pstext -R0/10000/0/10000 -JX100 -G0/0/0 -N -O -K << END >> ${PS_NAME}
+${XPOS}.0 ${YPOS}.0 8 0 1 LB Currently displayed events:
+END
+YPOS=YPOS-Y_LINE
+N_POS=0
+#XPOS_INIT=1700
+XPOS_INIT=1660
+declare -i XPOS_BEGTEXT=0
+declare -i XPOS_ENDTEXT=0
+XPOS_BEGTEXT=${XPOS_INIT}-36
+#XPOS_ENDTEXT=${XPOS_INIT}+1620
+XPOS_ENDTEXT=${XPOS_INIT}+1695
+declare -i YPOS_TOPTEXT_FIRST=YPOS+6*Y_LINE/8
+declare -i YPOS_TOPTEXT=YPOS_TOPTEXT_FIRST
+declare -i YPOS_BOTTEXT=YPOS-3*Y_LINE/8
+# plot white background
+psxy -R0/10000/0/10000 -JX100 -L -G255 -N -O -K << END >> ${PS_NAME}
+${XPOS_BEGTEXT} ${YPOS_BOTTEXT}
+${XPOS_BEGTEXT} ${YPOS_TOPTEXT}
+${XPOS_ENDTEXT} ${YPOS_TOPTEXT}
+${XPOS_ENDTEXT} ${YPOS_BOTTEXT}
+END
+XPOS=${XPOS_INIT}
+for token in "${header_line[@]}"; do
+	if [ $((N_POS != 0)) = 1 ] && [ $((N_POS != 3)) = 1 ] && [ $((N_POS != 6)) = 1 ] && [ $((N_POS != 7)) = 1 ] && [ $((N_POS != 8)) = 1 ] && [ $((N_POS != 31)) = 1 ] ; then	# skip hypo unique_id, n_assoc, gap1, gap2, atten
+		TXT_SIZE=7
+		if [ $((N_POS == 2)) = 1 ] || [ $((N_POS == 13)) = 1 ] || [ $((N_POS == 15)) = 1 ] || [ $((N_POS == 18)) = 1 ] \
+				|| [ $((N_POS == 20)) = 1 ] || [ $((N_POS == 24)) = 1 ] || [ $((N_POS == 26)) = 1 ] \
+				|| [ $((N_POS == 28)) = 1 ] || [ $((N_POS == 30)) = 1 ] ; then	# n count
+			TXT_SIZE=5
+		fi
+		pstext -R0/10000/0/10000 -JX100 -N -O -K << END >> ${PS_NAME}
+		${XPOS}.0 ${YPOS}.0 ${TXT_SIZE} 0 1 RB ${token}
+END
+	fi
+	XPOS=XPOS+txtpos[N_POS]
+	N_POS=N_POS+1
+done
+declare -i N_HYPO=0
+declare -i HYPO_INDEX=0
+declare -i INT_VALUE=0
+{
+	while read -a tokens ; do
+		N_HYPO=N_HYPO+1
+		HYPO_INDEX=${tokens[1]}-1
+		YPOS_TOPTEXT=YPOS-Y_LINE/4
+		YPOS=YPOS-Y_LINE
+		YPOS_BOTTEXT=YPOS-3*Y_LINE/8
+		N_POS=0
+		XPOS=${XPOS_INIT}
+		# plot white background
+		psxy -R0/10000/0/10000 -JX100 -L -G255 -N -O -K << END >> ${PS_NAME}
+		${XPOS_BEGTEXT} ${YPOS_BOTTEXT}
+		${XPOS_BEGTEXT} ${YPOS_TOPTEXT}
+		${XPOS_ENDTEXT} ${YPOS_TOPTEXT}
+		${XPOS_ENDTEXT} ${YPOS_BOTTEXT}
+END
+		for token in "${tokens[@]}"; do
+			if [ $((N_POS != 0)) = 1 ] && [ $((N_POS != 3)) = 1 ] && [ $((N_POS != 6)) = 1 ] && [ $((N_POS != 7)) = 1 ] && [ $((N_POS != 8)) = 1 ] && [ $((N_POS < 31)) = 1 ] ; then	# skip hypo unique_id, n_assoc, gap1, gap2, atten
+				TXT_COLOR=${HYPO_COLOR[${HYPO_INDEX}]}
+				W_VAL=
+				TXT_SIZE=8
+				# TdT50 WL color indicator
+				if [ ${token} = RED ]; then
+					TXT_COLOR=255/0/0
+					W_VAL="-W0.5 -Gred"
+					token=I
+				elif  [ ${token} = YELLOW ]; then
+					TXT_COLOR=255/255/0
+					W_VAL="-W0.5 -Gyellow"
+					token=I
+				elif  [ ${token} = GREEN ]; then
+					TXT_COLOR=0/255/0
+					W_VAL="-W0.5 -Ggreen"
+					token=I
+				elif  [ ${token} = WHITE ]; then
+					TXT_COLOR=255
+					#W_VAL="-W0.5 -Gwhite"
+					W_VAL="-Gwhite"
+					token=I
+				elif  [ ${token} = GREY ]; then
+					#TXT_COLOR=191
+					#W_VAL="-W0.5 -Ggrey"
+					TXT_COLOR=255
+					W_VAL="-Gwhite"
+					token=I
+				fi
+				if [ ${token} = I ]; then
+					XPOS=XPOS-0
+				fi
+				# special cases
+				if [ $((N_POS == 16)) = 1 ] ; then	# Q
+					TXT_COLOR=0
+					W_VAL=-W0o
+					if [ ${token} = A ]; then
+						W_VAL=-Wgreen,o
+					elif [ ${token} = B ]; then
+						W_VAL=-Wyellow,o
+					elif [ ${token} = C ]; then
+						W_VAL=-Worange,o
+					else
+						W_VAL=-Wred,o
+					fi
+				fi
+				# check for null values
+				if [ $((N_POS == 23)) = 1 ] ; then	# mb
+					if [ ${token} == -9.0 ] ; then
+						token=-
+					fi
+					if [ "${token: -1}" == "*" ] ; then
+						TOKEN_TMP=${token}
+						token=${TOKEN_TMP//\*}
+						W_VAL=${PREFERRED_MAG_TEXT_EMPHASIS}
+					fi
+				fi
+				if [ $((N_POS == 25)) = 1 ] ; then	# Mwp
+					INT_VALUE=0	# 20110317 AJL
+					if [ ${token} == -9.0 ] ; then
+						token=-
+					else
+						INT_VALUE=${token:0:1}	# 20110317 AJL
+					fi
+					if [ "${token: -1}" == "*" ] ; then
+						TOKEN_TMP=${token}
+						token=${TOKEN_TMP//\*}
+						W_VAL=${PREFERRED_MAG_TEXT_EMPHASIS}
+					fi
+				fi
+				if [ $((N_POS == 29)) = 1 ] ; then	# Mwpd
+					if [ ${token} == -9.0 ] ; then
+						token=-
+					else
+						#INT_VALUE=${token:0:1}	# 20110317 AJL
+						# if Mwp<7 do not use Mwpd	# 20110317 AJL
+						if [ $((INT_VALUE < 7)) = 1 ] ; then
+							token=inv
+						fi
+					fi
+					if [ "${token: -1}" == "*" ] ; then
+						TOKEN_TMP=${token}
+						token=${TOKEN_TMP//\*}
+						W_VAL=${PREFERRED_MAG_TEXT_EMPHASIS}
+					fi
+				fi
+				if [ $((N_POS == 28)) = 1 ] ; then	# To
+					if [ ${token} == -1 ] ; then
+						token=-
+					fi
+				fi
+				if [ $((N_POS == 2)) = 1 ] || [ $((N_POS == 13)) = 1 ] || [ $((N_POS == 15)) = 1 ] || [ $((N_POS == 18)) = 1 ] \
+						|| [ $((N_POS == 20)) = 1 ] || [ $((N_POS == 24)) = 1 ] || [ $((N_POS == 26)) = 1 ] \
+						|| [ $((N_POS == 28)) = 1 ] || [ $((N_POS == 30)) = 1 ] ; then	# n count
+					TXT_SIZE=5
+				fi
+				pstext -R0/10000/0/10000 -JX100 -N ${W_VAL} -G${TXT_COLOR}  -O -K << END >> ${PS_NAME}
+				${XPOS}.0 ${YPOS}.0 ${TXT_SIZE} 0 1 RB ${token}
+END
+				if [ ${token} = III ]; then
+					XPOS=XPOS+7
+				fi
+			fi
+			XPOS=XPOS+txtpos[N_POS]
+			N_POS=N_POS+1
+		done
+	done
+} < ${INSTANCE_PATH_NAME}/hypos_pretty.csv #> ${GMT_TMPDIR}/_temp_.txt
+# plot box around text background
+psxy -R0/10000/0/10000 -JX100 -L -W1.0,0 -N -O -K << END >> ${PS_NAME}
+${XPOS_BEGTEXT} ${YPOS_BOTTEXT}
+${XPOS_BEGTEXT} ${YPOS_TOPTEXT_FIRST}
+${XPOS_ENDTEXT} ${YPOS_TOPTEXT_FIRST}
+${XPOS_ENDTEXT} ${YPOS_BOTTEXT}
+END
+
+#echo "DEBUG: plot_warning_report_GMT4.gmt: dt=${SECONDS}: TP 2"
+
+GRID_WIDTH=11.8
+GRID_B_VAL=-B5
+#
+# DE warning results grid
+RUN_NAME="t50"
+TITLE="To>50s_Exceed"
+LONG_TITLE=${TITLE}
+X_POS=0.6
+#Y_POS=4.6
+Y_POS=4.3
+#@GRID_J_VAL=-Jx${JX}/0.5
+GRID_J_VAL=-Jx${JX}/0.375
+#@J_VAL_Y_HIST=0.5
+J_VAL_Y_HIST=0.375
+B_VAL_Y_INFO=1.0
+GRID_SN_VAL=Sn
+R_VAL_Y=-0.05/5.15
+R_VAL_Y_SYM=0.0/5.1
+I_VAL_Y=0.1
+PLOT_START_STOP_TIME=YES
+PLOT_GRID=YES
+PLOT_STATION_RESULTS=YES
+PLOT_SUMMARY_RESULTS=NO
+HISTOGRAM_BIN_WIDTH=0.1
+PLOT_HISTOGRAM_ONLY=NO
+PLOT_LAST_LEVEL=NO
+./plot_warning_GMT4.gmt ${SAVE_DIR} ${INSTANCE_PATH_NAME} ${INSTANCE_NAME} ${RUN_NAME} ${TITLE} ${LONG_TITLE} ${PS_NAME} ${X_POS} ${Y_POS} \
+${GRID_WIDTH} ${GRID_J_VAL} ${GRID_B_VAL} ${B_VAL_Y_INFO} ${GRID_SN_VAL} ${R_VAL_Y} ${R_VAL_Y_SYM} ${I_VAL_Y} ${J_VAL_Y_HIST} \
+${PLOT_START_STOP_TIME} ${PLOT_GRID} ${PLOT_STATION_RESULTS} ${PLOT_SUMMARY_RESULTS} ${HISTOGRAM_BIN_WIDTH} ${PLOT_HISTOGRAM_ONLY} ${PLOT_LAST_LEVEL}
+#
+#echo "DEBUG: plot_warning_report_GMT4.gmt: dt=${SECONDS}: TP 3"
+# tauc results grid
+RUN_NAME="tauc"
+TITLE="Tdom_(sec)"
+LONG_TITLE=${TITLE}
+#X_POS= - (2.5+${GRID_WIDTH}+0.58)
+X_POS=-12.36
+#@Y_POS=2.75
+Y_POS=2.0625
+#@GRID_J_VAL=-Jx${JX}/0.1
+GRID_J_VAL=-Jx${JX}/0.075
+#@J_VAL_Y_HIST=0.10
+J_VAL_Y_HIST=0.075
+B_VAL_Y_INFO=5.0
+GRID_SN_VAL=sn
+R_VAL_Y=-0.25/25.75
+R_VAL_Y_SYM=0.0/25.5
+I_VAL_Y=0.5
+PLOT_START_STOP_TIME=NO
+PLOT_GRID=YES
+PLOT_STATION_RESULTS=YES
+PLOT_SUMMARY_RESULTS=NO
+HISTOGRAM_BIN_WIDTH=0.5
+PLOT_HISTOGRAM_ONLY=NO
+PLOT_LAST_LEVEL=NO
+./plot_warning_GMT4.gmt ${SAVE_DIR} ${INSTANCE_PATH_NAME} ${INSTANCE_NAME} ${RUN_NAME} ${TITLE} ${LONG_TITLE} ${PS_NAME} ${X_POS} ${Y_POS} \
+${GRID_WIDTH} ${GRID_J_VAL} ${GRID_B_VAL} ${B_VAL_Y_INFO} ${GRID_SN_VAL} ${R_VAL_Y} ${R_VAL_Y_SYM} ${I_VAL_Y} ${J_VAL_Y_HIST} \
+${PLOT_START_STOP_TIME} ${PLOT_GRID} ${PLOT_STATION_RESULTS} ${PLOT_SUMMARY_RESULTS} ${HISTOGRAM_BIN_WIDTH} ${PLOT_HISTOGRAM_ONLY} ${PLOT_LAST_LEVEL}
+#
+#echo "DEBUG: plot_warning_report_GMT4.gmt: dt=${SECONDS}: TP 4"
+# alarm results grid
+RUN_NAME="alarm"
+TITLE="Td\267T50Ex"
+LONG_TITLE="${TITLE}_(Tsunami_Potential)"
+#X_POS= - (2.5+${GRID_WIDTH}+0.58)
+X_POS=-12.36
+#@Y_POS=2.8
+Y_POS=2.0625
+#@GRID_J_VAL=-Jx${JX}/0.1
+GRID_J_VAL=-Jx${JX}/0.075
+#@J_VAL_Y_HIST=0.1
+J_VAL_Y_HIST=0.075
+B_VAL_Y_INFO=5.0
+GRID_SN_VAL=sn
+R_VAL_Y=-0.25/25.75
+R_VAL_Y_SYM=0.0/25.5
+I_VAL_Y=0.5
+PLOT_START_STOP_TIME=NO
+PLOT_GRID=NO
+PLOT_STATION_RESULTS=NO
+PLOT_SUMMARY_RESULTS=YES
+HISTOGRAM_BIN_WIDTH=-1
+PLOT_HISTOGRAM_ONLY=NO
+PLOT_LAST_LEVEL=NO
+./plot_warning_GMT4.gmt ${SAVE_DIR} ${INSTANCE_PATH_NAME} ${INSTANCE_NAME} ${RUN_NAME} ${TITLE} ${LONG_TITLE} ${PS_NAME} ${X_POS} ${Y_POS} \
+${GRID_WIDTH} ${GRID_J_VAL} ${GRID_B_VAL} ${B_VAL_Y_INFO} ${GRID_SN_VAL} ${R_VAL_Y} ${R_VAL_Y_SYM} ${I_VAL_Y} ${J_VAL_Y_HIST} \
+${PLOT_START_STOP_TIME} ${PLOT_GRID} ${PLOT_STATION_RESULTS} ${PLOT_SUMMARY_RESULTS} ${HISTOGRAM_BIN_WIDTH} ${PLOT_HISTOGRAM_ONLY} ${PLOT_LAST_LEVEL}
+#
+#echo "DEBUG: plot_warning_report_GMT4.gmt: dt=${SECONDS}: TP 5"
+# location quality results grid
+RUN_NAME="epicenter.diff"
+TITLE="EpictrConv_(km)"
+LONG_TITLE=${TITLE}
+#X_POS= - (2.5+${GRID_WIDTH}+0.58)
+#@X_POS=-13.06
+X_POS=-11.8
+#@Y_POS=2.8
+Y_POS=2.1375
+#@GRID_J_VAL=-Jx${JX}/0.1
+GRID_J_VAL=-Jx${JX}/0.0375
+#@J_VAL_Y_HIST=0.1
+J_VAL_Y_HIST=0.0375
+B_VAL_Y_INFO=10.0
+GRID_SN_VAL=sn
+R_VAL_Y=-0.5/51.5
+R_VAL_Y_SYM=0.0/51.0
+I_VAL_Y=0.5
+PLOT_START_STOP_TIME=NO
+PLOT_GRID=NO
+PLOT_STATION_RESULTS=NO
+PLOT_SUMMARY_RESULTS=NO
+HISTOGRAM_BIN_WIDTH=-1
+PLOT_HISTOGRAM_ONLY=NO
+PLOT_LAST_LEVEL=YES
+./plot_warning_GMT4.gmt ${SAVE_DIR} ${INSTANCE_PATH_NAME} ${INSTANCE_NAME} ${RUN_NAME} ${TITLE} ${LONG_TITLE} ${PS_NAME} ${X_POS} ${Y_POS} \
+${GRID_WIDTH} ${GRID_J_VAL} ${GRID_B_VAL} ${B_VAL_Y_INFO} ${GRID_SN_VAL} ${R_VAL_Y} ${R_VAL_Y_SYM} ${I_VAL_Y} ${J_VAL_Y_HIST} \
+${PLOT_START_STOP_TIME} ${PLOT_GRID} ${PLOT_STATION_RESULTS} ${PLOT_SUMMARY_RESULTS} ${HISTOGRAM_BIN_WIDTH} ${PLOT_HISTOGRAM_ONLY} ${PLOT_LAST_LEVEL}
+#
+
+
+# histograms
+#echo "DEBUG: plot_warning_report_GMT4.gmt: dt=${SECONDS}: TP 6"
+# mb histogram
+RUN_NAME="mb"
+TITLE="mb(Vmax)"
+LONG_TITLE=${TITLE}
+#X_POS= - (2.5+${GRID_WIDTH}+0.58)
+#X_POS=4.0
+X_POS=-7.9
+#@Y_POS=-0.4
+Y_POS=-1.105
+GRID_J_VAL=-Jx${JX}/0.4286
+J_VAL_Y_HIST=0.4286
+B_VAL_Y_INFO=1.0
+GRID_SN_VAL=Sn
+R_VAL_Y=2.95/10.15
+R_VAL_Y_SYM=3.0/10.1
+I_VAL_Y=0.1
+PLOT_START_STOP_TIME=NO
+PLOT_GRID=YES
+PLOT_STATION_RESULTS=YES
+PLOT_SUMMARY_RESULTS=NO
+HISTOGRAM_BIN_WIDTH=0.1
+PLOT_HISTOGRAM_ONLY=YES
+PLOT_LAST_LEVEL=NO
+./plot_warning_GMT4.gmt ${SAVE_DIR} ${INSTANCE_PATH_NAME} ${INSTANCE_NAME} ${RUN_NAME} ${TITLE} ${LONG_TITLE} ${PS_NAME} ${X_POS} ${Y_POS} \
+${GRID_WIDTH} ${GRID_J_VAL} ${GRID_B_VAL} ${B_VAL_Y_INFO} ${GRID_SN_VAL} ${R_VAL_Y} ${R_VAL_Y_SYM} ${I_VAL_Y} ${J_VAL_Y_HIST} \
+${PLOT_START_STOP_TIME} ${PLOT_GRID} ${PLOT_STATION_RESULTS} ${PLOT_SUMMARY_RESULTS} ${HISTOGRAM_BIN_WIDTH} ${PLOT_HISTOGRAM_ONLY} ${PLOT_LAST_LEVEL}
+#
+#echo "DEBUG: plot_warning_report_GMT4.gmt: dt=${SECONDS}: TP 7"
+# mwp histogram
+RUN_NAME="mwp"
+TITLE="Mwp"
+LONG_TITLE=${TITLE}
+#X_POS= - (2.5+${GRID_WIDTH}+0.58)
+#X_POS=4.0
+X_POS=-7.9
+Y_POS=0.0
+GRID_J_VAL=-Jx${JX}/0.4286
+J_VAL_Y_HIST=0.4286
+B_VAL_Y_INFO=1.0
+GRID_SN_VAL=Sn
+R_VAL_Y=2.95/10.15
+R_VAL_Y_SYM=3.0/10.1
+I_VAL_Y=0.1
+PLOT_START_STOP_TIME=NO
+PLOT_GRID=YES
+PLOT_STATION_RESULTS=YES
+PLOT_SUMMARY_RESULTS=NO
+HISTOGRAM_BIN_WIDTH=0.1
+PLOT_HISTOGRAM_ONLY=YES
+PLOT_LAST_LEVEL=NO
+./plot_warning_GMT4.gmt ${SAVE_DIR} ${INSTANCE_PATH_NAME} ${INSTANCE_NAME} ${RUN_NAME} ${TITLE} ${LONG_TITLE} ${PS_NAME} ${X_POS} ${Y_POS} \
+${GRID_WIDTH} ${GRID_J_VAL} ${GRID_B_VAL} ${B_VAL_Y_INFO} ${GRID_SN_VAL} ${R_VAL_Y} ${R_VAL_Y_SYM} ${I_VAL_Y} ${J_VAL_Y_HIST} \
+${PLOT_START_STOP_TIME} ${PLOT_GRID} ${PLOT_STATION_RESULTS} ${PLOT_SUMMARY_RESULTS} ${HISTOGRAM_BIN_WIDTH} ${PLOT_HISTOGRAM_ONLY} ${PLOT_LAST_LEVEL}
+#
+#echo "DEBUG: plot_warning_report_GMT4.gmt: dt=${SECONDS}: TP 8"
+# mwpd histogram
+RUN_NAME="mwpd"
+TITLE="Mwpd"
+LONG_TITLE=${TITLE}
+#X_POS= - (2.5+${GRID_WIDTH}+0.58)
+#X_POS=4.0
+X_POS=-7.9
+Y_POS=0.0
+GRID_J_VAL=-Jx${JX}/0.4286
+J_VAL_Y_HIST=0.4286
+B_VAL_Y_INFO=1.0
+GRID_SN_VAL=Sn
+R_VAL_Y=2.95/10.15
+R_VAL_Y_SYM=3.0/10.1
+I_VAL_Y=0.1
+PLOT_START_STOP_TIME=NO
+PLOT_GRID=YES
+PLOT_STATION_RESULTS=YES
+PLOT_SUMMARY_RESULTS=NO
+HISTOGRAM_BIN_WIDTH=0.1
+PLOT_HISTOGRAM_ONLY=YES
+PLOT_LAST_LEVEL=NO
+./plot_warning_GMT4.gmt ${SAVE_DIR} ${INSTANCE_PATH_NAME} ${INSTANCE_NAME} ${RUN_NAME} ${TITLE} ${LONG_TITLE} ${PS_NAME} ${X_POS} ${Y_POS} \
+${GRID_WIDTH} ${GRID_J_VAL} ${GRID_B_VAL} ${B_VAL_Y_INFO} ${GRID_SN_VAL} ${R_VAL_Y} ${R_VAL_Y_SYM} ${I_VAL_Y} ${J_VAL_Y_HIST} \
+${PLOT_START_STOP_TIME} ${PLOT_GRID} ${PLOT_STATION_RESULTS} ${PLOT_SUMMARY_RESULTS} ${HISTOGRAM_BIN_WIDTH} ${PLOT_HISTOGRAM_ONLY} ${PLOT_LAST_LEVEL}
+#
+#echo "DEBUG: plot_warning_report_GMT4.gmt: dt=${SECONDS}: TP 9"
+# t0 histogram
+RUN_NAME="t0"
+TITLE="To"
+LONG_TITLE=${TITLE}
+#X_POS= - (2.5+${GRID_WIDTH}+0.58)
+#X_POS=4.0
+X_POS=-7.9
+Y_POS=0.0
+GRID_J_VAL=-Jx${JX}/0.012
+J_VAL_Y_HIST=0.012
+B_VAL_Y_INFO=50.0
+GRID_SN_VAL=Sn
+R_VAL_Y=-2.0833/256.25
+R_VAL_Y_SYM=0.0/254.1667
+I_VAL_Y=0.1
+PLOT_START_STOP_TIME=NO
+PLOT_GRID=YES
+PLOT_STATION_RESULTS=YES
+PLOT_SUMMARY_RESULTS=NO
+HISTOGRAM_BIN_WIDTH=5.0
+PLOT_HISTOGRAM_ONLY=YES
+PLOT_LAST_LEVEL=NO
+./plot_warning_GMT4.gmt ${SAVE_DIR} ${INSTANCE_PATH_NAME} ${INSTANCE_NAME} ${RUN_NAME} ${TITLE} ${LONG_TITLE} ${PS_NAME} ${X_POS} ${Y_POS} \
+${GRID_WIDTH} ${GRID_J_VAL} ${GRID_B_VAL} ${B_VAL_Y_INFO} ${GRID_SN_VAL} ${R_VAL_Y} ${R_VAL_Y_SYM} ${I_VAL_Y} ${J_VAL_Y_HIST} \
+${PLOT_START_STOP_TIME} ${PLOT_GRID} ${PLOT_STATION_RESULTS} ${PLOT_SUMMARY_RESULTS} ${HISTOGRAM_BIN_WIDTH} ${PLOT_HISTOGRAM_ONLY} ${PLOT_LAST_LEVEL}
+
+
+RUN_NAME="t50"
+
+# maps
+
+
+#echo "DEBUG: plot_warning_report_GMT4.gmt: dt=${SECONDS}: TP 10"
+# global map
+#X_POS=-29.75
+X_POS=-30.25
+Y_POS=-15.3
+R_VAL=-Rd
+J_VAL=-JN150/18c
+B_VAL=-B30g30/30g30WEnS
+N_VAL=YES
+R_VAL_Y=-0.25/25.75
+R_VAL_Y_SYM=0.0/25.5
+AUTO_CENTER_MAP=NO
+LAT_CENT=XXX
+SINGLE_EVENT_PLOT_INDEX=NO	# must use NO to plot all events
+./plot_warning_map_GMT4.gmt ${SAVE_DIR} ${ROOT_OUT_PATH} ${INSTANCE_PATH_NAME} ${INSTANCE_NAME} ${RUN_NAME} ${X_POS} ${Y_POS} ${R_VAL} ${J_VAL} \
+	${B_VAL} ${N_VAL} ${AUTO_CENTER_MAP} ${LAT_CENT} ${SINGLE_EVENT_PLOT_INDEX} ${PLOT_MAP_MECHANISM_TYPE} ${PS_NAME}
+
+#echo "DEBUG: plot_warning_report_GMT4.gmt: dt=${SECONDS}: TP 11"
+# NOTE: ===========================================================================================
+# set GMT projection defaults here for displayed regional map when no hypocenters located, 
+#   or for fixed regional map if you set AUTO_CENTER_MAP=NO
+# R_VAL:
+#   AUTO_CENTER_MAP=YES uses a latitude range of 70deg and longitude range of 120deg
+#     with AUTO_CENTER_MAP=NO, use this range or same ratio of lat/lon, or slightly larger ratio
+#     in order to leave sufficient white space above for the hypocenter list
+# J_VAL:
+#   use -JQ, then the mean of your longitude range, then 37.5 for minimum distortion
+#     or the mean of your latitude range, then 13.7c to fit the map width correctly 
+#     in the plot graphic
+# for more details and options, see: 
+#   http://www.soest.hawaii.edu/GMT/gmt/doc/gmt/html/man/psbasemap.html
+#   http://www.soest.hawaii.edu/GMT/gmt/doc/gmt/html/GMT_Docs/node108.html
+#
+# Euro-Med map
+R_VAL=-Rg
+LON_CENT=12.5
+LAT_CENT=45.0
+J_VAL=-JG${LON_CENT}/${LAT_CENT}/75000/0/0/0/5/4.7/13.7c
+#
+# NW US
+#R_VAL=-Rg
+#LON_CENT=-100.0
+#LAT_CENT=40.0
+#J_VAL=-JG${LON_CENT}/${LAT_CENT}/75000/0/0/0/5/4.7/13.7c
+#
+# Chile
+#R_VAL=-R-132/-70/-12/5r
+#J_VAL=-JQ-72/37.5/13.7c
+#
+# SW Pacific / Indonesia
+#R_VAL=-R75/-45/-165/50r
+#J_VAL=-JQ135/0/13.7c
+#
+# =================================================================================================
+#X_POS=+18.9
+X_POS=19.1
+Y_POS=0.25
+B_VAL=-B10g10/10g10nWES
+N_VAL=NO
+AUTO_CENTER_MAP=YES
+SINGLE_EVENT_PLOT_INDEX=NO	# must use NO to plot all events
+./plot_warning_map_GMT4.gmt ${SAVE_DIR} ${ROOT_OUT_PATH} ${INSTANCE_PATH_NAME} ${INSTANCE_NAME} ${RUN_NAME} ${X_POS} ${Y_POS} \
+${R_VAL} ${J_VAL} ${B_VAL} ${N_VAL} ${AUTO_CENTER_MAP} ${LAT_CENT} ${SINGLE_EVENT_PLOT_INDEX} ${PLOT_MAP_MECHANISM_TYPE} ${PS_NAME}
+
+
+#echo "DEBUG: plot_warning_report_GMT4.gmt: dt=${SECONDS}: TP 12"
+# pick summary text
+#1322237820 111 0 0 32 59 13 7 0 0
+read PLOT_TIME_MAX NUM_PICK NUM_PICK_NOT_COMPLETED NUM_PICK_CLIPPED NUM_PICK_NON_CONTIGUOUS NUM_PICK_SN_LOW NUM_PICK_SN_BRBV_LOW NUM_PICK_SN_BRBD_LOW \
+            NUM_PICK_IN_PREV_CODA NUM_PICK_OK NUM_PICK_ASSOC NUM_EVENT \
+		< ${INSTANCE_PATH_NAME}/picks.log
+# x,  y,  size,  angle, fontno,  justify,  text
+pstext -R0/1/0/1 -JX1 -N -O -K << END >> ${PS_NAME}
+-19.5 8.6  8 0 1 BL   ${NUM_PICK} picks, ${NUM_PICK_OK} active,
+-19.5 8.25 8 0 1 BL   ${NUM_PICK_ASSOC} associated into
+-19.5 7.9  8 0 1 BL   ${NUM_EVENT} events
+END
+
+
+# station summary text
+#t50 1.000000 61.016667 2010.01.27-19:42:38 2010.01.27-20:43:39 167 176 1
+read DUMMY CRITICAL_VALUE TIME_AXIS_LEN PLOT_START_TIME PLOT_END_TIME TIME_STEP N_ACTIVE N_HAS_BEEN_ACTIVE N_HYPOCENTERS \
+		< ${INSTANCE_PATH_NAME}/${RUN_NAME}.csv
+# x,  y,  size,  angle, fontno,  justify,  text
+pstext -R0/1/0/1 -JX1 -N -O -K << END >> ${PS_NAME}
+-0.7 8.80 8 0 1 BR   ${N_HAS_BEEN_ACTIVE} sta, ${N_ACTIVE} w/ latency<${TIME_STEP}s
+-0.7 8.50 6 0 1 BR   hypo color @~\256@~ Td\267T50Ex
+-0.7 8.25 6 0 1 BR   sta color @~\256@~ Td / T50Ex
+-0.7 8.00 6 0 1 BR   (white @~\256@~ latency>${TIME_STEP}s)
+END
+
+
+# program icon
+#psimage early-est_395x96.png -C-0.5/0.11/BR -W2.6 -O -K >> ${PS_NAME}
+
+# signature logos
+#psimage logo-INGV_64_64.png -Gt255 -C-1.5/0.30/BR -W0.6 -O -K >> ${PS_NAME}
+#psimage al_logo_60x96.png -Gt255 -C-3.1/-0.37/BR -W0.4 -O -K >> ${PS_NAME}
+psimage al_logo_alomax_scientific_364_100.png -C-0.65/-0.55/BR -W2.9 -O -K >> ${PS_NAME}
+psimage banner_INGV_345_90.png -C-0.65/0.15/BR -W2.2 -O -K >> ${PS_NAME}
+# close plot (no -K)
+psimage NERA_260_64.png -C-0.65/0.95/BR -W0.8 -O >> ${PS_NAME}
+
+
+#echo "gs -dNOPAUSE -sDEVICE=pdfwrite -sOutputFile=${ROOT_NAME}.pdf ${PS_NAME} -c quit"
+gs -dNOPAUSE -sDEVICE=pdfwrite -sOutputFile=${ROOT_NAME}.pdf ${PS_NAME} -c quit
+
+#echo "gv ${ROOT_NAME}.pdf"
+#echo "acroread ${ROOT_NAME}.pdf"
+#echo "okular ${ROOT_NAME}.pdf"
+
+# gmt_shell_functions
+rm -rf $GMT_TMPDIR
+unset GMT_TMPDIR
+
+#echo "DEBUG: plot_warning_report_GMT4.gmt: dt=${SECONDS}: TP 99"

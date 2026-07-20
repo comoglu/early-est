@@ -1,0 +1,443 @@
+#!/bin/bash
+
+# gmt_shell_functions
+# These functions can be used from any sh/bash script by specifying
+# . gmt_shell_functions.sh
+# in your script.  See our script template gmt_script.sh for usage.
+#export GMT_TMPDIR=`mktemp -d ${TMPDIR:-/tmp}/gmt.warning.XXXXXX`
+
+
+#./plot_warning_GMT4.gmt ${SAVE_DIR} ${INSTANCE_PATH} ${INSTANCE_NAME} ${DURATION} ${PS_NAME} ${X_POS} ${Y_POS}
+
+SAVE_DIR=$1
+#echo "SAVE_DIR ${SAVE_DIR}"
+
+INSTANCE_PATH=$2
+#echo "INSTANCE_PATH ${INSTANCE_PATH}"
+
+INSTANCE_NAME=$3
+#echo "INSTANCE_NAME ${INSTANCE_NAME}"
+
+PARAMETER_NAME=$4
+#echo "PARAMETER_NAME ${PARAMETER_NAME}"
+
+TITLE=$5
+#echo "TITLE ${TITLE}"
+
+LONG_TITLE=$6
+#echo "LONG_TITLE ${LONG_TITLE}"
+
+PS_NAME=$7
+#echo "PS_NAME ${PS_NAME}"
+
+X_POS=$8
+#echo "X_POS ${X_POS}"
+
+Y_POS=$9
+#echo "Y_POS ${Y_POS}"
+
+GRID_WIDTH=${10}
+#echo "GRID_WIDTH ${GRID_WIDTH}"
+
+GRID_J_VAL=${11}
+#echo "GRID_J_VAL ${GRID_J_VAL}"
+
+GRID_B_VAL=${12}
+#echo "GRID_B_VAL ${GRID_B_VAL}"
+
+B_VAL_Y_INFO=${13}
+#echo "B_VAL_Y_INFO ${B_VAL_Y_INFO}"
+
+GRID_SN_VAL=${14}
+#echo "GRID_SN_VAL ${GRID_SN_VAL}"
+
+R_VAL_Y=${15}
+#echo "R_VAL_Y ${R_VAL_Y}"
+
+R_VAL_Y_SYM=${16}
+#echo "R_VAL_Y_SYM ${R_VAL_Y_SYM}"
+
+I_VAL_Y=${17}
+#echo "I_VAL_Y ${I_VAL_Y}"
+
+J_VAL_Y_HIST=${18}
+#echo "J_VAL_Y_HIST ${J_VAL_Y_HIST}"
+
+PLOT_START_STOP_TIME=${19}
+#echo "PLOT_START_STOP_TIME ${PLOT_START_STOP_TIME}"
+
+PLOT_GRID=${20}
+#echo "PLOT_GRID ${PLOT_GRID}"
+
+PLOT_STATION_RESULTS=${21}
+#echo "PLOT_STATION_RESULTS ${PLOT_STATION_RESULTS}"
+
+PLOT_SUMMARY_RESULTS=${22}
+#echo "PLOT_SUMMARY_RESULTS ${PLOT_SUMMARY_RESULTS}"
+
+HISTOGRAM_BIN_WIDTH=${23}
+#echo "HISTOGRAM_BIN_WIDTH ${HISTOGRAM_BIN_WIDTH}"
+
+PLOT_HISTOGRAM_ONLY=${24}
+#echo "PLOT_HISTOGRAM_ONLY ${PLOT_HISTOGRAM_ONLY}"
+
+PLOT_LAST_LEVEL=${25}
+#echo "PLOT_LAST_LEVEL ${PLOT_LAST_LEVEL}"
+
+
+gmtset   TICK_LENGTH 0.05c
+
+PLOT_DATA_PATH=${INSTANCE_PATH}/plot
+
+declare -a HYPO_COLOR
+HYPO_COLOR[0]=31/31/191
+HYPO_COLOR[1]=159/31/159
+HYPO_COLOR[2]=31/127/0
+HYPO_COLOR[3]=159/95/0
+HYPO_COLOR[4]=31/31/191
+HYPO_COLOR[5]=159/31/159
+HYPO_COLOR[6]=31/127/0
+HYPO_COLOR[7]=159/95/0
+HYPO_COLOR[8]=31/31/191
+HYPO_COLOR[9]=159/31/159
+HYPO_COLOR[10]=31/127/0
+HYPO_COLOR[11]=159/95/0
+HYPO_COLOR[12]=31/31/191
+HYPO_COLOR[13]=159/31/159
+HYPO_COLOR[14]=31/127/0
+HYPO_COLOR[15]=159/95/0
+HYPO_COLOR[16]=31/31/191
+HYPO_COLOR[17]=159/31/159
+HYPO_COLOR[18]=31/127/0
+HYPO_COLOR[19]=159/95/0
+
+# assumes maximum of 20 hypocenters (see timedomain_processing_report.h: #define MAX_NUM_HYPO)
+
+
+# highlight color for preferred magnitide
+PREFERRED_MAG_BOX_COLOR=191/0/0
+PREFERRED_MAG_TEXT_EMPHASIS="-Wo2,${PREFERRED_MAG_BOX_COLOR}"
+
+
+# parameters
+declare -a PARAMETER_LEVEL_MEAN_PLOT
+declare -a PARAMETER_LEVEL_MEAN
+declare -a PARAMETER_LEVEL_MINUS_STD_DEV
+declare -a PARAMETER_LEVEL_PLUS_STD_DEV
+declare -a PARAMETER_LEVEL
+declare -a N_PARAMETER
+declare -a MEAN_COLOR
+#t50 1.000000 61.016667 2010.01.27-19:42:38 2010.01.27-20:43:39 167 176 1
+# 0.407052 0.151959 0.545531 GREEN 8
+{
+read DUMMY CRITICAL_VALUE TIME_AXIS_LEN PLOT_START_TIME PLOT_END_TIME TIME_STEP N_ACTIVE N_HAS_BEEN_ACTIVE N_HYPOCENTERS
+#echo "============= N_HYPOCENTERS: ${N_HYPOCENTERS}"
+declare -i ITERATION_MAX_HYPOCENTERS=${N_HYPOCENTERS}
+declare -i I_N_HYPO=0
+while [ $((${I_N_HYPO} < ${ITERATION_MAX_HYPOCENTERS})) = 1 ]; do
+	read PARAMETER_LEVEL_MEAN_PLOT[${I_N_HYPO}] PARAMETER_LEVEL_MEAN[${I_N_HYPO}] PARAMETER_LEVEL_MINUS_STD_DEV[${I_N_HYPO}] \
+		PARAMETER_LEVEL_PLUS_STD_DEV[${I_N_HYPO}] PARAMETER_LEVEL[${I_N_HYPO}] N_PARAMETER[${I_N_HYPO}]
+	#echo "N_HYPO: ${I_N_HYPO} ==============="
+	#echo "PARAMETER_LEVEL_MEAN_PLOT: ${PARAMETER_LEVEL_MEAN_PLOT[${I_N_HYPO}]}"
+	#echo "PARAMETER_LEVEL_MEAN: ${PARAMETER_LEVEL_MEAN[${I_N_HYPO}]}"
+	#echo "PARAMETER_LEVEL: ${PARAMETER_LEVEL[${I_N_HYPO}]}"
+	#echo "N_PARAMETER: ${N_PARAMETER[${I_N_HYPO}]}"
+	if [ ${PARAMETER_LEVEL[${I_N_HYPO}]} = RED ]; then
+		MEAN_COLOR[${I_N_HYPO}]=255/0/0
+	elif  [ ${PARAMETER_LEVEL[${I_N_HYPO}]} = YELLOW ]; then
+		MEAN_COLOR[${I_N_HYPO}]=255/255/0
+	elif  [ ${PARAMETER_LEVEL[${I_N_HYPO}]} = GREEN ]; then
+		MEAN_COLOR[${I_N_HYPO}]=0/255/0
+	elif  [ ${PARAMETER_LEVEL[${I_N_HYPO}]} = WHITE ]; then
+		MEAN_COLOR[${I_N_HYPO}]=255
+	else
+		MEAN_COLOR[${I_N_HYPO}]=191
+	fi
+	#echo "MEAN_COLOR: MEAN_COLOR[${I_N_HYPO}]"
+	I_N_HYPO=I_N_HYPO+1
+done
+} < ${INSTANCE_PATH}/${PARAMETER_NAME}.csv
+
+
+
+R_VAL=-R-${TIME_AXIS_LEN}/0.0166666667/${R_VAL_Y}
+#echo "R_VAL: ${R_VAL}"
+I_VAL=-I0.0166666667/${I_VAL_Y}
+#echo "I_VAL: ${I_VAL}"
+
+J_VAL=${GRID_J_VAL}
+
+
+# following is needed to set -X and -Y shift
+psxy ${R_VAL} ${J_VAL} -W255 -X${X_POS} -Y${Y_POS} -O -K << END >> ${PS_NAME}
+0 0
+0 0
+END
+
+
+# warning level grid
+
+if [ ${PLOT_HISTOGRAM_ONLY} = NO ]; then
+
+psbasemap ${R_VAL} ${J_VAL} ${GRID_B_VAL}:"Time before last data (min)":/${B_VAL_Y_INFO}:"${TITLE}":We${GRID_SN_VAL} \
+-G0  -O -K >> ${PS_NAME}
+#grdimage ${SAVE_DIR}/${PARAMETER_NAME}.grd ${R_VAL} ${J_VAL} \
+#${GRID_B_VAL}:"Time before last data (minutes)":/${B_VAL_Y_INFO}:"${TITLE}":We${GRID_SN_VAL} \
+#-X${X_POS} -Y${Y_POS} -C${CPT_NAME} -O -K >> ${PS_NAME}
+
+if [ ${PLOT_GRID} = YES ]; then
+# signed char
+xyz2grd -F ${PLOT_DATA_PATH}/${PARAMETER_NAME}.grid.bin -Ds/units/count/1/0/${TITLE}/= -G${SAVE_DIR}/${PARAMETER_NAME}.grd ${R_VAL} ${I_VAL} -ZLBc
+#
+CPT_NAME=${SAVE_DIR}/${PARAMETER_NAME}.cpt
+#makecpt -Cred2green -I > ${CPT_NAME}
+cat << END > ${CPT_NAME}
+-999       0   255     0     -3.5     0   255     0
+-3.5     0   223     0       -2.5     0   223     0
+-2.5     0   191     0       -1.5     0   191     0
+-1.5     0   127     0       -0.5     0   127     0
+-0.5     0     0     0        0.5     0     0     0
+ 0.5     127   127     0        1.5   127   127     0
+ 1.5     191   191     0        2.5   191   191     0
+ 2.5     223   223     0        3.5   223   223     0
+ 3.5     255   255     0        99   255   255     0
+ 99   255   255   255      100.5     255   255   255
+ 100.5   127     0     0        101.5   127     0     0
+ 101.5   191     0     0        102.5   191     0     0
+ 102.5   223     0     0        103.5   223     0     0
+ 103.5   255     0     0        199     255     0     0
+B       0   255     0
+F       255    0    0
+N       128     128     128
+END
+#
+grdimage ${SAVE_DIR}/${PARAMETER_NAME}.grd ${R_VAL} ${J_VAL} -C${CPT_NAME} -O -K >> ${PS_NAME}
+#
+# clean up large grid file and cpt
+rm ${SAVE_DIR}/${PARAMETER_NAME}.grd
+rm ${CPT_NAME}
+#
+fi
+
+#psxy ${M_SYNTAX} ${PLOT_DATA_PATH}/pick.xy ${R_VAL} ${J_VAL} -W1,127/127/127 -O -K >> ${PS_NAME}
+psxy ${M_SYNTAX} ${PLOT_DATA_PATH}/pick.xy ${R_VAL} ${J_VAL} -W1,95/95/95 -O -K >> ${PS_NAME}
+
+Y_HYP_OTIME_SYM=${R_VAL_Y_SYM%%/*}
+Y_MAX_HYP_OTIME_SYM=${R_VAL_Y_SYM##*/}
+#UPPER_LOWER_BG_COLOR=191
+UPPER_LOWER_BG_COLOR=255
+I_N_HYPO=${ITERATION_MAX_HYPOCENTERS}-1
+while [ $((${I_N_HYPO} >= 0)) = 1 ]; do
+#I_N_HYPO=0
+#while [ $((${I_N_HYPO} < ${ITERATION_MAX_HYPOCENTERS})) = 1 ]; do
+	psxy ${M_SYNTAX} ${PLOT_DATA_PATH}/pick.assoc.${I_N_HYPO}.xy ${R_VAL} ${J_VAL} -W2,${HYPO_COLOR[${I_N_HYPO}]} -O -K >> ${PS_NAME}
+	# hypocenter otime
+	{
+		read X_HYP_OTIME_SYM
+	} < ${PLOT_DATA_PATH}/hypo.${I_N_HYPO}.otime.dat
+	psxy ${R_VAL} ${J_VAL} -W8,255  -O -K  << END >> ${PS_NAME}
+		${X_HYP_OTIME_SYM}    ${Y_HYP_OTIME_SYM}
+		${X_HYP_OTIME_SYM}    ${Y_MAX_HYP_OTIME_SYM}
+END
+	psxy ${R_VAL} ${J_VAL} -W5,${HYPO_COLOR[${I_N_HYPO}]}  -O -K  << END >> ${PS_NAME}
+		${X_HYP_OTIME_SYM}    ${Y_HYP_OTIME_SYM}
+		${X_HYP_OTIME_SYM}    ${Y_MAX_HYP_OTIME_SYM}
+END
+	psxy ${R_VAL} ${J_VAL} -Sd0.3 -G${HYPO_COLOR[${I_N_HYPO}]} -N -D-0/-0.05  -O -K << END >> ${PS_NAME}
+		${X_HYP_OTIME_SYM}    ${Y_HYP_OTIME_SYM}
+END
+	psxy ${M_SYNTAX} ${PLOT_DATA_PATH}/${PARAMETER_NAME}.upper.${I_N_HYPO}.xy ${R_VAL} ${J_VAL} -W2,${UPPER_LOWER_BG_COLOR} -O -K >> ${PS_NAME}
+	psxy ${M_SYNTAX} ${PLOT_DATA_PATH}/${PARAMETER_NAME}.upper.${I_N_HYPO}.xy ${R_VAL} ${J_VAL} -W2,${HYPO_COLOR[${I_N_HYPO}]},- -O -K >> ${PS_NAME}
+	psxy ${M_SYNTAX} ${PLOT_DATA_PATH}/${PARAMETER_NAME}.lower.${I_N_HYPO}.xy ${R_VAL} ${J_VAL} -W2,${UPPER_LOWER_BG_COLOR} -O -K >> ${PS_NAME}
+	psxy ${M_SYNTAX} ${PLOT_DATA_PATH}/${PARAMETER_NAME}.lower.${I_N_HYPO}.xy ${R_VAL} ${J_VAL} -W2,${HYPO_COLOR[${I_N_HYPO}]},- -O -K >> ${PS_NAME}
+	STATISTICS_W_VAL=5,${HYPO_COLOR[${I_N_HYPO}]}
+	STATISTICS_W_VAL_BG=8,255
+	if [ ${PLOT_SUMMARY_RESULTS} = YES ]; then
+		STATISTICS_W_VAL_BG=10,${MEAN_COLOR[${I_N_HYPO}]}
+	fi
+	psxy ${M_SYNTAX} ${PLOT_DATA_PATH}/${PARAMETER_NAME}.value.${I_N_HYPO}.xy ${R_VAL} ${J_VAL} -W${STATISTICS_W_VAL_BG} -O -K >> ${PS_NAME}
+	psxy ${M_SYNTAX} ${PLOT_DATA_PATH}/${PARAMETER_NAME}.value.${I_N_HYPO}.xy ${R_VAL} ${J_VAL} -W${STATISTICS_W_VAL} -O -K >> ${PS_NAME}
+
+	I_N_HYPO=I_N_HYPO-1
+done
+
+# level = critical value line
+psxy ${R_VAL} ${J_VAL} -W2,255 -O -K << END >> ${PS_NAME}
+-${TIME_AXIS_LEN}    ${CRITICAL_VALUE}
+0  ${CRITICAL_VALUE}
+END
+
+# station codes
+# if [ ${PLOT_GRID} = YES ]; then
+# # x,  y,  size,  angle, fontno,  justify,  text
+# cat << END > ${GMT_TMPDIR}/_temp_.txt
+# END
+# {
+# while read -a tokens ; do
+# cat << END >> ${GMT_TMPDIR}/_temp_.txt
+# ${tokens[0]} ${tokens[1]} 3 0 0 RM ${tokens[2]}
+# END
+# done
+# } < ${PLOT_DATA_PATH}/${PARAMETER_NAME}.grid.sta.code.txt
+# pstext ${GMT_TMPDIR}/_temp_.txt ${R_VAL} ${J_VAL} -D-0.07/0 -G191/191/191 -O -K >> ${PS_NAME}
+# fi
+
+# start and stop time text
+if [ ${PLOT_START_STOP_TIME} = YES ]; then
+# x,  y,  size,  angle, fontno,  justify,  text
+pstext ${R_VAL} ${J_VAL} -G0/0/0 -N -O -K << END >> ${PS_NAME}
+-${TIME_AXIS_LEN} -1.95 8 0 1 LB  ${PLOT_START_TIME} UTC
+END
+pstext ${R_VAL} ${J_VAL} -G0/0/0 -W255o -N -O -K << END >> ${PS_NAME}
+-0.8 -2.00 10 0 1 RB  ${PLOT_END_TIME}
+END
+pstext ${R_VAL} ${J_VAL} -G0/0/0 -N -O -K << END >> ${PS_NAME}
+0.00 -2.06 10 0 1 CB  @~\255@~
+END
+fi
+
+# title text
+# x,  y,  size,  angle, fontno,  justify,  text
+pstext ${R_VAL} ${J_VAL} -D0.1/-0.1 -G255 -N -O -K << END >> ${PS_NAME}
+-${TIME_AXIS_LEN} ${R_VAL_Y##*/} 9 0 1 LT  ${LONG_TITLE}
+END
+
+fi #if [ ${PLOT_HISTOGRAM_ONLY} = NO ]; then
+
+
+J_VAL=-Jx1/${J_VAL_Y_HIST}
+R_VAL=-R-0.2/2.2/${R_VAL_Y_SYM}
+SYMBOL=-Sd0.65
+SYMBOL_X=-0.05
+SYMBOL_W=-W20,159/159/159
+if [ ${PLOT_SUMMARY_RESULTS} = YES ]; then
+	SYMBOL=-Sd0.9
+	SYMBOL_X=0.05
+elif [ ${PLOT_LAST_LEVEL} = YES ]; then
+	SYMBOL=-S-0.5
+	SYMBOL_X=0.05
+elif [ ${PLOT_HISTOGRAM_ONLY} = YES ]; then
+	SYMBOL=-Sd0.5
+	SYMBOL_X=1.95
+fi
+
+# following is needed to set -X shift
+psxy ${R_VAL} ${J_VAL} ${SYMBOL_W} -X${GRID_WIDTH} -O -K << END >> ${PS_NAME}
+${SYMBOL_X} 0
+${SYMBOL_X} 0
+END
+# plot grey symbol at level 0 if no hypocenters
+#if [ $((${ITERATION_MAX_HYPOCENTERS} < 1)) = 1 ]; then
+#	psxy -N ${R_VAL} ${J_VAL} ${SYMBOL} -G191 -W1,0 -O -K << END >> ${PS_NAME}
+#	${SYMBOL_X} 0
+#END
+#fi
+
+I_N_HYPO=${ITERATION_MAX_HYPOCENTERS}-1
+declare -i I_N_HYPO_P1=${ITERATION_MAX_HYPOCENTERS}
+while [ $((${I_N_HYPO} >= 0)) = 1 ]; do
+	if [ $((${N_PARAMETER[${I_N_HYPO}]} > 0)) = 1 ]; then
+		if [ ${PLOT_LAST_LEVEL} = YES ]; then
+			#SYMBOL_X=$(echo "0.05+0.05*${I_N_HYPO}" | bc -l)
+			SYMBOL_X=$(echo "-0.05+0.15*${I_N_HYPO}" | bc -l)
+			SYMBOL_W=-W10,${HYPO_COLOR[${I_N_HYPO}]}
+			pstext ${R_VAL} ${J_VAL} -G${HYPO_COLOR[${I_N_HYPO}]} -D-0.05/0.1 -N -O -K << END >> ${PS_NAME}
+			${SYMBOL_X} ${PARAMETER_LEVEL_PLUS_STD_DEV[${I_N_HYPO}]} 5 0 1 ML ${I_N_HYPO_P1}
+END
+		fi
+		# error bar
+		psxy ${R_VAL} ${J_VAL} ${SYMBOL_W} -O -K << END >> ${PS_NAME}
+		${SYMBOL_X} ${PARAMETER_LEVEL_MINUS_STD_DEV[${I_N_HYPO}]}
+		${SYMBOL_X} ${PARAMETER_LEVEL_PLUS_STD_DEV[${I_N_HYPO}]}
+END
+	fi
+	I_N_HYPO=I_N_HYPO-1
+	I_N_HYPO_P1=I_N_HYPO_P1-1
+done
+
+I_N_HYPO=${ITERATION_MAX_HYPOCENTERS}-1
+while [ $((${I_N_HYPO} >= 0)) = 1 ]; do
+	if [ $((${N_PARAMETER[${I_N_HYPO}]} > 0)) = 1 ]; then
+		# alarm level symbol
+		if [ ${PLOT_SUMMARY_RESULTS} = YES ]; then
+			#echo "pstext ${R_VAL} ${J_VAL} -W${MEAN_COLOR[${I_N_HYPO}]},3,${HYPO_COLOR[${I_N_HYPO}]}O -G0 -N -O  -K << END >> ${PS_NAME}"
+			#echo "${SYMBOL_X} ${PARAMETER_LEVEL_MEAN_PLOT[${I_N_HYPO}]} 10 0 1 BL .    ${TITLE}=${PARAMETER_LEVEL_MEAN[${I_N_HYPO}]}"
+			pstext ${R_VAL} ${J_VAL} -W255,O4,${MEAN_COLOR[${I_N_HYPO}]} -G${HYPO_COLOR[${I_N_HYPO}]} -N -O  -K << END >> ${PS_NAME}
+			${SYMBOL_X} ${PARAMETER_LEVEL_MEAN_PLOT[${I_N_HYPO}]} 8 0 1 ML .     ${TITLE} = ${PARAMETER_LEVEL_MEAN[${I_N_HYPO}]}
+END
+		fi
+		# other level symbol
+		if [ ${PLOT_LAST_LEVEL} = YES ]; then
+			#SYMBOL_X=$(echo "0.05+0.05*${I_N_HYPO}" | bc -l)
+			SYMBOL_X=$(echo "-0.05+0.15*${I_N_HYPO}" | bc -l)
+		fi
+		psxy -N ${R_VAL} ${J_VAL} ${SYMBOL} -G${MEAN_COLOR[${I_N_HYPO}]} -W4,${HYPO_COLOR[${I_N_HYPO}]} -O -K << END >> ${PS_NAME}
+		${SYMBOL_X} ${PARAMETER_LEVEL_MEAN_PLOT[${I_N_HYPO}]}
+END
+	
+	fi
+	I_N_HYPO=I_N_HYPO-1
+done
+
+# histogram axis title
+AXIS_LABEL=count
+WE_CODE=we
+X_INFO_TXT=11.5
+if [ ${PLOT_HISTOGRAM_ONLY} = YES ]; then
+	#AXIS_LABEL="${TITLE} count"
+	AXIS_LABEL=""	# 20110513 AJL
+	WE_CODE=We
+	X_INFO_TXT=12.75
+fi
+
+# histogram
+if [ ${PLOT_STATION_RESULTS} = YES ]; then
+	J_VAL=-Jx0.15/${J_VAL_Y_HIST}
+	R_VAL=-R0.001/10.5/${R_VAL_Y}
+	psbasemap -B2:"${AXIS_LABEL}":/${B_VAL_Y_INFO}:"${TITLE}":${WE_CODE}${GRID_SN_VAL} -G255 ${R_VAL} ${J_VAL} -X0.56 -O -K >> ${PS_NAME}
+	I_N_HYPO=${ITERATION_MAX_HYPOCENTERS}-1
+	while [ $((${I_N_HYPO} >= 0)) = 1 ]; do
+			#echo "N_PARAMETER[${I_N_HYPO}] ${N_PARAMETER[${I_N_HYPO}]}"
+		if [ $((${N_PARAMETER[${I_N_HYPO}]} > 0)) = 1 ]; then
+			R_VAL=-R${R_VAL_Y}/0.001/10.5
+			#echo "pshistogram ${PLOT_DATA_PATH}/${PARAMETER_NAME}.${I_N_HYPO}.hist -A ${R_VAL} ${J_VAL} -G${HYPO_COLOR[${I_N_HYPO}]} -Z0 -W${HISTOGRAM_BIN_WIDTH} -O -K >> ${PS_NAME}"
+			pshistogram ${PLOT_DATA_PATH}/${PARAMETER_NAME}.${I_N_HYPO}.hist -A ${R_VAL} ${J_VAL} -G${HYPO_COLOR[${I_N_HYPO}]} \
+				-Z0 -W${HISTOGRAM_BIN_WIDTH} -O -K >> ${PS_NAME}
+				#-L0.5p 
+				#2>/dev/null
+			R_VAL=-R0.001/10.5/${R_VAL_Y}
+			# info text
+			W_VAL=""
+			if [ "${PARAMETER_LEVEL_MEAN[${I_N_HYPO}]: -1}" == "*" ] ; then
+				TOKEN_TMP=${PARAMETER_LEVEL_MEAN[${I_N_HYPO}]}
+				PARAMETER_LEVEL_MEAN[${I_N_HYPO}]=${TOKEN_TMP//\*}
+				W_VAL=${PREFERRED_MAG_TEXT_EMPHASIS}
+			fi
+			# x,  y,  size,  angle, fontno,  justify,  text
+			#echo "pstext ${R_VAL} ${J_VAL} -G${HYPO_COLOR[${I_N_HYPO}]} -N -O -K << END >> ${PS_NAME}"
+			pstext ${R_VAL} ${J_VAL} ${W_VAL} -G${HYPO_COLOR[${I_N_HYPO}]} -N -O -K << END >> ${PS_NAME}
+			${X_INFO_TXT} ${PARAMETER_LEVEL_MEAN_PLOT[${I_N_HYPO}]} 8 0 1 LM  ${PARAMETER_LEVEL_MEAN[${I_N_HYPO}]} [${N_PARAMETER[${I_N_HYPO}]}]
+END
+		fi
+		I_N_HYPO=I_N_HYPO-1
+	done
+	R_VAL=-R0.001/10.5/${R_VAL_Y}
+	# level = 1 line
+	psxy ${R_VAL} ${J_VAL} -W2,127/127/127 -O -K << END >> ${PS_NAME}
+	0.001  ${CRITICAL_VALUE}
+	10.5   ${CRITICAL_VALUE}
+END
+fi
+
+
+# gmt_shell_functions
+#rm -rf $GMT_TMPDIR
+#unset GMT_TMPDIR
+
+
+
+
+
+
+
+
