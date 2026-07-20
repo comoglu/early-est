@@ -7,7 +7,30 @@ document *why* Early-est struggles against modern IRIS/EarthScope services, and 
 workaround used here, precisely — for A. Lomax and anyone else running into the same
 issue.
 
-## Root cause: no TLS support in the built-in web-service client
+There are two distinct EarthScope-side changes that can each independently cause
+"trouble getting data and using web services" — worth checking both.
+
+## 1. SeedLink real-time streaming: address migration (affects "getting data")
+
+EarthScope moved the NSF National Geophysical Facility's public SeedLink service from
+`rtserve.iris.washington.edu` to `rtserve.earthscope.org` as part of a cloud
+transition ([announcement](https://www.earthscope.org/news/seedlink-service-is-moving-as-part-of-our-cloud-transition/)).
+Both addresses ran in parallel for about a month, with a **forced cutover on 2026-06-08**:
+the legacy address's DNS now redirects to the new service, dropping any client still
+connected there. Critically, **the new service is an independent implementation that
+does not share connection/state with the legacy server** — a client resuming with an
+old statefile against the new address can stall, gap, or (per EarthScope's own notice)
+attempt to re-download large amounts of data it thinks is missing.
+
+If `seedlink_monitor` (or an upstream SeisComP/seedlink chain feeding it) is configured
+to connect directly to `rtserve.iris.washington.edu:18000`, **that is very likely a
+direct cause of "getting data" trouble** — independent of the TLS issue below.
+**Fix:** point the SeedLink client at `rtserve.earthscope.org:18000` instead, and
+discard/rename any saved SeedLink statefile before reconnecting (do not resume old
+state against the new address). This deployment's local SeisComP seedlink chain
+already uses `rtserve.earthscope.org:18000` and is unaffected.
+
+## 2. FDSN web services: no TLS support in the built-in HTTP client (affects "web services")
 
 Early-est's own HTTP client (`net/net_lib.c`, `net/htmlget.c`, `response/response_lib.c`)
 is a **plain-socket, unencrypted HTTP/1.x client** — there is no OpenSSL/mbedTLS/any TLS
