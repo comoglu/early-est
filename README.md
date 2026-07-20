@@ -32,8 +32,10 @@ program with `-h`.
 ## About this repository
 
 This mirrors the source as deployed and run in production (version `1.2.9xDEV`,
-2023.05.05) with a small set of patches to keep it working against modern
-SeisComP/SeedLink and FDSN web-service environments — see [PATCHES.md](PATCHES.md).
+2023.05.05). **No source patches have been applied.** See [PATCHES.md](PATCHES.md) for
+a precise diagnosis of why Early-est's built-in real-time data acquisition and
+web-service queries can fail against current IRIS/EarthScope services, and for notes
+on the (site-specific) operational workaround used for this particular deployment.
 
 **Not included:** compiled/rebuildable artifacts (`*.o`, `*.a`), accumulated runtime
 output (`work/seedlink_out/`, `work/msprocess_out/`, `work/msprocess_plots/`), and

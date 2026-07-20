@@ -1,11 +1,9 @@
 # Patches & operational notes — this deployment
 
-This tree is otherwise an unmodified copy of Early-est `1.2.9xDEV` (2023.05.05). No
-source patches have been applied to the networking code in this deployment; instead,
-the internet-query code path is avoided entirely (see below). This file exists to
-document *why* Early-est struggles against modern IRIS/EarthScope services, and the
-workaround used here, precisely — for A. Lomax and anyone else running into the same
-issue.
+This tree is an unmodified copy of Early-est `1.2.9xDEV` (2023.05.05) — no source
+patches have been applied. This file documents, precisely, *why* Early-est's built-in
+real-time acquisition and web-service queries struggle against current
+IRIS/EarthScope services, for A. Lomax and anyone else running into the same issue.
 
 There are two distinct EarthScope-side changes that can each independently cause
 "trouble getting data and using web services" — worth checking both.
@@ -55,25 +53,21 @@ of a certificate mismatch Early-est is mishandling, but because it never attempt
 at all; the connection is refused/reset at the protocol level, or blocked if EarthScope
 redirects HTTP→HTTPS.
 
-## Workaround used in this deployment (no source patch)
+## Note: this is a site-specific stopgap, not a fix
 
-Rather than patch the networking layer, this deployment avoids it entirely:
+`seedlink_monitor` already has its own native SeedLink client and its own built-in
+web-service queries (`-sta-query`, `-pz-query`) — it's designed to acquire real-time
+data and metadata directly, with nothing in between. The TLS gap above is a genuine
+bug in that direct path, and the right fix is to close the gap (e.g. by adding TLS
+support to `net/net_lib.c`, most easily via **libcurl** rather than hand-rolled
+OpenSSL), so those built-in mechanisms work again as intended.
 
-1. **Station coordinates & gains are supplied as static local files** (`-g geogfile`,
-   `-pz gainfile`) instead of the runtime `-sta-query`/`-pz-query` internet lookups.
-   These files are regenerated periodically from a **local** SeisComP `fdsnws`
-   instance (plain HTTP, localhost — no TLS needed) rather than fetched by Early-est
-   itself over the internet.
-2. **Continuous waveform data is fed from a local SeisComP SeedLink server**
-   (`seedlink_monitor :18000 -l streams.list …`) rather than Early-est connecting to a
-   remote SeedLink/DAS server directly. SeisComP itself handles acquisition from
-   GEOFON/EarthScope/RESIF/etc. upstream (over whatever protocol those require), and
-   Early-est only ever talks to `localhost`.
-
-This sidesteps the TLS gap completely: Early-est's own networking code is never asked
-to reach an HTTPS endpoint. A proper fix would add TLS support to `net/net_lib.c`
-(e.g. via OpenSSL) so `-sta-query`/`-pz-query` and the internet gain/station lookups
-can work again directly against modern FDSN web services.
+For reference only: this *particular* deployment happens to sit behind a local
+SeisComP instance for reasons unrelated to this bug (multi-network aggregation across
+several upstream providers), and that incidentally routes around the TLS gap too,
+since Early-est only ever talks to `localhost` in that setup. That's specific to this
+one deployment, not a general recommendation — happy to share the details if useful
+to someone, but it shouldn't be read as "how Early-est should be run."
 
 ## Other environment-compatibility notes
 
