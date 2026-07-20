@@ -12,7 +12,9 @@ void usage();
 int main(int argc, char **argv) {
 
     //struct sockaddr_in *remote;
+#ifndef USE_LIBCURL
     int sock;
+#endif
     char *host;
     char *page;
 
@@ -27,6 +29,16 @@ int main(int argc, char **argv) {
         page = PAGE;
     }
 
+#ifdef USE_LIBCURL
+    // 20260720 - patch: TLS-capable fetch (see PATCHES.md); tries HTTPS first,
+    // falling back to HTTP, instead of the plain-port-80-only path below.
+    int page_length = 0;
+    char *page_contents = http_fetch(host, page, &page_length);
+    if (page_contents == NULL)
+        return (1);
+    fprintf(stdout, "%s\n", page_contents);
+    free(page_contents);
+#else
     //sock = get_socket_connection(host, &remote);
     sock = get_socket_connection(host, "http");
     if (sock < 0)
@@ -39,6 +51,7 @@ int main(int argc, char **argv) {
 
     //free(remote);
     close(sock);
+#endif
 
     return (0);
 

@@ -1,9 +1,10 @@
 # Patches & operational notes — this deployment
 
-This tree is an unmodified copy of Early-est `1.2.9xDEV` (2023.05.05) — no source
-patches have been applied. This file documents, precisely, *why* Early-est's built-in
-real-time acquisition and web-service queries struggle against current
-IRIS/EarthScope services, for A. Lomax and anyone else running into the same issue.
+This tree is based on Early-est `1.2.9xDEV` (2023.05.05). One small, additive,
+optional patch is applied (see "Fix implemented" below) — everything else is
+unmodified. This file documents, precisely, *why* Early-est's built-in real-time
+acquisition and web-service queries struggle against current IRIS/EarthScope
+services, for A. Lomax and anyone else running into the same issue.
 
 There are two distinct EarthScope-side changes that can each independently cause
 "trouble getting data and using web services" — worth checking both.
@@ -53,23 +54,66 @@ of a certificate mismatch Early-est is mishandling, but because it never attempt
 at all; the connection is refused/reset at the protocol level, or blocked if EarthScope
 redirects HTTP→HTTPS.
 
-## Note: this is a site-specific stopgap, not a fix
+**Confirmed independently**, against `service.earthscope.org` on port 80 (i.e. without
+a real TLS fix, regardless of hostname or HTTP/1.0 vs 1.1): a plain HTTP/1.0 request is
+met with CloudFront's standard `301 Moved Permanently` → `https://...` (no
+redirect-following logic exists in this code, so the tiny redirect page is all that's
+returned); a plain HTTP/1.1 request instead hangs until the 10s socket timeout
+(`"Resource temporarily unavailable"`) — because CloudFront, like most servers, defaults
+to a *persistent* (keep-alive) connection under HTTP/1.1, and this code's `recv()` loop
+relies on the peer closing the socket to know the response is complete (true by default
+under HTTP/1.0, not under 1.1). Both are exactly the symptoms of "no TLS, ever, on
+port 80" — not two separate bugs.
 
-`seedlink_monitor` already has its own native SeedLink client and its own built-in
-web-service queries (`-sta-query`, `-pz-query`) — it's designed to acquire real-time
-data and metadata directly, with nothing in between. The TLS gap above is a genuine
-bug in that direct path, and the right fix is to close the gap (e.g. by adding TLS
-support to `net/net_lib.c`, most easily via **libcurl** rather than hand-rolled
-OpenSSL), so those built-in mechanisms work again as intended.
+## Fix implemented: `http_fetch()`, a TLS-capable fetch via libcurl
 
-For reference only: this *particular* deployment happens to sit behind a local
-SeisComP instance for reasons unrelated to this bug (multi-network aggregation across
-several upstream providers), and that incidentally routes around the TLS gap too,
-since Early-est only ever talks to `localhost` in that setup. That's specific to this
-one deployment, not a general recommendation — happy to share the details if useful
-to someone, but it shouldn't be read as "how Early-est should be run."
+`net/net_lib.c` / `net/net_lib.h` add a new function, `http_fetch(host, page,
+&page_length)`, guarded by `#ifdef USE_LIBCURL` and kept alongside (not replacing) the
+original socket-based functions:
+
+- Tries `https://host/page` first; if that fails, automatically retries
+  `http://host/page` — no config changes needed at call sites.
+- Uses libcurl, so it gets a real TLS handshake, HTTP/1.1 keep-alive handled correctly,
+  and redirects followed (`CURLOPT_FOLLOWLOCATION`) — closing all three failure modes
+  above at once.
+- Returns the **full raw response text, headers included** (`CURLOPT_HEADER, 1L`),
+  matching the historical `get_page()` output contract exactly — so `get_gain_xml()`,
+  `get_station_coords_xml()`, `get_disp_gain_seed_resp()`, etc. in `response_lib.c`
+  needed **no parsing changes**, only the fetch call at each of their 4 call sites
+  swapped in (also under `#ifdef USE_LIBCURL`, with the original path preserved in the
+  `#else` branch). `net/htmlget.c` (the standalone test tool) is updated the same way.
+- Enabled by default via `LIBCURL_DEFS = -D USE_LIBCURL` in the top-level `Makefile`
+  (mirroring the existing `AMQP_DEFS`/`JSON_DEFS` opt-in pattern already used in that
+  file) — comment out that one line to build without it; everything else is unaffected.
+  Requires `libcurl` (`apt install libcurl4-openssl-dev` / `brew install curl`).
+
+**Tested:** compiles cleanly both with and without `USE_LIBCURL` defined (`net_lib.c`,
+`response_lib.c`, `htmlget.c`). Run live against `service.earthscope.org`, including the
+exact failing query above (`net=AU&sta=EIDS&loc=00&cha=BHE&...&level=channel`) — returns
+a proper `HTTP/2 200` with the real `FDSNStationXML` body (gain/instrument sensitivity
+data intact), where the unpatched code got the 301 or hung.
+
+This is on a branch/PR rather than pushed straight to `main`, specifically so it's easy
+to review as one discrete change.
+
+## Aside: `seedlink_monitor` doesn't need anything in between
+
+Worth restating since it's easy to lose in all this: `seedlink_monitor` already has its
+own native SeedLink client and its own built-in web-service queries — it's designed to
+acquire real-time data and metadata directly, with nothing in between. The fix above
+closes the actual gap in that direct path. This deployment happens to also sit behind a
+local SeisComP instance, but that's for unrelated reasons (multi-network aggregation
+across several upstream providers) and is specific to this one deployment, not a
+general recommendation or a substitute for the fix above — happy to share the details
+if useful to someone, but it shouldn't be read as "how Early-est should be run."
 
 ## Other environment-compatibility notes
+
+- **`Makefile`** — the `libslink` include path was previously hardcoded to one
+  deployment's home directory (`-I/home/comonvgc/early-est_deps/libslink`), left over
+  from that deployment's own build. Replaced with a `LIBSLINK_INCLUDE_PATH` variable
+  (empty by default, matching how `AMQP_INCLUDE_PATH`/`JSONC_INCLUDE_PATH` already work
+  in this file) — set it only if your compiler can't already find libslink's headers.
 
 - **`work/gmt_bin/`** — thin wrapper scripts (one per GMT5 module name, e.g. `psmeca`,
   `pscoast`, `grdimage`) that each call `gmt <module>`, for running the GMT5-era

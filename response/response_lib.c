@@ -36,6 +36,15 @@ double get_gain_internet_station_query_FDSN_WS_STATION(char* internet_gain_query
             internet_gain_query, prtnet, prtsta, locstr, prtchan, year, month, mday, year, month, mday);
     fprintf(stdout, "Query: http://%s/%s\n", internet_gain_query_host, page);
 
+#ifdef USE_LIBCURL
+    // 20260712 - patch: TLS-capable fetch (see PATCHES.md); replaces the plain-HTTP-only
+    // get_socket_connection()+get_page() pair below, which cannot reach an HTTPS-only endpoint.
+    int page_length = 0;
+    char *page_contents = http_fetch(internet_gain_query_host, page, &page_length);
+    if (page_contents == NULL) {
+        return (-1);
+    }
+#else
     //struct sockaddr_in *internet_station_socket_remote;
     int internet_station_socket = -1;
     //internet_station_socket = get_socket_connection(internet_gain_query_host, &internet_station_socket_remote);
@@ -49,6 +58,7 @@ double get_gain_internet_station_query_FDSN_WS_STATION(char* internet_gain_query
         //free(internet_station_socket_remote);
         return (-1);
     }
+#endif
 
     fprintf(stdout, "%100.100s\n", page_contents);
 
@@ -58,9 +68,11 @@ double get_gain_internet_station_query_FDSN_WS_STATION(char* internet_gain_query
 
     free(page_contents);
 
+#ifndef USE_LIBCURL
     shutdown(internet_station_socket, SHUT_RDWR);
     close(internet_station_socket);
     //free(internet_station_socket_remote);
+#endif
 
     return (gain);
 
@@ -85,6 +97,15 @@ double get_gain_internet_gain_query_IRIS_WS_RESP(char* internet_gain_query_host,
             internet_gain_query, prtnet, prtsta, prtloc, prtchan, year, month, mday);
     fprintf(stdout, "Query: http://%s/%s\n", internet_gain_query_host, page);
 
+#ifdef USE_LIBCURL
+    // 20260712 - patch: TLS-capable fetch (see PATCHES.md); replaces the plain-HTTP-only
+    // get_socket_connection()+get_page() pair below, which cannot reach an HTTPS-only endpoint.
+    int page_length = 0;
+    char *page_contents = http_fetch(internet_gain_query_host, page, &page_length);
+    if (page_contents == NULL) {
+        return (-1.0);
+    }
+#else
     //struct sockaddr_in *internet_gain_socket_remote = NULL;
     int internet_gain_socket = -1;
     //internet_gain_socket = get_socket_connection(internet_gain_query_host, &internet_gain_socket_remote);
@@ -98,6 +119,7 @@ double get_gain_internet_gain_query_IRIS_WS_RESP(char* internet_gain_query_host,
         //free(internet_gain_socket_remote);
         return (-1.0);
     }
+#endif
 
     fprintf(stdout, "%100.100s\n", page_contents);
 
@@ -105,9 +127,11 @@ double get_gain_internet_gain_query_IRIS_WS_RESP(char* internet_gain_query_host,
 
     free(page_contents);
 
+#ifndef USE_LIBCURL
     shutdown(internet_gain_socket, SHUT_RDWR);
     close(internet_gain_socket);
     //free(internet_gain_socket_remote);
+#endif
 
     return (gain);
 
@@ -628,6 +652,15 @@ int get_station_coords_internet_station_query_FDSN_WS_STATION(char* internet_sta
             internet_station_query, prtnet, prtsta, prtloc, prtchan, year, month, mday, year, month, mday);
     fprintf(stdout, "Query: http://%s/%s\n", internet_station_query_host, page);
 
+#ifdef USE_LIBCURL
+    // 20260712 - patch: TLS-capable fetch (see PATCHES.md); replaces the plain-HTTP-only
+    // get_socket_connection()+get_page() pair below, which cannot reach an HTTPS-only endpoint.
+    int page_length = 0;
+    char *page_contents = http_fetch(internet_station_query_host, page, &page_length);
+    if (page_contents == NULL) {
+        return (-1);
+    }
+#else
     //struct sockaddr_in *internet_station_socket_remote;
     int internet_station_socket = -1;
     //internet_station_socket = get_socket_connection(internet_station_query_host, &internet_station_socket_remote);
@@ -641,6 +674,7 @@ int get_station_coords_internet_station_query_FDSN_WS_STATION(char* internet_sta
         //free(internet_station_socket_remote);
         return (-1);
     }
+#endif
 
     fprintf(stdout, "%100.100s\n", page_contents);
 
@@ -649,9 +683,11 @@ int get_station_coords_internet_station_query_FDSN_WS_STATION(char* internet_sta
 
     free(page_contents);
 
+#ifndef USE_LIBCURL
     shutdown(internet_station_socket, SHUT_RDWR);
     close(internet_station_socket);
     //free(internet_station_socket_remote);
+#endif
 
     return (return_value);
 
@@ -681,6 +717,15 @@ int get_station_coords_internet_station_query_IRIS_WS_STATION(char* internet_sta
             internet_station_query, prtnet, prtsta, year, month, mday, year, month, mday);
     fprintf(stdout, "Query: http://%s/%s\n", internet_station_query_host, page);
 
+#ifdef USE_LIBCURL
+    // 20260712 - patch: TLS-capable fetch (see PATCHES.md); replaces the plain-HTTP-only
+    // get_socket_connection()+get_page() pair below, which cannot reach an HTTPS-only endpoint.
+    int page_length = 0;
+    char *page_contents = http_fetch(internet_station_query_host, page, &page_length);
+    if (page_contents == NULL) {
+        return (-1);
+    }
+#else
     //struct sockaddr_in *internet_station_socket_remote;
     int internet_station_socket = -1;
     //internet_station_socket = get_socket_connection(internet_station_query_host, &internet_station_socket_remote);
@@ -694,6 +739,7 @@ int get_station_coords_internet_station_query_IRIS_WS_STATION(char* internet_sta
         //free(internet_station_socket_remote);
         return (-1);
     }
+#endif
 
     fprintf(stdout, "%100.100s\n", page_contents);
 
@@ -703,9 +749,11 @@ int get_station_coords_internet_station_query_IRIS_WS_STATION(char* internet_sta
 
     free(page_contents);
 
+#ifndef USE_LIBCURL
     shutdown(internet_station_socket, SHUT_RDWR);
     close(internet_station_socket);
     //free(internet_station_socket_remote);
+#endif
 
     return (return_value);
 
