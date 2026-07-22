@@ -5,6 +5,12 @@
 __pycache__/
 *.bak
 
+# stray backups/junk (pattern-based, not name-based — catches anything, not just
+# what we remembered to exclude by name)
+*.bak_*
+*~
+.DS_Store
+
 # runtime output — not part of the software
 work/seedlink_out/
 work/msprocess_out/
@@ -16,3 +22,7 @@ work/local_gainfile.csv
 work/local_station_coordinates.csv
 work/seedlink_monitor.prop
 work/streams.list
+
+# this deployment's own operational scripts — not part of Early-est itself
+work/publish_to_web.sh
+work/refresh_streams.sh
