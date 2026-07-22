@@ -1,5 +1,4 @@
 #!/bin/bash
-export PATH="/home/comonvgc/early-est-1.2.9/work/gmt_bin:$PATH"
 
 SECONDS=0
 
@@ -7,7 +6,7 @@ SECONDS=0
 # user settings
 
 # operating system type
-OPERATING_SYSTEM=LINUX
+OPERATING_SYSTEM=MACOSX
 #OPERATING_SYSTEM=LINUX
 # local directory to accumulate report interval output files: xml, csv, web, plot etc.
 # 20190401 AJL  SAVE_DIR=./seedlink_plots
@@ -15,7 +14,7 @@ SAVE_DIR=`mktemp -d ${TMPDIR:-/tmp}/$0.XXXXXX`
 #echo "SAVE_DIR ${SAVE_DIR}"
 
 # local directory to create web content
-LOCAL_DIR_WARNING=/home/comonvgc/early-est.comoglu.com
+LOCAL_DIR_WARNING=/Users/anthony/www/projects/early-est
 #echo "LOCAL_DIR_WARNING ${LOCAL_DIR_WARNING}"
 
 # remote web server to put web content
@@ -60,7 +59,7 @@ USE_COMPRESSION_FOR_JAVASCRIPT_HTML=NO
 
 # choose here if you want to use gs (ghostscript) or convert (ImageMagic command) for ps to jpg conversion
 #USE_CONVERT_FOR_PS2JPG=NO
-USE_CONVERT_FOR_PS2JPG=NO
+USE_CONVERT_FOR_PS2JPG=YES
 
 # choose here if you want this script to terminate if a previous instance of this script is still running
 RUN_ONLY_IF_PREV_COMPLETED=YES
@@ -242,7 +241,7 @@ mv ${ROOT_NAME}.pdf ${INSTANCE_PATH_NAME}
 #mv ${ROOT_NAME}_map.pdf ${INSTANCE_PATH_NAME}
 
 if [ ${USE_CONVERT_FOR_PS2JPG} == NO ] ; then
-	COMMAND="gs -dQUIET -dNOPAUSE -dBATCH -sDEVICE=jpeg -r120 -dJPEGQ=85 -sOutputFile=${SAVE_DIR}/t50.jpg ${SAVE_DIR}/t50.pdf"
+	COMMAND="gs -dDEBUG -dNOPAUSE -sDEVICE=jpeg -r150 -sOutputFile=${SAVE_DIR}/t50.jpg ${ROOT_NAME}.ps"
 else
 	COMMAND="convert -density 150 -quality 85  ${ROOT_NAME}.ps ${SAVE_DIR}/t50.jpg"
 fi

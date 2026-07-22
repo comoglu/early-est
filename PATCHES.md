@@ -128,3 +128,28 @@ if useful to someone, but it shouldn't be read as "how Early-est should be run."
   continuous, global, multi-network real-time feed. This deployment runs with both
   disabled (`save.plotfiles.geojson = 0`, `[WaveformExport] enable = 0`) in
   `seedlink_monitor.prop`, which is stable. Flagging in case it's a quick fix upstream.
+
+## Cleanup: deployment artifacts that had leaked into the initial import
+
+The very first import (`work/` mirrored from a running instance) unintentionally swept
+up several of this deployment's own runtime/operational files alongside the actual
+software — inconsistent with what this README has always said is excluded. Removed:
+
+- `work/publish_to_web.sh`, `work/refresh_streams.sh` — this deployment's own scripts,
+  not part of Early-est, referencing this deployment's own server paths.
+- Three stray timestamped backup copies of `refresh_streams.sh`, and two each of
+  `local_gainfile.csv`/`local_station_coordinates.csv` (the plain-named versions were
+  already `.gitignore`d — the `.bak_*` variants weren't).
+- `work/plot_warning_report_seedlink_runtime.bash` had been customized in place for
+  this deployment's own server paths, with the *original* preserved alongside as
+  `plot_warning_report_seedlink_runtime.bash.orig`. Restored the original under its
+  proper name; removed the customized copy.
+
+No credentials, keys, or tokens were ever present in any of these — just this
+deployment's own directory-naming conventions, which don't belong in a generic
+software mirror regardless.
+
+`.gitignore` also switched from purely name-based exclusions to a couple of
+**pattern-based** ones (`*.bak_*`, `*~`, `.DS_Store`) — the actual gap here was that
+only the plain filenames were excluded, so a backup copy of an already-excluded file
+still slipped through. A pattern catches that regardless of what gets backed up next.
