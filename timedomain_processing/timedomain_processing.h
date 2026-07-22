@@ -15,12 +15,12 @@
 #define EARLY_EST_MONITOR_NAME "Early-est - EArthquake Rapid Location sYstem with EStimation of Tsunamigenesis"
 #define EARLY_EST_MONITOR_SHORT_NAME "Early-est"
 #ifdef ALPHA_VERSION
-#define EARLY_EST_MONITOR_VERSION "1.2.4xALPHA"   // use "N.N.NxDEV" for development version
+#define EARLY_EST_MONITOR_VERSION "1.2.10xALPHA"   // use "N.N.NxDEV" for development version
 #else
-//#define EARLY_EST_MONITOR_VERSION "1.2.7"   // use "N.N.N" for post-development version
-#define EARLY_EST_MONITOR_VERSION "1.2.9xDEV"   // use "N.N.NxDEV" for development version
+//#define EARLY_EST_MONITOR_VERSION "1.2.10"   // use "N.N.N" for post-development version
+#define EARLY_EST_MONITOR_VERSION "1.2.11xDEV"   // use "N.N.NxDEV" for development version
 #endif
-#define EARLY_EST_MONITOR_VERSION_DATE "2023.05.05"
+#define EARLY_EST_MONITOR_VERSION_DATE "2026.07.21"
 #define EARLY_EST_MONITOR_BANNER_1 "comes with ABSOLUTELY NO WARRANTY."
 #define EARLY_EST_MONITOR_BANNER_2 "WARNING: DISCLAIMER: This is prototype software, it is not fully validated for use in continuous, real-time systems."
 #define EARLY_EST_MONITOR_BANNER_3 "                     This software produces automatic earthquake information that has not been reviewed by a seismologist."
@@ -167,7 +167,8 @@ EXTERN_TXT int num_internet_timeseries_query_sladdr;
 
 #define WEB_SERIVCE_METADATA_CHECK_INTERVAL 7 // days
 #define IRIS_WS_TIMESERIES 1
-#define IRIS_METADATA_BASE_URL "http://www.iris.edu/mda"
+// 20260720 #define IRIS_METADATA_BASE_URL "http://www.iris.edu/mda"
+#define IRIS_METADATA_BASE_URL "https://www.iris.edu/mda"
 
 // convenience structure to hold Internet query parameters
 

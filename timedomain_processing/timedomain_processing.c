@@ -2205,8 +2205,8 @@ int td_process_timedomain_processing_init(Settings *settings, char* outpath, cha
     num_de_data = 0;
     hypo_list = NULL;
     num_hypocenters = 0;
-    orphaned_hypo_list = NULL;  // 20221007 AJL - added
-    num_orphaned_hypocenters = 0;  // 20221007 AJL - added
+    orphaned_hypo_list = NULL; // 20221007 AJL - added
+    num_orphaned_hypocenters = 0; // 20221007 AJL - added
 
     int i;
 
@@ -2741,6 +2741,13 @@ int td_get_sta_coords_internet_station_query(int source_id, char* net, char* sta
         } else if (strcmp(internet_station_query_type[n], "FDSN_WS_STATION") == 0) {
             return_value = get_station_coords_internet_station_query_FDSN_WS_STATION(internet_station_query_host[n], internet_station_query[n],
                     net, sta, loc, chan, year, month, mday, &lat, &lon, &elev, &azimuth, &dip);
+            // 20240129 AJL - Bug fix: IRIS (and other?) services may not have correct location code
+            /* 20240129 AJL - not clear this is necessary in general
+            if (return_value < 0) {
+                // try same request with empty location code
+                return_value = get_station_coords_internet_station_query_FDSN_WS_STATION(internet_station_query_host[n], internet_station_query[n],
+                        net, sta, "--", chan, year, month, mday, &lat, &lon, &elev, &azimuth, &dip);
+            }*/
         }
         // 20140310 AJL - bug fix
         //if (return_value < 0)

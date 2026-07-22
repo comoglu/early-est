@@ -3652,6 +3652,16 @@ int associate_locate_octtree(int num_pass, char *outnameroot, HypocenterDesc **h
             &assoc_scatter_sample[num_hypocenters_associated], &n_alloc_scatter_sample[num_hypocenters_associated], i_get_assoc_scatter_sample,
             &n_assoc_scatter_sample[num_hypocenters_associated], &global_max_nassociated_P_lat_lon[num_hypocenters_associated],
             channelParameters, reassociate_only, time_min, time_max);
+
+    // 20240130 AJL - Flag regular, not associated events
+    int is_not_associated = wt_count_assoc < min_weight_sum_assoc;
+    // 20240130 AJL - Bug fix to detect non-located (associated only) events, as well as regular not associated events
+    if (!is_not_associated && (hyp_work->nassoc < 1 || hyp_work->prob <= 0.0)) {
+        is_not_associated = 1;
+        printf("Warning: Detected non-located (associated only) event: nassoc (%d) < 1 or prob (%g) < 0.0\n",
+                hyp_work->nassoc, hyp_work->prob);
+    }
+
     printf(" -> %d n=%d/%d/%.1f/%g ",
             num_pass, hyp_work->nassoc, hyp_work->nassoc_P, wt_count_assoc, hyp_work->prob);
     printf("a=%1f ",
@@ -3661,7 +3671,7 @@ int associate_locate_octtree(int num_pass, char *outnameroot, HypocenterDesc **h
             hyp_work->ot_std_dev, timeDecSec2string(hyp_work->otime, tmp_str, DEFAULT_TIME_FORMAT),
             hyp_work->lat, hyp_work->lon, hyp_work->errh, hyp_work->depth, hyp_work->errz,
             hyp_work->dist_min, hyp_work->dist_max, hyp_work->gap_primary, hyp_work->gap_secondary,
-            wt_count_assoc < min_weight_sum_assoc ? "NOT ASSOCIATED" : feregion(hyp_work->lat, hyp_work->lon, feregion_str, FEREGION_STR_SIZE)
+            is_not_associated ? "NOT ASSOCIATED" : feregion(hyp_work->lat, hyp_work->lon, feregion_str, FEREGION_STR_SIZE)
             );
     // 20150904 AJL - added ABCD hypo quality level
     double critical_errh = 10.0 * nominal_oct_tree_min_node_size; // TODO: add specific program property for critical_errh
@@ -3678,9 +3688,9 @@ int associate_locate_octtree(int num_pass, char *outnameroot, HypocenterDesc **h
     printf("\n");
     //printf("   --->    nlat=%d nlon=%d  nlat_alloc=%d nlon_alloc=%d\n", nlat, nlon, nlat_alloc, nlon_alloc);
 
-    // 20140721 AJL      if (wt_count_assoc < min_weight_sum_assoc) {
-    // 20220225 AJL      if (!reassociate_only && wt_count_assoc < min_weight_sum_assoc) {
-    if (wt_count_assoc < min_weight_sum_assoc) {
+    // 20140721 AJL      if (is_not_associated) {
+    // 20220225 AJL      if (!reassociate_only && is_not_associated) {
+    if (is_not_associated) {
         for (int n = 0; n < num_de_data; n++) {
             TimedomainProcessingData* deData = data_list[n];
             if (deData->is_associated == num_pass)
@@ -8213,7 +8223,7 @@ int td_writeTimedomainProcessingReport(char* outnameroot_archive, char* outnamer
                     addHypocenterDescToHypoList(phypo, &orphaned_hypo_list, &orphaned_hypo_list_size, &num_orphaned_hypocenters,
                             icheck_orphaned_duplicates, NULL, &porphaned_hypocenter_desc_inserted); // hypocenter unique_id is set here
                     //printf("DEBUG: Event not associated and otime is in analysis window, added to orphaned_hypo_list: id %ld, phypo->hyp_assoc_index %d, %s, phypo->otime %ld, time_mintime_min + report_interval %ld\n",
-                            //phypo->unique_id, phypo->hyp_assoc_index, timeDecSec2string(phypo->otime, tmp_str, DEFAULT_TIME_FORMAT), (time_t) phypo->otime, time_min + report_interval);
+                    //phypo->unique_id, phypo->hyp_assoc_index, timeDecSec2string(phypo->otime, tmp_str, DEFAULT_TIME_FORMAT), (time_t) phypo->otime, time_min + report_interval);
                     // free phypo if not from hyp_assoc_loc array, which is freed later
                     int n;
                     for (n = 0; n < MAX_NUM_HYPO; n++) {
@@ -8306,7 +8316,7 @@ int td_writeTimedomainProcessingReport(char* outnameroot_archive, char* outnamer
     int iWriteUnAssociatedPicks = 1;
     int iWriteJSONcopy = 1; // 20211103 AJL - added, TOTO: make program property
     writeLocXML(xmlWriterFileroot, time_max, agencyId, author, hypo_list, num_hypocenters, data_list, num_de_data,
-            orphaned_hypo_list, num_orphaned_hypocenters,  // 20221007 AJL - added
+            orphaned_hypo_list, num_orphaned_hypocenters, // 20221007 AJL - added
             iWriteAssociatedOnly, iWriteArrivals, iWriteUnAssociatedPicks, printIgnoredData, iWriteJSONcopy);
 
     // write archive hypocenter xml      // 20180131 AJL - added to support SeisGram2K waveform reading
@@ -8316,7 +8326,7 @@ int td_writeTimedomainProcessingReport(char* outnameroot_archive, char* outnamer
     iWriteUnAssociatedPicks = 0;
     iWriteJSONcopy = 1; // 20211103 AJL - added, TOTO: make program property
     writeLocXML(xmlWriterFileroot, time_max, agencyId, author, hypo_list, num_hypocenters, data_list, num_de_data,
-            orphaned_hypo_list, num_orphaned_hypocenters,  // 20221007 AJL - added
+            orphaned_hypo_list, num_orphaned_hypocenters, // 20221007 AJL - added
             iWriteAssociatedOnly, iWriteArrivals, iWriteUnAssociatedPicks, printIgnoredData, iWriteJSONcopy);
 
     // write active hypocenter sequence number xml
