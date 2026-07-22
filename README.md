@@ -31,12 +31,19 @@ program with `-h`.
 
 ## About this repository
 
-This mirrors the source as deployed and run in production (version `1.2.9xDEV`,
-2023.05.05), plus one small, optional, additive patch (TLS support for the
-internet web-service queries — see below). See [PATCHES.md](PATCHES.md) for
-a precise diagnosis of why Early-est's built-in real-time data acquisition and
-web-service queries can fail against current IRIS/EarthScope services, and for notes
-on the (site-specific) operational workaround used for this particular deployment.
+Originally mirrored from the source as deployed and run in production (`1.2.9xDEV`,
+2023.05.05), plus one small, optional, additive patch (TLS support for the internet
+web-service queries — see [PATCHES.md](PATCHES.md) for a precise diagnosis of why
+Early-est's built-in real-time data acquisition and web-service queries can fail
+against current IRIS/EarthScope services).
+
+Updated `2026.07.21` to `1.2.11xDEV`, syncing in A. Lomax's own subsequent fixes
+(from his working tree, shared directly) to the files that changed: a bug fix for
+correctly flagging associated-but-never-located events, an updated report-page link,
+and several additional optional regional velocity-model files. `net/`, `response/`,
+`math/`, and the other library modules are not part of that sync — they live outside
+this specific tree on the author's own machine and weren't touched. See PATCHES.md for
+the itemised diff.
 
 **Not included:** compiled/rebuildable artifacts (`*.o`, `*.a`), accumulated runtime
 output (`work/seedlink_out/`, `work/msprocess_out/`, `work/msprocess_plots/`), and

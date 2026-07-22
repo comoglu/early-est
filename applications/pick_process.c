@@ -408,7 +408,7 @@ int check_phases_count_in_location() {
         str_pos = strtok(NULL, ",");
     }
 
-    return(nphases);
+    return (nphases);
 
 }
 
@@ -428,7 +428,8 @@ int pick_process(TimedomainProcessingData* deData, int source_id, int is_new_sou
         td_set_station_coordinates(source_id, deData->network, deData->station, deData->location, deData->channel, deData->year, deData->month, deData->mday, verbose, icheck_ws_station_coords);
         if (!channelParameters[source_id].have_coords) {
             if (verbose)
-                printf("ERROR: sensor coordinates not found: %s %s %s %s, please add sensor data to file: %s\n", deData->network, deData->station, deData->location, deData->channel, geogfile);
+                printf("ERROR: sensor coordinates not found: %s %s %s %s, check channel exists on sta-query-host, or add sensor data to file: %s, or ignore (-i) on command line\n",
+                    deData->network, deData->station, deData->location, deData->channel, geogfile);
             return (-1);
         }
         // find and store references to other channel orientations for this net/sta/chan
