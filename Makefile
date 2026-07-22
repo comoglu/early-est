@@ -129,6 +129,24 @@ JSON_OBJ= ../json/json_lib.o
 JSON_MODULES= json
 endif
 
+# libcurl DEFS ===============================================================================================================
+# 20260720 - added: enables TLS/HTTPS support for the internet gain/station web-service
+# queries (-sta-query/-pz-query), via libcurl, fixing failures against FDSN services that
+# now require HTTPS (e.g. IRIS/EarthScope) -- the built-in fetch code otherwise only ever
+# speaks plain HTTP on port 80. See PATCHES.md for the full diagnosis.
+# REQUIRES: libcurl, e.g.:
+#   apt install libcurl4-openssl-dev   (Debian/Ubuntu)
+#   brew install curl                  (macOS)
+#
+# Comment out the following line if libcurl is not available -- everything else builds and
+# runs as before, just without HTTPS support for these web-service queries.
+LIBCURL_DEFS= -D USE_LIBCURL
+#
+ifdef LIBCURL_DEFS
+export LDLIBS_CURL= -lcurl
+endif
+# END - libcurl DEFS ===============================================================================================================
+
 
 # Uncomment the following line to ﻿enable OpenMP parallel programming (http://www.openmp.org)
 # DO NOT USE!
@@ -144,8 +162,14 @@ GNU_SOURCE=-D _GNU_SOURCE
 # IMPORTANT: try the following if the compiler you are using does not support GNU extensions!
 #GNU_SOURCE=
 #
+# 20260720 - libslink headers: point this at wherever libslink is installed/built on your
+# system (only needed if the compiler can't already find <libslink/libslink.h> via the
+# standard include path). Was previously hardcoded to one deployment's home directory.
+ifndef LIBSLINK_INCLUDE_PATH
+export LIBSLINK_INCLUDE_PATH=
+endif
 #
-CCFLAGS_BASIC =  -std=c99 -Wall -Wno-format-truncation -fcommon -I/home/comonvgc/early-est_deps/libslink $(GNU_SOURCE) `xml2-config --cflags` $(TTIME_DEFS) $(AMQP_DEFS) ${JSON_DEFS} $(JSONC_INCLUDE_PATH) $(FLAG_OPENMP) $(DEV_DEFS) $(DEFS_GOOGLE_API_KEY)
+CCFLAGS_BASIC =  -std=c99 -Wall -Wno-format-truncation -fcommon $(LIBSLINK_INCLUDE_PATH) $(GNU_SOURCE) `xml2-config --cflags` $(TTIME_DEFS) $(AMQP_DEFS) ${JSON_DEFS} $(JSONC_INCLUDE_PATH) $(LIBCURL_DEFS) $(FLAG_OPENMP) $(DEV_DEFS) $(DEFS_GOOGLE_API_KEY)
 # 20160513 - -mcmodel=large flag may be needed on Linux per suggestion by mehmety@boun.edu.tr
 #CCFLAGS_BASIC = -mcmodel=large -std=c99 -Wall $(GNU_SOURCE) `xml2-config --cflags` $(TTIME_DEFS) $(DEV_DEFS)
 

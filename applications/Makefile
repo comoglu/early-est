@@ -36,7 +36,7 @@ CCFLAGS = -O3 $(CCFLAGS_BASIC)
 endif
 
 LDFLAGS = $(LDFLAGS_RMQ) -L/usr/local/lib -L..
-LDLIBS = $(LDLIBS_RMQ) $(LDLIBS_JSON) -lm -lmseed ../timedomain_processing/libtdproc.a -lm `xml2-config --cflags` `xml2-config --libs`
+LDLIBS = $(LDLIBS_RMQ) $(LDLIBS_JSON) $(LDLIBS_CURL) -lm -lmseed ../timedomain_processing/libtdproc.a -lm `xml2-config --cflags` `xml2-config --libs`
 
 # 20211123
 OBJ= $(LIB_OBJS) app_lib.o

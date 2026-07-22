@@ -10,6 +10,10 @@
 
 #include "net_lib.h"
 
+#ifdef USE_LIBCURL
+#include <curl/curl.h>
+#endif
+
 #define PORT 80
 #define USERAGENT "HTMLGET 1.0"
 
@@ -316,4 +320,90 @@ char *build_get_query(char *host, char *page) {
     sprintf(query, tpl, getpage, host, USERAGENT);
     return query;
 }
+
+#ifdef USE_LIBCURL
+
+/* 20260712 - patch: TLS-capable replacement for the internet web-service query
+ * path (get_socket_connection()+get_page(), always plain HTTP on port 80, no
+ * way to reach an HTTPS-only endpoint -- see PATCHES.md for why this matters).
+ * Kept separate from the functions above rather than modifying them in place,
+ * so the original socket-based implementation is left untouched and available.
+ */
+
+struct http_fetch_buffer {
+    char *data;
+    size_t len;
+};
+
+static size_t http_fetch_write_cb(void *contents, size_t size, size_t nmemb, void *userp) {
+    size_t realsize = size * nmemb;
+    struct http_fetch_buffer *mem = (struct http_fetch_buffer *) userp;
+    char *ptr = realloc(mem->data, mem->len + realsize + 1);
+    if (ptr == NULL)
+        return (0); // out of memory; libcurl treats a short write as an error
+    mem->data = ptr;
+    memcpy(&(mem->data[mem->len]), contents, realsize);
+    mem->len += realsize;
+    mem->data[mem->len] = '\0';
+    return (realsize);
+}
+
+// single attempt at one URL; returns NULL on any failure (bad connect, TLS error, timeout, empty response)
+static char *http_fetch_try(const char *url, int *ppage_length) {
+
+    CURL *curl = curl_easy_init();
+    if (curl == NULL)
+        return (NULL);
+
+    struct http_fetch_buffer buf;
+    buf.data = (char *) malloc(1);
+    buf.data[0] = '\0';
+    buf.len = 0;
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, http_fetch_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *) &buf);
+    curl_easy_setopt(curl, CURLOPT_HEADER, 1L); // merge headers into the body output, matching the historical get_page() contract
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L); // follow http->https redirects
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L); // matches the original socket SO_SNDTIMEO/SO_RCVTIMEO of 10s
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, USERAGENT);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+    CURLcode res = curl_easy_perform(curl);
+    curl_easy_cleanup(curl);
+
+    if (res != CURLE_OK || buf.len == 0) {
+        if (VERBOSE) fprintf(stderr, "net.http_fetch: %s failed: %s\n", url, curl_easy_strerror(res));
+        free(buf.data);
+        return (NULL);
+    }
+
+    *ppage_length = (int) buf.len;
+    return (buf.data);
+}
+
+char *http_fetch(char *host, char *page, int *ppage_length) {
+
+    char *getpage = page;
+    if (getpage[0] == '/')
+        getpage = getpage + 1;
+
+    char url[2048];
+    char *page_contents;
+
+    snprintf(url, sizeof (url), "https://%s/%s", host, getpage);
+    page_contents = http_fetch_try(url, ppage_length);
+    if (page_contents != NULL)
+        return (page_contents);
+
+    if (VERBOSE) fprintf(stdout, "net.http_fetch: HTTPS failed for %s, retrying over HTTP\n", url);
+    snprintf(url, sizeof (url), "http://%s/%s", host, getpage);
+    page_contents = http_fetch_try(url, ppage_length);
+
+    return (page_contents); // NULL if this also failed
+
+}
+
+#endif // USE_LIBCURL
 

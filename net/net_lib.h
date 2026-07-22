@@ -25,6 +25,16 @@ int create_tcp_socket();
 char *get_ip(char *host);
 char *build_get_query(char *host, char *page);
 
+#ifdef USE_LIBCURL
+/* 20260712 - patch: fetches host/page over HTTPS (falling back to HTTP if
+ * HTTPS fails), via libcurl. Replaces the get_socket_connection()+get_page()
+ * pair for internet web-service queries -- see PATCHES.md. Returns the full
+ * raw response text (headers + body), matching the historical get_page()
+ * output contract, so existing callers/parsers need no changes. Returned
+ * buffer must be free()'d by the caller; returns NULL on failure. */
+char *http_fetch(char *host, char *page, int *ppage_length);
+#endif
+
 
 
 #ifdef	__cplusplus

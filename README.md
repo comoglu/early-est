@@ -32,7 +32,8 @@ program with `-h`.
 ## About this repository
 
 This mirrors the source as deployed and run in production (version `1.2.9xDEV`,
-2023.05.05). **No source patches have been applied.** See [PATCHES.md](PATCHES.md) for
+2023.05.05), plus one small, optional, additive patch (TLS support for the
+internet web-service queries — see below). See [PATCHES.md](PATCHES.md) for
 a precise diagnosis of why Early-est's built-in real-time data acquisition and
 web-service queries can fail against current IRIS/EarthScope services, and for notes
 on the (site-specific) operational workaround used for this particular deployment.

@@ -59,5 +59,5 @@ clean :
 #
 OBJ_TEST1= $(OBJS_NET)
 ${BINDIR}/htmlget : ${OBJ_TEST1}
-	$(CC) ${OBJ_TEST1} ${CCFLAGS} -o ${BINDIR}/htmlget -lm
+	$(CC) ${OBJ_TEST1} ${CCFLAGS} -o ${BINDIR}/htmlget -lm $(LDLIBS_CURL)
 # --------------------------------------------------------------------------
